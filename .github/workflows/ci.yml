@@ -204,14 +204,11 @@ jobs:
                   failures.append(f"README.md must link {target}")
 
           link_re = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]+)\)")
-          doc_roots = ["."]
+          files = ["README.md"]
           for dirpath, _dirnames, filenames in os.walk("docs"):
-              doc_roots.append(dirpath)
-          files = []
-          for root in doc_roots:
               for name in sorted(filenames):
                   if name.endswith(".md"):
-                      files.append(os.path.join(root, name))
+                      files.append(os.path.join(dirpath, name))
 
           for path in sorted(files):
               try:
