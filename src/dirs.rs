@@ -142,8 +142,9 @@ impl DaemonPaths {
         let state_root = state_home_for(xdg_state_home, home)?.join("herdr-fleet");
         let socket_override = socket_override.filter(|path| !path.is_empty());
         // An explicit socket override removes the XDG_RUNTIME_DIR
-        // requirement: the pair (socket + lock) moves into the override's
-        // directory. Without one the XDG runtime root applies.
+        // requirement: the socket moves into the override's directory
+        // (the lock stays with the state dir). Without one the XDG
+        // runtime root applies for the socket.
         let runtime_root: PathBuf = match &socket_override {
             Some(path) => PathBuf::from(path)
                 .parent()
@@ -155,16 +156,13 @@ impl DaemonPaths {
             Some(path) => PathBuf::from(path),
             None => runtime_root.join("daemon.sock"),
         };
-        // The lock file always sits next to the socket so a socket override
-        // cannot split the pair across permission domains.
-        let lock_dir = socket_path
-            .parent()
-            .map(PathBuf::from)
-            .ok_or_else(|| error("dirs.socket", "socket path has no parent directory"))?;
+        // The single-writer lock is bound to the STATE directory (beside
+        // the database/journal): one writer per state dir is enforced no
+        // matter which socket path a daemon was started with.
         Ok(DaemonPaths {
             state_dir: state_root.clone(),
             runtime_dir: runtime_root,
-            lock_path: lock_dir.join("daemon.lock"),
+            lock_path: state_root.join("daemon.lock"),
             socket_path,
             db_path: state_root.join("state.db"),
             audit_mirror_path: state_root.join("journal").join("audit.jsonl"),
@@ -226,6 +224,8 @@ fn create_private_dir(dir: &std::path::Path) -> Result<(), PathError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[cfg(unix)]
@@ -234,95 +234,124 @@ mod tests {
         std::fs::metadata(path).ok().map(|meta| meta.mode())
     }
 
-    fn os(value: &str) -> Option<std::ffi::OsString> {
-        Some(std::ffi::OsString::from(value))
+    /// One temp base per test name keeps parallel tests isolated; every
+    /// path is runtime-derived so no absolute literal reaches the tree.
+    fn fixture_base(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("hf-dirs-{}-{}", std::process::id(), name))
+    }
+
+    fn os(value: &std::path::Path) -> Option<std::ffi::OsString> {
+        Some(value.as_os_str().to_owned())
     }
 
     fn derive_with(
-        xdg_state: Option<&str>,
-        xdg_runtime: Option<&str>,
+        xdg_state: Option<&Path>,
+        xdg_runtime: Option<&Path>,
+        home: Option<&Path>,
         override_socket: Option<&str>,
     ) -> Result<DaemonPaths, PathError> {
         DaemonPaths::derive_for(
-            xdg_state.map(std::ffi::OsString::from),
-            xdg_runtime.map(std::ffi::OsString::from),
-            Some(std::ffi::OsString::from("/tmp/home")),
+            xdg_state.map(|path| path.as_os_str().to_owned()),
+            xdg_runtime.map(|path| path.as_os_str().to_owned()),
+            home.map(|path| path.as_os_str().to_owned()),
             override_socket,
         )
     }
 
     #[test]
     fn paths_derive_from_xdg_environment_values() {
-        let paths = derive_with(Some("/tmp/st"), Some("/tmp/run"), None).expect("derive");
-        assert_eq!(paths.state_dir, PathBuf::from("/tmp/st/herdr-fleet"));
-        assert_eq!(paths.runtime_dir, PathBuf::from("/tmp/run/herdr-fleet"));
-        assert_eq!(
-            paths.socket_path,
-            PathBuf::from("/tmp/run/herdr-fleet/daemon.sock")
-        );
-        assert_eq!(
-            paths.lock_path,
-            PathBuf::from("/tmp/run/herdr-fleet/daemon.lock")
-        );
-        assert_eq!(paths.db_path, PathBuf::from("/tmp/st/herdr-fleet/state.db"));
+        let base = fixture_base("xdg");
+        let state = base.join("st");
+        let run = base.join("run");
+        let home = base.join("home");
+        let paths = derive_with(Some(&state), Some(&run), Some(&home), None).expect("derive");
+        assert_eq!(paths.state_dir, state.join("herdr-fleet"));
+        assert_eq!(paths.runtime_dir, run.join("herdr-fleet"));
+        assert_eq!(paths.socket_path, run.join("herdr-fleet/daemon.sock"));
+        // The single-writer lock belongs to the STATE dir (AC1: one writer
+        // per state dir regardless of socket path).
+        assert_eq!(paths.lock_path, state.join("herdr-fleet/daemon.lock"));
+        assert_eq!(paths.db_path, state.join("herdr-fleet/state.db"));
         assert_eq!(
             paths.audit_mirror_path,
-            PathBuf::from("/tmp/st/herdr-fleet/journal/audit.jsonl")
+            state.join("herdr-fleet/journal/audit.jsonl")
         );
     }
 
     #[test]
     fn state_home_falls_back_to_home_local_state() {
+        let base = fixture_base("fallback");
+        let home = base.join("home-u");
         assert_eq!(
-            state_home_for(None, os("/home/u")).expect("fallback"),
-            PathBuf::from("/home/u/.local/state")
+            state_home_for(None, os(&home)).expect("fallback"),
+            home.join(".local/state")
         );
         assert_eq!(
-            config_home_for(None, os("/home/u")).expect("fallback"),
-            PathBuf::from("/home/u/.config")
+            config_home_for(None, os(&home)).expect("fallback"),
+            home.join(".config")
         );
         let err = state_home_for(None, None).expect_err("must refuse");
         assert_eq!(err.code, "dirs.state");
     }
 
     #[test]
-    fn socket_override_moves_socket_and_lock_together() {
+    fn socket_override_moves_socket_but_lock_stays_with_state() {
+        let base = fixture_base("override");
+        let state = base.join("st");
+        let run = base.join("run");
+        let home = base.join("home");
         let paths = derive_with(
-            Some("/tmp/st"),
-            Some("/tmp/run"),
-            Some("/tmp/custom/daemon.sock"),
+            Some(&state),
+            Some(&run),
+            Some(&home),
+            Some(
+                base.join("custom")
+                    .join("daemon.sock")
+                    .to_str()
+                    .expect("utf8"),
+            ),
         )
         .expect("derive");
-        assert_eq!(paths.socket_path, PathBuf::from("/tmp/custom/daemon.sock"));
+        assert_eq!(paths.socket_path, base.join("custom").join("daemon.sock"));
         assert_eq!(
             paths.lock_path,
-            PathBuf::from("/tmp/custom/daemon.lock"),
-            "lock stays next to the socket"
+            state.join("herdr-fleet/daemon.lock"),
+            "the writer lock stays with the state dir, not the socket"
         );
     }
 
     #[test]
     fn missing_runtime_dir_is_a_typed_error_unless_socket_override_present() {
-        let err = derive_with(Some("/tmp/st"), None, None).expect_err("must refuse");
+        let base = fixture_base("runtime");
+        let state = base.join("st");
+        let home = base.join("home");
+        let err = derive_with(Some(&state), None, Some(&home), None).expect_err("must refuse");
         assert_eq!(err.code, "dirs.runtime");
-        // An explicit override removes the runtime-dir requirement.
-        let paths =
-            derive_with(Some("/tmp/st"), None, Some("/tmp/custom/daemon.sock")).expect("derive");
-        assert_eq!(paths.socket_path, PathBuf::from("/tmp/custom/daemon.sock"));
+        // An explicit socket override removes the runtime-dir requirement.
+        let paths = derive_with(
+            Some(&state),
+            None,
+            Some(&home),
+            Some(
+                base.join("custom")
+                    .join("daemon.sock")
+                    .to_str()
+                    .expect("utf8"),
+            ),
+        )
+        .expect("derive");
+        assert_eq!(paths.socket_path, base.join("custom").join("daemon.sock"));
+        assert_eq!(paths.lock_path, state.join("herdr-fleet/daemon.lock"));
     }
 
     #[cfg(unix)]
     #[test]
     fn prepared_directories_are_private_and_symlinks_refused() {
-        let base = std::env::temp_dir().join(format!("hf-dirs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let paths = DaemonPaths::derive_for(
-            Some(std::ffi::OsString::from(base.join("state"))),
-            Some(std::ffi::OsString::from(base.join("runtime"))),
-            Some(std::ffi::OsString::from(base.join("home"))),
-            None,
-        )
-        .expect("derive");
+        let base = fixture_base("prepare");
+        let state = base.join("state");
+        let run = base.join("run");
+        let home = base.join("home");
+        let paths = derive_with(Some(&state), Some(&run), Some(&home), None).expect("derive");
         paths.prepare().expect("prepare");
         for dir in [paths.state_dir.as_path(), paths.runtime_dir.as_path()] {
             assert!(dir.is_dir());

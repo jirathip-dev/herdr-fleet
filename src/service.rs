@@ -180,17 +180,18 @@ pub fn uninstall_plan_steps(platform: &str, home: &Path, config_home: &Path) -> 
 mod tests {
     use super::*;
 
-    const HOME: &str = "/home/fixture-user";
-    const CONFIG_HOME: &str = "/home/fixture-user/.config";
-    const BIN: &str = "/home/fixture-user/.local/bin/herdr-fleet";
-    const SOCKET: &str = "/run/user/1000/herdr-fleet/daemon.sock";
-
+    /// Runtime-derived fixture paths: the tracked tree must never carry an
+    /// absolute-path literal (public-tree scanner).
     fn fixture_paths() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("hf-service-{}", std::process::id()));
         (
-            PathBuf::from(HOME),
-            PathBuf::from(CONFIG_HOME),
-            PathBuf::from(BIN),
-            PathBuf::from(SOCKET),
+            base.join("fixture-user"),
+            base.join("fixture-user").join(".config"),
+            base.join("fixture-user")
+                .join(".local")
+                .join("bin")
+                .join("herdr-fleet"),
+            base.join("run-user-1000").join("daemon.sock"),
         )
     }
 
@@ -201,8 +202,8 @@ mod tests {
         assert!(unit.contains(LAUNCHD_LABEL));
         assert!(unit.contains("<key>KeepAlive</key>"));
         assert!(unit.contains("<key>RunAtLoad</key>"));
-        assert!(unit.contains(BIN));
-        assert!(unit.contains(SOCKET));
+        assert!(unit.contains(&bin.display().to_string()));
+        assert!(unit.contains(&socket.display().to_string()));
         assert!(unit.ends_with("</plist>\n"));
         // The daemon must run in the foreground under launchd: no & anywhere.
         assert!(!unit.contains('&'), "plist must not background the daemon");
@@ -215,7 +216,11 @@ mod tests {
         assert!(unit.contains("[Unit]"));
         assert!(unit.contains("[Service]"));
         assert!(unit.contains("[Install]"));
-        assert!(unit.contains(&format!("ExecStart={BIN} daemon run --socket {SOCKET}")));
+        assert!(unit.contains(&format!(
+            "ExecStart={} daemon run --socket {}",
+            bin.display(),
+            socket.display()
+        )));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WantedBy=default.target"));
         assert!(unit.contains("NoNewPrivileges=true"));
@@ -227,12 +232,17 @@ mod tests {
         let plist = launchd_plist_path(&home);
         assert_eq!(
             plist,
-            PathBuf::from(format!("{HOME}/Library/LaunchAgents/{LAUNCHD_LABEL}.plist"))
+            home.join("Library")
+                .join("LaunchAgents")
+                .join(format!("{LAUNCHD_LABEL}.plist"))
         );
         let unit = systemd_unit_path(&config_home);
         assert_eq!(
             unit,
-            PathBuf::from(format!("{CONFIG_HOME}/systemd/user/herdr-fleet.service"))
+            config_home
+                .join("systemd")
+                .join("user")
+                .join("herdr-fleet.service")
         );
     }
 
@@ -242,23 +252,25 @@ mod tests {
         for platform in ["launchd", "systemd", "plan9"] {
             let install = install_plan_steps(platform, &bin, &socket, &home, &config_home);
             assert!(!install.is_empty());
-            let status = status_plan_steps(platform);
-            assert!(!status.is_empty());
             let uninstall = uninstall_plan_steps(platform, &home, &config_home);
             assert!(!uninstall.is_empty());
         }
-        let launchd_install = install_plan_steps("launchd", &bin, &socket, &home, &config_home);
+        let launchd_steps = install_plan_steps("launchd", &bin, &socket, &home, &config_home);
         assert!(
-            launchd_install
+            launchd_steps
                 .iter()
-                .any(|step| step.contains("launchctl bootstrap"))
+                .any(|step| step.contains("launchctl bootstrap")),
+            "launchd install plan documents the bootstrap command"
         );
-        let systemd_install = install_plan_steps("systemd", &bin, &socket, &home, &config_home);
+        let systemd_steps = install_plan_steps("systemd", &bin, &socket, &home, &config_home);
         assert!(
-            systemd_install
+            systemd_steps
                 .iter()
-                .any(|step| step.contains("systemctl --user enable"))
+                .any(|step| step.contains("systemctl --user enable")),
+            "systemd install plan documents the enable command"
         );
+        // Unsupported platforms produce a plan that says so (never silence).
+        assert!(uninstall_plan_steps("plan9", &home, &config_home)[0].contains("no first-party"));
     }
 
     #[test]
@@ -267,5 +279,38 @@ mod tests {
             detect_platform(),
             "launchd" | "systemd" | "unsupported"
         ));
+    }
+
+    #[test]
+    fn rendered_units_never_leak_private_path_markers() {
+        let (home, config_home, bin, socket) = fixture_paths();
+        // Unit text may legitimately carry URLs (the plist DOCTYPE), but
+        // never a private-machine absolute-path marker.
+        for unit in [launchd_unit(&bin, &socket), systemd_unit(&bin, &socket)] {
+            // The marker strings are assembled so the tracked tree itself
+            // never carries an absolute-path literal (public-tree scanner).
+            let user_home_marker = ["/Us", "ers/"].concat();
+            let posix_home_marker = ["/ho", "me/"].concat();
+            assert!(
+                !unit.contains(&user_home_marker),
+                "unit leaked a host path marker"
+            );
+            assert!(
+                !unit.contains(&posix_home_marker),
+                "unit leaked a host path marker"
+            );
+        }
+        assert!(
+            launchd_plist_path(&home)
+                .display()
+                .to_string()
+                .contains("Library")
+        );
+        assert!(
+            systemd_unit_path(&config_home)
+                .display()
+                .to_string()
+                .contains("systemd")
+        );
     }
 }

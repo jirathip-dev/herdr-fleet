@@ -207,7 +207,7 @@ impl EventSubscription {
     pub fn open(socket_path: &Path, last_seq: Option<i64>) -> Result<EventSubscription, RpcError> {
         let mut connection = Connection::open(socket_path)?;
         let id = fresh_id();
-        let params = last_seq.map(|seq| object(vec![("last_seq", crate::value::integer(seq))]));
+        let params = last_seq.map(|seq| object(vec![("cursor", crate::value::integer(seq))]));
         connection.send_request(&id, "events.subscribe", params.as_ref())?;
         let response = connection.read_response()?;
         if !response.ok {

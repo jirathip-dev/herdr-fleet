@@ -47,7 +47,9 @@ impl Fixture {
             state_dir: state_dir.clone(),
             runtime_dir: self.dir.clone(),
             socket_path: self.socket.clone(),
-            lock_path: self.dir.join("daemon.lock"),
+            // The single-writer lock lives in the STATE dir (AC1: one writer
+            // per state dir regardless of socket path).
+            lock_path: state_dir.join("daemon.lock"),
             db_path: state_dir.join("state.db"),
             audit_mirror_path: state_dir.join("journal").join("audit.jsonl"),
             events_mirror_path: state_dir.join("journal").join("events.jsonl"),
@@ -57,13 +59,23 @@ impl Fixture {
     }
 
     fn spawn(&self, crash_point: Option<&str>) -> Child {
+        self.spawn_with(&self.socket, &self.state_dir, crash_point)
+    }
+
+    /// Spawn a daemon with an explicit socket path and state home (used to
+    /// prove the writer lock binds the state dir, not the socket dir).
+    fn spawn_with(&self, socket: &Path, state_home: &Path, crash_point: Option<&str>) -> Child {
         let mut command = Command::new(bin());
-        let stderr_path = self.dir.join("daemon.stderr.log");
+        let socket_name = socket
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "daemon".to_string());
+        let stderr_path = self.dir.join(format!("{socket_name}.stderr.log"));
         let stderr_file = std::fs::File::create(&stderr_path).expect("stderr log");
         command
             .args(["daemon", "run", "--socket"])
-            .arg(&self.socket)
-            .env("XDG_STATE_HOME", &self.state_dir)
+            .arg(socket)
+            .env("XDG_STATE_HOME", state_home)
             .env("HOME", &self.dir)
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file));
@@ -219,6 +231,101 @@ fn second_daemon_is_refused_while_first_runs() {
     let mut first = first;
     let _ = first.kill();
     wait_exit(first, "first daemon");
+}
+
+// The child is bounded on every path: the try_wait loop reaps a refused
+// daemon; the fallback kills and wait()s it before panicking.
+#[allow(clippy::zombie_processes)]
+#[test]
+fn two_daemons_with_different_sockets_but_shared_state_cannot_both_write() {
+    // AC1 hole regression: the writer lock must be bound to the STATE dir.
+    // Two daemons with different --socket paths but the same XDG_STATE_HOME
+    // must not both run: the second refuses with daemon.busy.
+    let fixture = Fixture::new("ac1-shared-state");
+    let first = fixture.spawn(None);
+    wait_ready(&fixture);
+
+    let other_socket = fixture.dir.join("other.sock");
+    let mut second = Command::new(bin())
+        .args([
+            "daemon",
+            "run",
+            "--socket",
+            other_socket.to_str().unwrap(),
+            "--json",
+        ])
+        .env("XDG_STATE_HOME", &fixture.state_dir)
+        .env("HOME", &fixture.dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("second daemon (different socket, same state)");
+
+    // Bounded wait: a correct lock refuses quickly (exit 1, daemon.busy);
+    // the pre-fix behavior (socket-scoped lock) would keep serving forever.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut refused = false;
+    while Instant::now() < deadline {
+        if let Some(status) = second.try_wait().expect("try_wait") {
+            assert_eq!(
+                status.code(),
+                Some(1),
+                "shared-state second daemon must exit 1"
+            );
+            refused = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !refused {
+        let _ = second.kill();
+        wait_exit(second, "second daemon");
+        panic!(
+            "second daemon with a DIFFERENT socket and the SAME state dir must be refused (writer lock must bind the state dir)"
+        );
+    }
+    let mut stdout = String::new();
+    use std::io::Read;
+    second
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut stdout)
+        .expect("read stdout");
+    assert!(stdout.contains("daemon.busy"), "stdout: {stdout}");
+
+    // The first daemon is unaffected and still serves its socket.
+    let status = rpc_ok(&fixture.socket, &fresh_id(3), "status", None);
+    assert!(status.get("state").and_then(|s| s.get("epoch")).is_some());
+
+    let mut first = first;
+    let _ = first.kill();
+    wait_exit(first, "first daemon");
+}
+
+#[test]
+fn daemons_with_distinct_state_dirs_coexist() {
+    // The lock is per STATE dir: a second daemon on its own state dir (even
+    // in the same temp tree) must start and serve concurrently.
+    let fixture_a = Fixture::new("ac1-coexist-a");
+    let daemon_a = fixture_a.spawn(None);
+    wait_ready(&fixture_a);
+
+    let fixture_b = Fixture::new("ac1-coexist-b");
+    let daemon_b = fixture_b.spawn(None);
+    wait_ready(&fixture_b);
+
+    let status_a = rpc_ok(&fixture_a.socket, &fresh_id(4), "status", None);
+    let status_b = rpc_ok(&fixture_b.socket, &fresh_id(5), "status", None);
+    assert!(status_a.get("state").and_then(|s| s.get("epoch")).is_some());
+    assert!(status_b.get("state").and_then(|s| s.get("epoch")).is_some());
+
+    let mut daemon_a = daemon_a;
+    let mut daemon_b = daemon_b;
+    let _ = daemon_a.kill();
+    let _ = daemon_b.kill();
+    wait_exit(daemon_a, "daemon a");
+    wait_exit(daemon_b, "daemon b");
 }
 
 #[test]

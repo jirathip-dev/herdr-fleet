@@ -1258,14 +1258,14 @@ fn subscribe_request(_shared: &Arc<Shared>, request: &Request) -> HandleOutcome 
     let cursor = request
         .params
         .as_ref()
-        .and_then(|params| params.get("last_seq"))
+        .and_then(|params| params.get("cursor"))
         .and_then(as_non_negative);
     let response = ok_response(
         &request.id,
         object(vec![
             ("event_stream", bool_(true)),
             ("schema", string("hf-event/v1")),
-            ("last_seq", cursor.map(integer).unwrap_or_else(null)),
+            ("cursor", cursor.map(integer).unwrap_or_else(null)),
         ]),
     );
     HandleOutcome::Subscribed { response, cursor }
