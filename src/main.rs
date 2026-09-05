@@ -1,59 +1,87 @@
 //! herdr-fleet command-line entry point.
 //!
-//! Pre-alpha bootstrap: the binary truthfully reports `--help` and
-//! `--version` only. No status/spawn/rearm/review/plugin/release command
-//! exists yet, and none is claimed by the usage text.
+//! Read-only core: this binary reports package metadata, configures,
+//! diagnoses, observes, and renders deterministic plans. It never mutates
+//! fleet state, never installs/starts/stops Herdr, and never stores
+//! credentials.
 
 #![forbid(unsafe_code)]
 
 use std::process::ExitCode;
 
+use herdr_fleet::commands::{ParseError, USAGE, execute, parse_invocation, render_envelope};
 use herdr_fleet::{PACKAGE_NAME, PACKAGE_VERSION, about};
-
-const USAGE: &str = "\
-herdr-fleet — typed, plan-first companion CLI for Herdr coding-agent fleets
-
-PRE-ALPHA BOOTSTRAP: no daemon, workflow, mutation, or release behavior is
-implemented yet. This binary reports package metadata only.
-
-USAGE:
-    herdr-fleet --help
-    herdr-fleet --version
-
-OPTIONS:
-    -h, --help       Print this usage text and exit.
-    -V, --version    Print the package name, version, and description, and exit.
-
-No other commands exist in this bootstrap.
-";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    match args.as_slice() {
-        [] => {
-            eprintln!("{USAGE}");
-            eprintln!("error: no arguments given; try `herdr-fleet --help`");
-            ExitCode::from(2)
+    // Top-level metadata flags (the only flag forms before a command).
+    if args.len() == 1 {
+        match args[0].as_str() {
+            "--help" | "-h" => {
+                print!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            "--version" | "-V" => {
+                println!("{PACKAGE_NAME} {PACKAGE_VERSION}");
+                println!("{}", about());
+                return ExitCode::SUCCESS;
+            }
+            _ => {}
         }
-        [flag] if flag == "--help" || flag == "-h" => {
-            print!("{USAGE}");
-            ExitCode::SUCCESS
+    }
+    if args.is_empty() {
+        eprintln!("{USAGE}");
+        eprintln!("error: no arguments given; try `herdr-fleet --help`");
+        return ExitCode::from(2);
+    }
+    if args[0].starts_with('-') {
+        eprintln!("{USAGE}");
+        eprintln!("error: unknown argument `{}`", args[0]);
+        return ExitCode::from(2);
+    }
+
+    let invocation = match parse_invocation(&args) {
+        Ok(invocation) => invocation,
+        Err(ParseError::Help(text)) => {
+            println!("{text}");
+            return ExitCode::SUCCESS;
         }
-        [flag] if flag == "--version" || flag == "-V" => {
-            println!("{} {}", PACKAGE_NAME, PACKAGE_VERSION);
-            println!("{}", about());
-            ExitCode::SUCCESS
+        Err(ParseError::Usage(message)) => {
+            eprintln!("error: {message}");
+            eprintln!();
+            eprintln!("{}", per_command_usage(&args[0]));
+            return ExitCode::from(2);
         }
-        [unknown] => {
-            eprintln!("{USAGE}");
-            eprintln!("error: unknown argument `{unknown}`");
-            ExitCode::from(2)
+    };
+
+    let result = execute(&invocation);
+
+    if invocation.json {
+        let json = render_envelope(&invocation.command, &result);
+        print!("{json}");
+    } else if !result.human.is_empty() {
+        print!("{}", result.human);
+        if !result.human.ends_with('\n') {
+            println!();
         }
-        _ => {
-            eprintln!("{USAGE}");
-            eprintln!("error: expected at most one argument");
-            ExitCode::from(2)
+    }
+    if !result.diagnostics.is_empty() {
+        eprintln!("{}", result.diagnostics);
+    }
+    ExitCode::from(result.exit_code)
+}
+
+/// Usage hint line printed under a usage error for the offending command.
+fn per_command_usage(command: &str) -> &'static str {
+    match command {
+        "config" => "usage: herdr-fleet config <init|validate|show> [--config PATH] [--json]",
+        "doctor" => "usage: herdr-fleet doctor [--json]",
+        "status" => "usage: herdr-fleet status [--config PATH] [--json]",
+        "plan" => {
+            "usage: herdr-fleet plan <repository> <issue> [--revision HEX40] [--config PATH] [--json]"
         }
+        "capabilities" => "usage: herdr-fleet capabilities [--json]",
+        _ => "usage: herdr-fleet [--help] [--version] | herdr-fleet <command> [options]",
     }
 }

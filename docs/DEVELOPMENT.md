@@ -60,13 +60,30 @@ fail with rustup/cargo's own actionable errors.
 
 ## Test layout
 
-- `src/lib.rs` unit test (package identity surface) — `cargo test` unit
-  phase.
+- Unit tests live beside their modules under `src/` (`cargo test` unit phase):
+  strict JSON/TOML parsing and the closed `Val` model (`value.rs`), canonical
+  form including the trailing newline and digest rules (`canonical.rs`),
+  RFC3339 formatting (`time.rs`), identity/hex/slug validators (`formats.rs`),
+  adapter-boundary redaction (`redact.rs`), the seven `hf-*` family
+  validators with per-family discrimination (`schema.rs`), config
+  discovery/typing/policy overlay (`config.rs`), the bounded process runner
+  (`process.rs`), observation adapters and revision binding (`observe.rs`),
+  deterministic plan rendering (`plan.rs`), and command parsing/envelope
+  emission (`commands.rs`).
 - `tests/cli_smoke.rs` — integration tests against the **real compiled
   binary** (`CARGO_BIN_EXE_herdr-fleet`): help exits 0 and prints usage,
   version exits 0 and prints name + version, unknown flag and no-args exit
-  non-zero (2) with usage on stderr, and usage lists no unimplemented
-  commands.
+  non-zero (2) with usage on stderr, usage lists only implemented commands,
+  and `--json` mode writes exactly one envelope to stdout without prompting.
+- `tests/cli_readonly.rs` — behavior tests against the real binary with
+  **fake `herdr`/`gh` executables on a controlled PATH and synthetic local
+  git repositories**: doctor rows (ok / missing / invalid config exit 5),
+  status completeness + degradation semantics, deterministic `plan`
+  rendering whose digest equals sha256 over the canonical plan bytes, plan
+  revisions that bind the *redacted* acceptance text (and differ from the
+  raw-text hash), untrusted input (hostile config paths, issue text with
+  secret-shaped tokens) never breaking argv or JSON framing, and exit codes
+  matching envelope `exit_code` fields.
 - `scripts/test-check-public-tree.py` — self-tests for the privacy scanner;
   each test builds a temporary git repo proving a rule bites (or that a
   clean fixture passes).
@@ -88,13 +105,13 @@ compile.
 
 ## Coverage — Phase 1 decision
 
-**Phase 1: no coverage gate.** The scaffold's test surface is a CLI metadata
-smoke suite; there is no domain logic yet whose branches a coverage floor
+**Phase 1: no coverage gate.** The scaffold's test surface was a CLI metadata
+smoke suite; there was no domain logic yet whose branches a coverage floor
 would meaningfully protect. Rather than publish a fake 100% badge or an
-empty-profile pass, coverage measurement is deferred until the first real
-behavioral slice (issue #3/#4 territory) lands; that slice must establish a
-measured baseline and a floor below it, prove RED on an unobserved branch,
-and fail on absent/empty profiles (per the issue's coverage contract).
+empty-profile pass, coverage measurement is deferred until a behavioral
+slice lands with an explicit coverage contract in its route grant; that
+slice must establish a measured baseline and a floor below it, prove RED on
+an unobserved branch, and fail on absent/empty profiles.
 
 ## Troubleshooting
 

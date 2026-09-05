@@ -2,9 +2,11 @@
 
 Typed, plan-first companion CLI for operating Herdr coding-agent fleets.
 
-> **PRE-ALPHA — repository foundation only.** Live fleet mutations are **not
-> implemented**. The binary truthfully reports `--help` and `--version` and
-> nothing else. See [Roadmap](#roadmap).
+> **READ-ONLY CORE (issue #4).** This binary configures, diagnoses, observes,
+> and renders deterministic read-only plans. It never starts/stops Herdr and
+> never mutates repositories or fleet state. Live fleet mutations are **not
+> implemented**. See [Status and boundaries](#status-and-boundaries) and the
+> [Roadmap](#roadmap).
 
 herdr-fleet is an **independent community companion** compatible with Herdr —
 it is not an official or endorsed Herdr project. It is a Herdr-first,
@@ -30,8 +32,14 @@ implements none of that yet; it establishes the public foundation first
 ## Ecosystem
 
 ```text
-CURRENT BOOTSTRAP — this repository today
-    herdr-fleet --help / --version          (no daemon, no workflow, no mutations)
+CURRENT READ-ONLY CORE — this repository today (issue #4)
+    herdr-fleet config init|validate|show   typed hf-config/v1 configuration
+    herdr-fleet doctor                      prerequisite diagnosis (read-only)
+    herdr-fleet status                      bounded local/git/gh observations
+    herdr-fleet plan                        deterministic hf-plan/v1 rendering
+    herdr-fleet capabilities                declared read capabilities
+    (no daemon, no workflow execution, no live mutations; all versioned JSON
+     output follows the #3 contract corpus under docs/contracts/)
 
 APPROVED TARGET (locked in issue #1 — NOT implemented; see docs/architecture/)
     Operator + Route Grant -> CLI -> local daemon (sole transition/state
@@ -53,6 +61,15 @@ assumption of the planned engine.
 
 ## Status and boundaries
 
+- Current slice — **read-only core** (issue
+  [#4](https://github.com/jirathip-dev/herdr-fleet/issues/4)): configuration
+  (`config init|validate|show`), prerequisite diagnosis (`doctor`), bounded
+  read-only observation (`status`), deterministic plan rendering (`plan`),
+  and a capability declaration (`capabilities`). Every `--json` invocation
+  writes exactly one versioned `hf-output/v1` envelope per the
+  [#3 contract corpus](docs/contracts/README.md); plans bind a redacted
+  acceptance revision and a canonical digest, and nothing in the binary
+  installs/starts/stops Herdr, mutates a repository, or stores credentials.
 - Public core vs private overlays: everything here is public and reusable;
   deployment policy, credentials, model/provider choices, host paths, and
   private routing stay **downstream** and out of this repository (see
@@ -62,7 +79,8 @@ assumption of the planned engine.
 - Branch model: `main` is stable/release; `staging` is the permanent
   integration branch. See [WORKFLOW.md](docs/WORKFLOW.md) and
   [ADR-0002](docs/decisions/0002-staging-integration-main-release.md).
-- Safety principles: plan-first mutations, no shell-evaluated remote data,
+- Safety principles: plan-first mutations (future), no shell-evaluated remote
+  data, adapter reads are env-isolated and redacted at the boundary,
   least-privilege CI, fail-closed public-data gates, no self-update, no
   plugin host until a real need is proven, and same-user TTY approval as an
   *accidental-safety* boundary — not cryptographic isolation (see
@@ -71,7 +89,10 @@ assumption of the planned engine.
 ## Quickstart
 
 Prerequisites: Rust 1.97.1 (see [DEVELOPMENT.md](docs/DEVELOPMENT.md) for
-exact install commands), `just` (optional but recommended).
+exact install commands), `just` (optional but recommended). The read-only
+commands need only the local tools they observe: `doctor`/`status`/`plan`
+probe `herdr --version`, authenticated `gh`, and local git — never install
+any of them.
 
 ```console
 $ git clone https://github.com/jirathip-dev/herdr-fleet.git
@@ -79,12 +100,36 @@ $ cd herdr-fleet
 $ cargo build --locked --release
 $ ./target/release/herdr-fleet --help
 herdr-fleet — typed, plan-first companion CLI for Herdr coding-agent fleets
+
+READ-ONLY CORE: this binary observes configuration, prerequisites, and
+repository state and renders deterministic plans. It never installs, starts,
+stops, or upgrades Herdr; it never mutates repositories or fleet state; and
+it never stores credentials (GitHub reads use the invoking environment's
+authenticated `gh`).
 ...
-$ ./target/release/herdr-fleet --version
-herdr-fleet 0.1.0
 ```
 
-That is all the binary does in this bootstrap — by design.
+Configure one repository (writes nothing; the template prints to stdout):
+
+```console
+$ ./target/release/herdr-fleet config init > ~/.config/herdr-fleet/config.toml
+$ ./target/release/herdr-fleet config validate && ./target/release/herdr-fleet config show
+```
+
+Diagnose and observe:
+
+```console
+$ ./target/release/herdr-fleet doctor
+$ cd /path/to/your/repo && /path/to/herdr-fleet status
+$ herdr-fleet plan example-org/widgets 123
+```
+
+Commands: `config init|validate|show [--config PATH] [--json]`,
+`doctor [--json]`, `status [--config PATH] [--json]`,
+`plan <repository> <issue> [--revision HEX40] [--config PATH] [--json]`,
+`capabilities [--json]`. Exit codes: 0 ok · 1 operational error · 2 usage ·
+3 partial · 4 refusal · 5 config error. `--json` mode writes exactly one
+`hf-output/v1` document to stdout (diagnostics on stderr, never prompts).
 
 ## Development, CI, and branches
 
@@ -100,6 +145,9 @@ That is all the binary does in this bootstrap — by design.
 
 ## Documentation index
 
+- [docs/contracts/README.md](docs/contracts/README.md) — the versioned
+  contract corpus (schema registry, CLI/JSON contract, config/plan/capability
+  specs) that machine and human outputs of this slice conform to.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — current scaffold vs planned
   modules, boundaries, dependency direction, target flow.
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — prerequisites, canonical gate
@@ -126,10 +174,10 @@ That is all the binary does in this bootstrap — by design.
 
 The umbrella issue
 [herdr-fleet#1](https://github.com/jirathip-dev/herdr-fleet/issues/1) tracks
-the approved target architecture and delivery graph; children #3–#10 are
-**unrouted** and will each require their own route grant. This repository's
-current state is only the bootstrap foundation (issue
-[#2](https://github.com/jirathip-dev/herdr-fleet/issues/2)).
+the approved target architecture and delivery graph. The #3 contract corpus
+(`docs/contracts/`) and the #4 read-only core (this repository's current
+state) are implemented; the remaining children are **unrouted** and will each
+require their own route grant.
 
 ## License
 
