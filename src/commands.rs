@@ -16,16 +16,21 @@
 use std::path::PathBuf;
 
 use crate::canonical::canonical_bytes;
+use crate::client::{self, RpcError};
 use crate::config::{
     Config, LoadError, adapter_environment, default_config_hint, discover_config, init_template,
     load_config, resolve_repository,
 };
+use crate::daemon::{self, DaemonError};
+use crate::dirs::DaemonPaths;
 use crate::formats::is_hex40;
+use crate::lock::describe_socket;
 use crate::observe::{
     HERDR_MINIMUM, Observation, acceptance_revision, gh_issue_text, observe_all, observe_herdr,
     probe_gh_auth, probe_version,
 };
 use crate::plan::{DOCTRINE_WORKFLOW_ID, PlanInput, render_plan};
+use crate::service::{self, LAUNCHD_LABEL, SYSTEMD_UNIT_NAME};
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// Top-level usage text (also the `--help` output body).
@@ -48,6 +53,12 @@ USAGE:
     herdr-fleet status [--config PATH] [--json]
     herdr-fleet plan <repository> <issue> [--revision HEX40] [--config PATH] [--json]
     herdr-fleet capabilities [--json]
+    herdr-fleet daemon run [--socket PATH] [--config PATH]
+    herdr-fleet daemon status [--config PATH] [--json]
+    herdr-fleet service doctor [--config PATH] [--json]
+    herdr-fleet service install-plan [--config PATH] [--json]
+    herdr-fleet service status-plan [--config PATH] [--json]
+    herdr-fleet service uninstall-plan [--config PATH] [--json]
 
 GLOBAL OPTIONS:
     -h, --help       Print help (add --help to any command for its usage).
@@ -61,6 +72,8 @@ COMMANDS:
     status           Observe configured repositories (read-only, bounded).
     plan             Render a deterministic read-only hf-plan/v1 plan.
     capabilities     Report the CLI's declared forge read capabilities.
+    daemon           Run or probe the single-writer state daemon.
+    service          Render per-user launchd/systemd plans; doctor checks.
 
 EXIT CODES (with or without --json):
     0 ok · 1 operational error · 2 usage · 3 partial · 4 refusal · 5 config error
@@ -82,6 +95,40 @@ pub struct Invocation {
     pub plan: Option<PlanArgs>,
     /// Config subcommand kind (`init`/`validate`/`show`).
     pub config_action: Option<ConfigAction>,
+    /// Daemon subcommand (`run`/`status`).
+    pub daemon_action: Option<DaemonAction>,
+    /// Service subcommand (doctor/plan actions).
+    pub service_action: Option<ServiceAction>,
+}
+
+/// Daemon subcommands (issue #5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DaemonAction {
+    /// Run the daemon in the foreground (`daemon run [--socket PATH]`).
+    Run {
+        /// Socket path override (`--socket PATH`).
+        socket: Option<String>,
+    },
+    /// Probe the daemon socket and report state
+    /// (`daemon status [--socket PATH]`).
+    Status {
+        /// Socket path override (`--socket PATH`).
+        socket: Option<String>,
+    },
+}
+
+/// Service-management subcommands: pure checks and rendered plans (never
+/// activate the host service manager).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServiceAction {
+    /// Diagnose the daemon/service environment (read-only).
+    Doctor,
+    /// Render the install plan (unit text + command steps).
+    PlanInstall,
+    /// Render the status-check plan.
+    PlanStatus,
+    /// Render the uninstall plan.
+    PlanUninstall,
 }
 
 /// Config subcommands.
@@ -231,6 +278,8 @@ pub fn parse_invocation(args: &[String]) -> Result<Invocation, ParseError> {
         "status" => parse_flag_command("status", &rest),
         "capabilities" => parse_flag_command("capabilities", &rest),
         "plan" => parse_plan(&rest),
+        "daemon" => parse_daemon(&rest),
+        "service" => parse_service(&rest),
         other => Err(ParseError::Usage(format!("unknown command {other:?}"))),
     }
 }
@@ -266,6 +315,8 @@ fn parse_flag_command(name: &str, args: &[&String]) -> Result<Invocation, ParseE
         config_path,
         plan: None,
         config_action: None,
+        daemon_action: None,
+        service_action: None,
     })
 }
 
@@ -277,6 +328,8 @@ fn help_request(name: &str) -> String {
         "capabilities" => CAPABILITIES_USAGE.trim_end().to_string(),
         "plan" => PLAN_USAGE.trim_end().to_string(),
         "config" => CONFIG_USAGE.trim_end().to_string(),
+        "daemon" => DAEMON_USAGE.trim_end().to_string(),
+        "service" => SERVICE_USAGE.trim_end().to_string(),
         _ => USAGE.to_string(),
     }
 }
@@ -401,6 +454,154 @@ fn parse_config(args: &[&String]) -> Result<Invocation, ParseError> {
         config_path,
         plan: None,
         config_action: Some(action),
+        daemon_action: None,
+        service_action: None,
+    })
+}
+
+/// Parse `daemon <run|status>`.
+fn parse_daemon(args: &[&String]) -> Result<Invocation, ParseError> {
+    let action = args
+        .first()
+        .ok_or_else(|| ParseError::Help(help_request("daemon")))?;
+    let mut socket: Option<String> = None;
+    let mut json = false;
+    let mut config_path: Option<PathBuf> = None;
+    let action = match action.as_str() {
+        "run" => {
+            let mut index = 1;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--socket" => {
+                        index += 1;
+                        let value = args.get(index).ok_or_else(|| {
+                            ParseError::Usage("daemon run: --socket requires a path".to_string())
+                        })?;
+                        socket = Some(value.to_string());
+                    }
+                    "--config" => {
+                        index += 1;
+                        let value = args.get(index).ok_or_else(|| {
+                            ParseError::Usage("daemon run: --config requires a path".to_string())
+                        })?;
+                        config_path = Some(PathBuf::from(value));
+                    }
+                    "--json" => json = true,
+                    "-h" | "--help" => return Err(ParseError::Help(help_request("daemon"))),
+                    flag => {
+                        return Err(ParseError::Usage(format!(
+                            "daemon run: unknown flag {flag:?}; run `herdr-fleet daemon --help`"
+                        )));
+                    }
+                }
+                index += 1;
+            }
+            DaemonAction::Run { socket }
+        }
+        "status" => {
+            let mut index = 1;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--socket" => {
+                        index += 1;
+                        let value = args.get(index).ok_or_else(|| {
+                            ParseError::Usage("daemon status: --socket requires a path".to_string())
+                        })?;
+                        socket = Some(value.to_string());
+                    }
+                    "--config" => {
+                        index += 1;
+                        let value = args.get(index).ok_or_else(|| {
+                            ParseError::Usage("daemon status: --config requires a path".to_string())
+                        })?;
+                        config_path = Some(PathBuf::from(value));
+                    }
+                    "--json" => json = true,
+                    "-h" | "--help" => return Err(ParseError::Help(help_request("daemon"))),
+                    flag => {
+                        return Err(ParseError::Usage(format!(
+                            "daemon status: unknown flag {flag:?}; run `herdr-fleet daemon --help`"
+                        )));
+                    }
+                }
+                index += 1;
+            }
+            DaemonAction::Status { socket }
+        }
+        "-h" | "--help" => return Err(ParseError::Help(help_request("daemon"))),
+        other => {
+            return Err(ParseError::Usage(format!(
+                "daemon: unknown subcommand {other:?}; run `herdr-fleet daemon --help`"
+            )));
+        }
+    };
+    Ok(Invocation {
+        command: match &action {
+            DaemonAction::Run { .. } => "daemon run".to_string(),
+            DaemonAction::Status { .. } => "daemon status".to_string(),
+        },
+        json,
+        config_path,
+        plan: None,
+        config_action: None,
+        daemon_action: Some(action),
+        service_action: None,
+    })
+}
+
+/// Parse `service <doctor|install-plan|status-plan|uninstall-plan>`.
+fn parse_service(args: &[&String]) -> Result<Invocation, ParseError> {
+    let action = args
+        .first()
+        .ok_or_else(|| ParseError::Help(help_request("service")))?;
+    let action = match action.as_str() {
+        "doctor" => ServiceAction::Doctor,
+        "install-plan" => ServiceAction::PlanInstall,
+        "status-plan" => ServiceAction::PlanStatus,
+        "uninstall-plan" => ServiceAction::PlanUninstall,
+        "-h" | "--help" => return Err(ParseError::Help(help_request("service"))),
+        other => {
+            return Err(ParseError::Usage(format!(
+                "service: unknown subcommand {other:?}; run `herdr-fleet service --help`"
+            )));
+        }
+    };
+    let mut json = false;
+    let mut config_path: Option<PathBuf> = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--config" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    ParseError::Usage("service: --config requires a path argument".to_string())
+                })?;
+                config_path = Some(PathBuf::from(value));
+            }
+            "-h" | "--help" => return Err(ParseError::Help(help_request("service"))),
+            flag => {
+                return Err(ParseError::Usage(format!(
+                    "service: unknown flag {flag:?}; run `herdr-fleet service --help`"
+                )));
+            }
+        }
+        index += 1;
+    }
+    let command = match action {
+        ServiceAction::Doctor => "service doctor",
+        ServiceAction::PlanInstall => "service install-plan",
+        ServiceAction::PlanStatus => "service status-plan",
+        ServiceAction::PlanUninstall => "service uninstall-plan",
+    };
+    Ok(Invocation {
+        command: command.to_string(),
+        json,
+        config_path,
+        plan: None,
+        config_action: None,
+        daemon_action: None,
+        service_action: Some(action),
     })
 }
 
@@ -461,6 +662,8 @@ fn parse_plan(args: &[&String]) -> Result<Invocation, ParseError> {
         command: "plan".to_string(),
         json,
         config_path,
+        daemon_action: None,
+        service_action: None,
         plan: Some(PlanArgs {
             repository: positionals[0].clone(),
             issue_number,
@@ -554,6 +757,12 @@ pub fn render_envelope(command: &str, result: &CmdResult) -> String {
 
 /// Execute one parsed invocation.
 pub fn execute(invocation: &Invocation) -> CmdResult {
+    if let Some(action) = invocation.daemon_action.clone() {
+        return execute_daemon(action, invocation);
+    }
+    if let Some(action) = invocation.service_action.clone() {
+        return execute_service(action, invocation);
+    }
     if let Some(action) = invocation.config_action {
         return execute_config(action, invocation);
     }
@@ -1231,6 +1440,390 @@ fn execute_config(action: ConfigAction, invocation: &Invocation) -> CmdResult {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+const DAEMON_USAGE: &str = "\
+herdr-fleet daemon <run|status> — run or probe the state daemon
+
+USAGE:
+    herdr-fleet daemon run [--socket PATH] [--config PATH]
+    herdr-fleet daemon status [--config PATH] [--json]
+
+run serves the single-writer daemon in the foreground: it acquires the
+per-user flock, opens/migrates the SQLite state, reconciles interrupted
+claims, and serves hf-rpc/v1 on the per-user Unix socket (default: the XDG
+runtime dir; --socket or config daemon.socket override it). A second daemon
+is refused (exit 1, code daemon.busy). status probes the socket and reports
+the live state; when no daemon is running it exits 1 with code daemon.absent
+— read-only commands stay available without the daemon.
+";
+
+const SERVICE_USAGE: &str = "\
+herdr-fleet service <doctor|install-plan|status-plan|uninstall-plan>
+
+USAGE:
+    herdr-fleet service doctor [--config PATH] [--json]
+    herdr-fleet service install-plan [--config PATH] [--json]
+    herdr-fleet service status-plan [--config PATH] [--json]
+    herdr-fleet service uninstall-plan [--config PATH] [--json]
+
+doctor checks the daemon environment read-only (platform, config, socket
+state, per-user unit placement). The *-plan commands render the first-party
+launchd/systemd unit text and the exact command steps for a clean host —
+they never install, start, stop, or query the host service manager.
+";
+
+/// Resolve the daemon socket override: the CLI flag wins over
+/// `config.daemon.socket`; otherwise the XDG runtime default applies.
+fn effective_socket(flag: Option<&str>, config: Option<&Config>) -> Option<String> {
+    flag.map(str::to_string).or_else(|| {
+        config
+            .and_then(|config| config.daemon_socket.clone())
+            .filter(|socket| !socket.is_empty())
+    })
+}
+
+/// Load the optional config; a found-but-invalid config is a hard error.
+#[allow(clippy::result_large_err)]
+fn load_optional_config(invocation: &Invocation) -> Result<Option<Config>, CmdResult> {
+    match discover_config(invocation.config_path.as_deref()) {
+        Ok(Some(path)) => match load_config(&path) {
+            Ok(config) => Ok(Some(config)),
+            Err(load_error) => Err(load_error_result(load_error)),
+        },
+        Ok(None) => Ok(None),
+        Err(load_error) => Err(load_error_result(load_error)),
+    }
+}
+
+/// Derive daemon paths, applying the config/flag socket override.
+#[allow(clippy::result_large_err)]
+fn derive_paths(socket: Option<String>) -> Result<DaemonPaths, CmdResult> {
+    DaemonPaths::derive(socket.as_deref()).map_err(|err| {
+        error_result(
+            1,
+            "daemon.paths",
+            format!("{}: {}", err.code, err.message),
+            false,
+        )
+    })
+}
+
+fn execute_daemon(action: DaemonAction, invocation: &Invocation) -> CmdResult {
+    match action {
+        DaemonAction::Run { socket: flag } => execute_daemon_run(flag.as_deref(), invocation),
+        DaemonAction::Status { socket: flag } => execute_daemon_status(flag.as_deref(), invocation),
+    }
+}
+
+fn execute_daemon_run(socket_flag: Option<&str>, invocation: &Invocation) -> CmdResult {
+    let config = match load_optional_config(invocation) {
+        Ok(config) => config,
+        Err(result) => return result,
+    };
+    if let Some(false) = config.as_ref().and_then(|config| config.daemon_enabled) {
+        return error_result(
+            4,
+            "refusal.daemon.disabled",
+            "config daemon.enabled=false: the daemon is disabled for this user; remove the flag or set daemon.enabled=true".to_string(),
+            false,
+        );
+    }
+    let socket = effective_socket(socket_flag, config.as_ref());
+    let paths = match derive_paths(socket) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    // The daemon logs readiness and every refusal to its own JSONL log; the
+    // foreground process runs until stopped by the service manager or a
+    // fatal error (there is no daemonize: launchd/systemd own the process).
+    match daemon::serve(&paths) {
+        Ok(()) => ok_result(object(vec![]), "daemon exited cleanly\n".to_string()),
+        Err(DaemonError { code, message }) => error_result(1, code, message, false),
+    }
+}
+
+fn execute_daemon_status(socket_flag: Option<&str>, invocation: &Invocation) -> CmdResult {
+    let config = match load_optional_config(invocation) {
+        Ok(config) => config,
+        Err(result) => return result,
+    };
+    let socket = effective_socket(socket_flag, config.as_ref());
+    let paths = match derive_paths(socket) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    match crate::lock::socket_presence(&paths.socket_path) {
+        crate::lock::SocketPresence::Active => {
+            let result = client::call(&paths.socket_path, "status", None);
+            match result {
+                Ok(doc) => {
+                    let epoch = doc
+                        .get("state")
+                        .and_then(|state| state.get("epoch"))
+                        .and_then(Val::as_int)
+                        .unwrap_or(0);
+                    let journal_seq = doc
+                        .get("state")
+                        .and_then(|state| state.get("journal_seq"))
+                        .and_then(Val::as_int)
+                        .unwrap_or(0);
+                    let pid = doc
+                        .get("daemon")
+                        .and_then(|daemon| daemon.get("pid"))
+                        .and_then(Val::as_int)
+                        .unwrap_or(0);
+                    let started_at = doc
+                        .get("daemon")
+                        .and_then(|daemon| daemon.get("started_at"))
+                        .and_then(Val::as_str)
+                        .unwrap_or("unknown");
+                    let human = format!(
+                        "daemon: running (pid {pid}, started {started_at})\nstate: epoch {epoch}, journal seq {journal_seq}\nsocket: {}\n",
+                        paths.socket_path.display()
+                    );
+                    ok_result(doc, human)
+                }
+                Err(RpcError { code, message }) => {
+                    error_result(1, &code, format!("daemon status: {message}"), false)
+                }
+            }
+        }
+        crate::lock::SocketPresence::Stale => error_result(
+            1,
+            "daemon.stale",
+            format!(
+                "a stale daemon socket exists at {}; a fresh `daemon run` reclaims it",
+                paths.socket_path.display()
+            ),
+            true,
+        ),
+        crate::lock::SocketPresence::Absent => error_result(
+            1,
+            "daemon.absent",
+            format!(
+                "no daemon is running on {}; read-only commands (doctor/status/plan) stay available without it",
+                paths.socket_path.display()
+            ),
+            false,
+        ),
+        crate::lock::SocketPresence::Unsafe(reason) => error_result(
+            1,
+            "daemon.unsafe_socket",
+            format!("{} ({})", reason, paths.socket_path.display()),
+            false,
+        ),
+    }
+}
+
+fn execute_service(action: ServiceAction, invocation: &Invocation) -> CmdResult {
+    match action {
+        ServiceAction::Doctor => execute_service_doctor(invocation),
+        ServiceAction::PlanInstall => execute_service_plan(invocation, "install"),
+        ServiceAction::PlanStatus => execute_service_plan(invocation, "status"),
+        ServiceAction::PlanUninstall => execute_service_plan(invocation, "uninstall"),
+    }
+}
+
+fn execute_service_doctor(invocation: &Invocation) -> CmdResult {
+    let config = match load_optional_config(invocation) {
+        Ok(config) => config,
+        Err(result) => return result,
+    };
+    let platform = service::detect_platform();
+    let socket = effective_socket(None, config.as_ref());
+    let paths = match derive_paths(socket) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    let mut rows: Vec<DoctorRow> = Vec::new();
+    let mut degraded = false;
+
+    rows.push(DoctorRow {
+        name: "platform",
+        status: "ok",
+        detail: Some(platform.to_string()),
+    });
+    let config_status = match &config {
+        Some(config) => {
+            let enabled = config.daemon_enabled.unwrap_or(true);
+            let detail = format!(
+                "daemon.enabled={enabled}{}",
+                config
+                    .daemon_socket
+                    .as_ref()
+                    .map(|socket| format!(", daemon.socket={socket}"))
+                    .unwrap_or_default()
+            );
+            if !enabled {
+                degraded = true;
+            }
+            ("found", detail)
+        }
+        None => ("absent", "no config file; defaults apply".to_string()),
+    };
+    rows.push(DoctorRow {
+        name: "config",
+        status: config_status.0,
+        detail: Some(config_status.1),
+    });
+
+    let socket_presence = crate::lock::socket_presence(&paths.socket_path);
+    let (socket_status, socket_detail) = match &socket_presence {
+        crate::lock::SocketPresence::Active => ("running", describe_socket(&paths.socket_path)),
+        crate::lock::SocketPresence::Absent => ("absent", "daemon not running".to_string()),
+        crate::lock::SocketPresence::Stale => {
+            degraded = true;
+            ("stale", describe_socket(&paths.socket_path))
+        }
+        crate::lock::SocketPresence::Unsafe(reason) => {
+            degraded = true;
+            ("unsafe", reason.clone())
+        }
+    };
+    rows.push(DoctorRow {
+        name: "socket",
+        status: socket_status,
+        detail: Some(socket_detail),
+    });
+
+    // Per-user unit placement (read-only; never queried/activated).
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let config_home = crate::dirs::config_home().ok();
+    let (unit_name, unit_present) = match (platform, &home, &config_home) {
+        ("launchd", Some(home), _) => {
+            let path = service::launchd_plist_path(home);
+            (path.display().to_string(), path.exists())
+        }
+        ("systemd", _, Some(config_home)) => {
+            let path = service::systemd_unit_path(config_home);
+            (path.display().to_string(), path.exists())
+        }
+        _ => ("no per-user unit for this platform".to_string(), false),
+    };
+    rows.push(DoctorRow {
+        name: "service-unit",
+        status: if unit_present { "installed" } else { "absent" },
+        detail: Some(unit_name),
+    });
+    if unit_present && socket_status == "absent" {
+        degraded = true;
+    }
+
+    let data = object(vec![
+        (
+            "checks",
+            Val::Arr(
+                rows.iter()
+                    .map(DoctorRow::clone)
+                    .map(DoctorRow::into_val)
+                    .collect(),
+            ),
+        ),
+        (
+            "summary",
+            object(vec![
+                ("platform", string(platform)),
+                ("daemon", string(socket_status)),
+                (
+                    "unit",
+                    string(if unit_present { "installed" } else { "absent" }),
+                ),
+            ]),
+        ),
+    ]);
+    let human = rows.iter().map(DoctorRow::render).collect::<String>();
+    if degraded {
+        partial_result(data, human, String::new())
+    } else {
+        ok_result(data, human)
+    }
+}
+
+fn execute_service_plan(invocation: &Invocation, kind: &str) -> CmdResult {
+    let config = match load_optional_config(invocation) {
+        Ok(config) => config,
+        Err(result) => return result,
+    };
+    let platform = service::detect_platform();
+    let socket = effective_socket(None, config.as_ref());
+    let paths = match derive_paths(socket) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    let bin = std::env::current_exe()
+        .ok()
+        .unwrap_or_else(|| std::path::PathBuf::from("herdr-fleet"));
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let config_home = crate::dirs::config_home().ok();
+
+    let (unit, target) = match platform {
+        "launchd" => {
+            let target = home
+                .as_ref()
+                .map(|home| service::launchd_plist_path(home))
+                .unwrap_or_else(|| std::path::PathBuf::from(format!("~/{LAUNCHD_LABEL}.plist")));
+            (service::launchd_unit(&bin, &paths.socket_path), target)
+        }
+        "systemd" => {
+            let target = config_home
+                .as_ref()
+                .map(|config_home| service::systemd_unit_path(config_home))
+                .unwrap_or_else(|| {
+                    std::path::PathBuf::from(format!("~/.config/systemd/user/{SYSTEMD_UNIT_NAME}"))
+                });
+            (service::systemd_unit(&bin, &paths.socket_path), target)
+        }
+        other => {
+            return error_result(
+                1,
+                "service.unsupported",
+                format!("no first-party unit exists for platform {other:?}"),
+                false,
+            );
+        }
+    };
+    let steps = match kind {
+        "install" => service::install_plan_steps(
+            platform,
+            &bin,
+            &paths.socket_path,
+            home.as_deref().unwrap_or(std::path::Path::new("~")),
+            config_home.as_deref().unwrap_or(std::path::Path::new("~")),
+        ),
+        "status" => service::status_plan_steps(platform),
+        "uninstall" => service::uninstall_plan_steps(
+            platform,
+            home.as_deref().unwrap_or(std::path::Path::new("~")),
+            config_home.as_deref().unwrap_or(std::path::Path::new("~")),
+        ),
+        other => {
+            return error_result(
+                2,
+                "usage.error",
+                format!("unknown plan kind {other:?}"),
+                false,
+            );
+        }
+    };
+    let step_vals: Vec<Val> = steps.iter().map(|step| string(step)).collect();
+    let data = object(vec![
+        ("platform", string(platform)),
+        ("target", string(&target.display().to_string())),
+        ("unit", string(&unit)),
+        ("steps", Val::Arr(step_vals)),
+    ]);
+    let mut human = String::new();
+    human.push_str(&format!(
+        "herdr-fleet service {kind}-plan (platform {platform}) — nothing was installed or started\n\n"
+    ));
+    human.push_str(&format!("unit file: {}\n\n", target.display()));
+    human.push_str(&unit);
+    human.push_str("\nsteps:\n");
+    for (index, step) in steps.iter().enumerate() {
+        human.push_str(&format!("  {}. {step}\n", index + 1));
+    }
+    ok_result(data, human)
+}
 
 #[cfg(test)]
 mod tests {

@@ -10,13 +10,22 @@ readme = "README.md"
 license = "Apache-2.0 OR MIT"
 
 [dependencies]
-# Read-only slice (issue #4): TOML parsing for hf-config/hf-policy documents,
+# Read-only core (issue #4): TOML parsing for hf-config/hf-policy documents,
 # SHA-256 for deterministic plan digests/acceptance revisions, and serde for
 # the typed TOML decode path. No async/HTTP/clap/tracing dependencies: the
-# slice is stdlib-first and spawns only bounded child processes.
+# core is stdlib-first and spawns only bounded child processes.
 serde = "1"
 sha2 = "0.10"
 toml = "0.8"
+
+# Daemon foundation (issue #5): bundled SQLite is the daemon-owned state
+# authority (leases, idempotency claims, journals, audit, epochs, recovery);
+# fs2 provides the cross-platform advisory file lock (flock) that makes the
+# daemon a single-writer process with stale-process recovery. Both are
+# permissive-licensed and used only where the slice proves need.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+fs2 = "0.4.3"
+libc = "0.2"
 
 [dev-dependencies]
 # Reference JSON parser used only to cross-check the crate's own strict

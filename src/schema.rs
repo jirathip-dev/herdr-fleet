@@ -1,10 +1,14 @@
 //! #3 schema-family validators (closed v1 surfaces).
 //!
 //! This module is the Rust mirror of the machine-readable half of the
-//! contract — `scripts/check-contract-fixtures.py` — for exactly the seven
-//! families this read-only slice emits or consumes: `hf-config/v1`,
+//! contract — `scripts/check-contract-fixtures.py` — for the families this
+//! slice emits or consumes: the read-only CLI families (`hf-config/v1`,
 //! `hf-policy/v1` (TOML), `hf-output/v1`, `hf-error/v1`,
-//! `hf-observation/v1`, `hf-plan/v1`, and `hf-capability/v1` (JSON).
+//! `hf-observation/v1`, `hf-plan/v1`, `hf-capability/v1`) plus the daemon
+//! wire/state families implemented by the daemon foundation slice
+//! (`hf-rpc-request/v1`, `hf-rpc-response/v1`, `hf-event/v1` (JSONL),
+//! `hf-audit/v1` (JSONL), `hf-migration/v1`, `hf-epoch/v1`, `hf-grant/v1`,
+//! `hf-outcome/v1`).
 //!
 //! Verdict semantics mirror the probe: `refuse-parse`, `refuse-schema`
 //! (missing/foreign identifier), `refuse-version` (known family, unsupported
@@ -17,8 +21,9 @@
 
 use crate::canonical::canonical_bytes;
 use crate::formats::{
-    is_actor, is_error_code, is_hex40, is_hex64, is_plan_id, is_repository_identity,
-    is_rfc3339_seconds_z, is_slug,
+    is_action_code, is_actor, is_error_code, is_grant_id, is_hex40, is_hex64, is_idempotency_key,
+    is_migration_id, is_plan_id, is_repository_identity, is_request_id, is_rfc3339_seconds_z,
+    is_slug,
 };
 use crate::value::Val;
 
@@ -39,6 +44,22 @@ pub enum Family {
     Plan,
     /// `hf-capability/v1` — capability negotiation envelope.
     Capability,
+    /// `hf-rpc-request/v1` — daemon request document (per-user socket).
+    RpcRequest,
+    /// `hf-rpc-response/v1` — daemon response document.
+    RpcResponse,
+    /// `hf-event/v1` — local JSONL event record (one event per line).
+    Event,
+    /// `hf-audit/v1` — journal/audit record (JSONL; journal-before-mutation).
+    Audit,
+    /// `hf-migration/v1` — SQLite migration manifest.
+    Migration,
+    /// `hf-epoch/v1` — state epoch record (restore rotation).
+    Epoch,
+    /// `hf-grant/v1` — route grant (AC3 bindings).
+    Grant,
+    /// `hf-outcome/v1` — typed step outcome (idempotency-keyed).
+    Outcome,
 }
 
 impl Family {
@@ -52,6 +73,14 @@ impl Family {
             Family::Observation => "hf-observation",
             Family::Plan => "hf-plan",
             Family::Capability => "hf-capability",
+            Family::RpcRequest => "hf-rpc-request",
+            Family::RpcResponse => "hf-rpc-response",
+            Family::Event => "hf-event",
+            Family::Audit => "hf-audit",
+            Family::Migration => "hf-migration",
+            Family::Epoch => "hf-epoch",
+            Family::Grant => "hf-grant",
+            Family::Outcome => "hf-outcome",
         }
     }
 
@@ -65,11 +94,25 @@ impl Family {
             Family::Observation => "hf-observation/v1",
             Family::Plan => "hf-plan/v1",
             Family::Capability => "hf-capability/v1",
+            Family::RpcRequest => "hf-rpc-request/v1",
+            Family::RpcResponse => "hf-rpc-response/v1",
+            Family::Event => "hf-event/v1",
+            Family::Audit => "hf-audit/v1",
+            Family::Migration => "hf-migration/v1",
+            Family::Epoch => "hf-epoch/v1",
+            Family::Grant => "hf-grant/v1",
+            Family::Outcome => "hf-outcome/v1",
         }
     }
 
+    /// Whether the family's document surface is newline-delimited JSONL.
+    pub fn is_jsonl(self) -> bool {
+        matches!(self, Family::Event | Family::Audit)
+    }
+
     /// Parse document bytes into a [`Val`]: TOML for config/policy, strict
-    /// JSON for every other family.
+    /// JSON for every other single-document family. JSONL families are
+    /// parsed line-by-line by [`validate_bytes`] instead.
     fn parse_bytes(self, bytes: &[u8]) -> Result<Val, String> {
         let text = std::str::from_utf8(bytes).map_err(|err| format!("not valid UTF-8 ({err})"))?;
         match self {
@@ -149,8 +192,13 @@ impl Verdict {
 
 /// Validate raw document bytes for a family (parse + version + shape +
 /// canonical-bytes rules). This is the entry point used by the CLI's config
-/// commands and by the fixture-corpus tests.
+/// commands and by the fixture-corpus tests. JSONL families are validated
+/// line by line: every non-empty line must parse and validate, mirroring the
+/// probe's JSONL driver.
 pub fn validate_bytes(family: Family, bytes: &[u8]) -> Verdict {
+    if family.is_jsonl() {
+        return validate_jsonl(family, bytes);
+    }
     let doc = match family.parse_bytes(bytes) {
         Ok(doc) => doc,
         Err(message) => return Verdict::refuse(Refusal::Parse, message),
@@ -172,6 +220,43 @@ pub fn validate_bytes(family: Family, bytes: &[u8]) -> Verdict {
     Verdict::accept()
 }
 
+/// Validate a newline-delimited JSONL document: one document per line, every
+/// line must parse and validate for the family (a single bad line fails the
+/// stream, mirroring the probe's JSONL driver).
+fn validate_jsonl(family: Family, bytes: &[u8]) -> Verdict {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) => return Verdict::refuse(Refusal::Parse, format!("not valid UTF-8 ({err})")),
+    };
+    let mut seen_line = false;
+    for (lineno, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        seen_line = true;
+        let doc = match Val::parse_json(line) {
+            Ok(doc) => doc,
+            Err(err) => {
+                return Verdict::refuse(
+                    Refusal::Parse,
+                    format!("line {}: not valid JSON ({err})", lineno + 1),
+                );
+            }
+        };
+        let verdict = validate_doc(family, &doc);
+        if verdict.refusal.is_some() {
+            return Verdict::refuse(
+                verdict.refusal().expect("refused"),
+                format!("line {}: {}", lineno + 1, verdict.message()),
+            );
+        }
+    }
+    if !seen_line {
+        return Verdict::refuse(Refusal::Parse, "empty JSONL document");
+    }
+    Verdict::accept()
+}
+
 /// Validate an already-parsed document value for a family.
 pub fn validate_doc(family: Family, doc: &Val) -> Verdict {
     match family {
@@ -182,6 +267,14 @@ pub fn validate_doc(family: Family, doc: &Val) -> Verdict {
         Family::Observation => validate_observation(doc),
         Family::Plan => validate_plan(doc),
         Family::Capability => validate_capability(doc),
+        Family::RpcRequest => validate_rpc_request(doc),
+        Family::RpcResponse => validate_rpc_response(doc),
+        Family::Event => validate_event(doc),
+        Family::Audit => validate_audit(doc),
+        Family::Migration => validate_migration(doc),
+        Family::Epoch => validate_epoch(doc),
+        Family::Grant => validate_grant(doc),
+        Family::Outcome => validate_outcome(doc),
     }
 }
 
@@ -959,7 +1052,7 @@ fn validate_capability(obj: &Val) -> Verdict {
 }
 
 /// Registry of the families this module validates (used by drift tests).
-pub const SUPPORTED_FAMILIES: [Family; 7] = [
+pub const SUPPORTED_FAMILIES: [Family; 15] = [
     Family::Config,
     Family::Policy,
     Family::Output,
@@ -967,7 +1060,583 @@ pub const SUPPORTED_FAMILIES: [Family; 7] = [
     Family::Observation,
     Family::Plan,
     Family::Capability,
+    Family::RpcRequest,
+    Family::RpcResponse,
+    Family::Event,
+    Family::Audit,
+    Family::Migration,
+    Family::Epoch,
+    Family::Grant,
+    Family::Outcome,
 ];
+
+// ---------------------------------------------------------------------------
+// Daemon wire/state family validators (mirror the probe's validators)
+// ---------------------------------------------------------------------------
+
+/// Closed RPC method set (spec-daemon.md; mirrored by the fixture probe).
+pub const RPC_METHODS: [&str; 13] = [
+    "capabilities",
+    "doctor",
+    "status",
+    "plan",
+    "apply",
+    "grants.list",
+    "grants.revoke",
+    "schedules.list",
+    "state.epoch",
+    "backup.create",
+    "restore.begin",
+    "journal.tail",
+    "events.subscribe",
+];
+
+/// Closed hf-event/v1 event-kind set (spec-daemon.md).
+pub const EVENT_KINDS: [&str; 7] = [
+    "state.snapshot",
+    "agent.updated",
+    "plan.updated",
+    "grant.updated",
+    "journal.appended",
+    "epoch.rotated",
+    "schedule.ran",
+];
+
+/// Closed hf-grant/v1 phase set (spec-plans.md §2).
+pub const GRANT_PHASES: [&str; 9] = [
+    "plan",
+    "read",
+    "worktree",
+    "spawn",
+    "review",
+    "merge",
+    "production",
+    "cleanup",
+    "recovery",
+];
+
+/// Closed hf-grant/v1 capability set (spec-plans.md §2).
+pub const GRANT_CAPS: [&str; 9] = [
+    "read",
+    "worktree",
+    "spawn",
+    "prompt",
+    "review",
+    "merge",
+    "production",
+    "cleanup",
+    "release",
+];
+
+fn validate_rpc_request(obj: &Val) -> Verdict {
+    if let Err(verdict) = check_schema(obj, Family::RpcRequest) {
+        return verdict;
+    }
+    if let Err(verdict) = require_keys(
+        obj,
+        &["schema", "id", "method", "params"],
+        &["schema", "id", "method", "params"],
+        "rpc-request",
+    ) {
+        return verdict;
+    }
+    match obj.get("id") {
+        Some(Val::Str(text)) if is_request_id(text) => {}
+        _ => {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "rpc-request.id must be 8-64 lowercase hex",
+            );
+        }
+    }
+    match obj.get("method") {
+        Some(Val::Str(text)) if RPC_METHODS.contains(&text.as_str()) => {}
+        _ => {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "rpc-request.method outside the closed method set",
+            );
+        }
+    }
+    match obj.get("params") {
+        None | Some(Val::Null) | Some(Val::Obj(_)) => {}
+        _ => {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "rpc-request.params must be object or null",
+            );
+        }
+    }
+    if matches!(obj.get("method"), Some(Val::Str(text)) if text == "apply") {
+        let params = obj.get("params");
+        let key_ok = match params {
+            Some(Val::Obj(_)) => matches!(
+                params.and_then(|p| p.get("idempotency_key")),
+                Some(Val::Str(text)) if is_idempotency_key(text)
+            ),
+            _ => false,
+        };
+        if !key_ok {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "rpc-request: apply requires params.idempotency_key (ik_ format)",
+            );
+        }
+    }
+    Verdict::accept()
+}
+
+fn validate_rpc_response(obj: &Val) -> Verdict {
+    if let Err(verdict) = check_schema(obj, Family::RpcResponse) {
+        return verdict;
+    }
+    if let Err(verdict) = require_keys(
+        obj,
+        &["schema", "id", "ok", "result", "error"],
+        &["schema", "id", "ok", "result", "error"],
+        "rpc-response",
+    ) {
+        return verdict;
+    }
+    match obj.get("id") {
+        Some(Val::Str(text)) if is_request_id(text) => {}
+        _ => {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "rpc-response.id must be 8-64 lowercase hex",
+            );
+        }
+    }
+    let ok = match obj.get("ok") {
+        Some(Val::Bool(value)) => *value,
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "rpc-response.ok must be a boolean");
+        }
+    };
+    if ok {
+        if !matches!(obj.get("error"), None | Some(Val::Null)) {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "rpc-response: ok responses must have null error",
+            );
+        }
+        if !matches!(obj.get("result"), Some(Val::Obj(_))) {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "rpc-response: ok responses require a result object",
+            );
+        }
+    } else {
+        if !matches!(obj.get("result"), None | Some(Val::Null)) {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "rpc-response: failed responses must have null result",
+            );
+        }
+        match obj.get("error") {
+            Some(value) => {
+                if let Err(verdict) = err_shaped(value) {
+                    return verdict;
+                }
+            }
+            None => {
+                return Verdict::refuse(
+                    Refusal::Malformed,
+                    "rpc-response: failed responses require an error object",
+                );
+            }
+        }
+    }
+    Verdict::accept()
+}
+
+fn validate_event(obj: &Val) -> Verdict {
+    if let Err(verdict) = check_schema(obj, Family::Event) {
+        return verdict;
+    }
+    if let Err(verdict) = require_keys(
+        obj,
+        &["schema", "event", "seq", "ts", "data"],
+        &["schema", "event", "seq", "ts", "data"],
+        "event",
+    ) {
+        return verdict;
+    }
+    match obj.get("event") {
+        Some(Val::Str(text)) if EVENT_KINDS.contains(&text.as_str()) => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "event kind outside the closed set");
+        }
+    }
+    if let Err(verdict) = expect_int(obj, "seq", "event", 0) {
+        return verdict;
+    }
+    if let Err(verdict) = expect_timestamp(obj, "ts", "event") {
+        return verdict;
+    }
+    if !matches!(obj.get("data"), Some(Val::Obj(_))) {
+        return Verdict::refuse(Refusal::Malformed, "event.data must be an object");
+    }
+    Verdict::accept()
+}
+
+fn validate_audit(obj: &Val) -> Verdict {
+    if let Err(verdict) = check_schema(obj, Family::Audit) {
+        return verdict;
+    }
+    const KEYS: [&str; 10] = [
+        "schema",
+        "seq",
+        "action",
+        "target",
+        "idempotency_key",
+        "plan_hash",
+        "grant_id",
+        "epoch",
+        "recorded_before_mutation",
+        "at",
+    ];
+    if let Err(verdict) = require_keys(obj, &KEYS, &KEYS, "audit") {
+        return verdict;
+    }
+    if let Err(verdict) = expect_int(obj, "seq", "audit", 0) {
+        return verdict;
+    }
+    match obj.get("action") {
+        Some(Val::Str(text)) if is_action_code(text) => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "audit.action invalid");
+        }
+    }
+    match obj.get("target") {
+        Some(Val::Str(text)) if !text.is_empty() => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "audit.target must be non-empty");
+        }
+    }
+    match obj.get("idempotency_key") {
+        Some(Val::Str(text)) if is_idempotency_key(text) => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "audit.idempotency_key invalid");
+        }
+    }
+    for (key, check) in [
+        ("plan_hash", is_hex64 as fn(&str) -> bool),
+        ("grant_id", is_grant_id),
+    ] {
+        match obj.get(key) {
+            None | Some(Val::Null) => {}
+            Some(Val::Str(text)) if check(text) => {}
+            _ => {
+                return Verdict::refuse(Refusal::Malformed, format!("audit.{key} invalid"));
+            }
+        }
+    }
+    if let Err(verdict) = expect_int(obj, "epoch", "audit", 0) {
+        return verdict;
+    }
+    let recorded_before = match obj.get("recorded_before_mutation") {
+        Some(Val::Bool(value)) => *value,
+        _ => {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "audit.recorded_before_mutation must be a boolean",
+            );
+        }
+    };
+    if let Some(Val::Str(action)) = obj.get("action")
+        && action.starts_with("mutate.")
+        && !recorded_before
+    {
+        return Verdict::refuse(
+            Refusal::Malformed,
+            "audit: mutation actions must be journaled before the mutation (fail closed)",
+        );
+    }
+    if let Err(verdict) = expect_timestamp(obj, "at", "audit") {
+        return verdict;
+    }
+    Verdict::accept()
+}
+
+fn validate_migration(obj: &Val) -> Verdict {
+    if let Err(verdict) = check_schema(obj, Family::Migration) {
+        return verdict;
+    }
+    if let Err(verdict) = require_keys(
+        obj,
+        &[
+            "schema",
+            "migration_id",
+            "applies_from",
+            "applies_to",
+            "checksum",
+            "description",
+        ],
+        &[
+            "schema",
+            "migration_id",
+            "applies_from",
+            "applies_to",
+            "checksum",
+            "description",
+        ],
+        "migration",
+    ) {
+        return verdict;
+    }
+    match obj.get("migration_id") {
+        Some(Val::Str(text)) if is_migration_id(text) => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "migration.migration_id invalid");
+        }
+    }
+    if let Err(verdict) = expect_int(obj, "applies_from", "migration", 0) {
+        return verdict;
+    }
+    if let Err(verdict) = expect_int(obj, "applies_to", "migration", 0) {
+        return verdict;
+    }
+    let (from, to) = match (obj.get("applies_from"), obj.get("applies_to")) {
+        (Some(Val::Int(from)), Some(Val::Int(to))) => (*from, *to),
+        _ => unreachable!("expect_int enforced integers"),
+    };
+    if to != from + 1 {
+        return Verdict::refuse(
+            Refusal::Malformed,
+            "migration: applies_to must be exactly applies_from + 1 (linear, ordered)",
+        );
+    }
+    match obj.get("checksum") {
+        Some(Val::Str(text)) if is_hex64(text) => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "migration.checksum must be 64-hex");
+        }
+    }
+    match obj.get("description") {
+        Some(Val::Str(text)) if !text.is_empty() => {}
+        _ => {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "migration.description must be non-empty",
+            );
+        }
+    }
+    Verdict::accept()
+}
+
+fn validate_epoch(obj: &Val) -> Verdict {
+    if let Err(verdict) = check_schema(obj, Family::Epoch) {
+        return verdict;
+    }
+    if let Err(verdict) = require_keys(
+        obj,
+        &["schema", "epoch", "created_at", "reason", "prior_epoch"],
+        &["schema", "epoch", "created_at", "reason", "prior_epoch"],
+        "epoch",
+    ) {
+        return verdict;
+    }
+    if let Err(verdict) = expect_int(obj, "epoch", "epoch", 0) {
+        return verdict;
+    }
+    if let Err(verdict) = expect_timestamp(obj, "created_at", "epoch") {
+        return verdict;
+    }
+    match obj.get("reason") {
+        Some(Val::Str(text))
+            if matches!(text.as_str(), "initial" | "restore" | "security_rotation") => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "epoch.reason outside closed set");
+        }
+    }
+    let prior = obj.get("prior_epoch");
+    match obj.get("reason") {
+        Some(Val::Str(text)) if text == "initial" => {
+            if !matches!(prior, None | Some(Val::Null)) {
+                return Verdict::refuse(
+                    Refusal::Malformed,
+                    "epoch: initial epoch must have prior_epoch null",
+                );
+            }
+        }
+        _ => match prior {
+            Some(Val::Int(number)) if *number >= 0 => {}
+            _ => {
+                return Verdict::refuse(
+                    Refusal::Malformed,
+                    "epoch: rotations must reference a prior_epoch integer",
+                );
+            }
+        },
+    }
+    Verdict::accept()
+}
+
+fn validate_grant(obj: &Val) -> Verdict {
+    if let Err(verdict) = check_schema(obj, Family::Grant) {
+        return verdict;
+    }
+    const KEYS: [&str; 12] = [
+        "schema",
+        "grant_id",
+        "repository",
+        "issue",
+        "workflow_hash",
+        "policy_hash",
+        "phase",
+        "scope",
+        "caps",
+        "expires_at",
+        "state_epoch",
+        "created_at",
+    ];
+    if let Err(verdict) = require_keys(obj, &KEYS, &KEYS, "grant") {
+        return verdict;
+    }
+    match obj.get("grant_id") {
+        Some(Val::Str(text)) if is_grant_id(text) => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "grant.grant_id invalid");
+        }
+    }
+    match obj.get("repository") {
+        Some(Val::Str(text)) if is_repository_identity(text) => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "grant.repository must be owner/name");
+        }
+    }
+    if let Some(issue) = obj.get("issue")
+        && let Err(verdict) = issue_shaped(issue)
+    {
+        return verdict;
+    }
+    for key in ["workflow_hash", "policy_hash"] {
+        match obj.get(key) {
+            Some(Val::Str(text)) if is_hex64(text) => {}
+            _ => {
+                return Verdict::refuse(Refusal::Malformed, format!("grant.{key} must be 64-hex"));
+            }
+        }
+    }
+    match obj.get("phase") {
+        Some(Val::Str(text)) if GRANT_PHASES.contains(&text.as_str()) => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "grant.phase outside closed set");
+        }
+    }
+    match obj.get("scope") {
+        Some(Val::Str(text)) if !text.is_empty() && text.len() <= 256 => {}
+        _ => {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "grant.scope must be a non-empty string <= 256 chars",
+            );
+        }
+    }
+    let caps = obj.get("caps");
+    let caps_ok = match caps {
+        Some(Val::Arr(items)) if !items.is_empty() => items
+            .iter()
+            .all(|item| matches!(item, Val::Str(text) if GRANT_CAPS.contains(&text.as_str()))),
+        _ => false,
+    };
+    if !caps_ok {
+        return Verdict::refuse(
+            Refusal::Malformed,
+            "grant.caps must be a non-empty subset of the closed set",
+        );
+    }
+    if let Err(verdict) = expect_timestamp(obj, "expires_at", "grant") {
+        return verdict;
+    }
+    if let Err(verdict) = expect_int(obj, "state_epoch", "grant", 0) {
+        return verdict;
+    }
+    if let Err(verdict) = expect_timestamp(obj, "created_at", "grant") {
+        return verdict;
+    }
+    Verdict::accept()
+}
+
+fn validate_outcome(obj: &Val) -> Verdict {
+    if let Err(verdict) = check_schema(obj, Family::Outcome) {
+        return verdict;
+    }
+    const KEYS: [&str; 8] = [
+        "schema",
+        "plan_id",
+        "step_id",
+        "status",
+        "idempotency_key",
+        "observed_at",
+        "result",
+        "error",
+    ];
+    if let Err(verdict) = require_keys(obj, &KEYS, &KEYS, "outcome") {
+        return verdict;
+    }
+    match obj.get("plan_id") {
+        Some(Val::Str(text)) if is_plan_id(text) => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "outcome.plan_id invalid");
+        }
+    }
+    match obj.get("step_id") {
+        Some(Val::Str(text)) if is_slug(text) => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "outcome.step_id invalid");
+        }
+    }
+    match obj.get("status") {
+        Some(Val::Str(text))
+            if matches!(
+                text.as_str(),
+                "succeeded" | "failed" | "ambiguous" | "refused" | "superseded"
+            ) => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "outcome.status outside closed set");
+        }
+    }
+    match obj.get("idempotency_key") {
+        Some(Val::Str(text)) if is_idempotency_key(text) => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "outcome.idempotency_key invalid");
+        }
+    }
+    if let Err(verdict) = expect_timestamp(obj, "observed_at", "outcome") {
+        return verdict;
+    }
+    for key in ["result", "error"] {
+        match obj.get(key) {
+            None | Some(Val::Null) | Some(Val::Obj(_)) => {}
+            _ => {
+                return Verdict::refuse(
+                    Refusal::Malformed,
+                    format!("outcome.{key} must be object or null"),
+                );
+            }
+        }
+    }
+    if let Some(Val::Str(status)) = obj.get("status")
+        && matches!(status.as_str(), "failed" | "refused")
+    {
+        match obj.get("error") {
+            Some(value) if !matches!(value, Val::Null) => {
+                if let Err(verdict) = err_shaped(value) {
+                    return verdict;
+                }
+            }
+            _ => {
+                return Verdict::refuse(
+                    Refusal::Malformed,
+                    "outcome: failed|refused requires an error object",
+                );
+            }
+        }
+    }
+    Verdict::accept()
+}
 
 // ---------------------------------------------------------------------------
 // Fixture-corpus discrimination tests
@@ -1174,6 +1843,59 @@ mod tests {
             (
                 Family::Capability,
                 "capability/capability.unknown-version.json",
+                false,
+            ),
+            (Family::RpcRequest, "rpc/request.status.valid.json", true),
+            (Family::RpcRequest, "rpc/request.apply.valid.json", true),
+            (Family::RpcRequest, "rpc/request.malformed.json", false),
+            (
+                Family::RpcRequest,
+                "rpc/request.unknown-version.json",
+                false,
+            ),
+            (Family::RpcResponse, "rpc/response.ok.valid.json", true),
+            (Family::RpcResponse, "rpc/response.error.valid.json", true),
+            (Family::RpcResponse, "rpc/response.malformed.json", false),
+            (
+                Family::RpcResponse,
+                "rpc/response.unknown-version.json",
+                false,
+            ),
+            (Family::Event, "event/events.valid.jsonl", true),
+            (Family::Event, "event/events.malformed.jsonl", false),
+            (Family::Event, "event/events.badline.jsonl", false),
+            (Family::Event, "event/events.unknown-version.jsonl", false),
+            (Family::Audit, "audit/audit.valid.jsonl", true),
+            (Family::Audit, "audit/audit.malformed.jsonl", false),
+            (Family::Audit, "audit/audit.unknown-version.jsonl", false),
+            (Family::Migration, "migration/migration.valid.json", true),
+            (
+                Family::Migration,
+                "migration/migration.malformed.json",
+                false,
+            ),
+            (
+                Family::Migration,
+                "migration/migration.unknown-version.json",
+                false,
+            ),
+            (Family::Epoch, "epoch/epoch.initial.valid.json", true),
+            (Family::Epoch, "epoch/epoch.restore.valid.json", true),
+            (Family::Epoch, "epoch/epoch.malformed.json", false),
+            (Family::Epoch, "epoch/epoch.unknown-version.json", false),
+            (Family::Grant, "grant/grant.valid.json", true),
+            (Family::Grant, "grant/grant.malformed.json", false),
+            (Family::Grant, "grant/grant.unknown-version.json", false),
+            (
+                Family::Outcome,
+                "outcome/outcome.succeeded.valid.json",
+                true,
+            ),
+            (Family::Outcome, "outcome/outcome.failed.valid.json", true),
+            (Family::Outcome, "outcome/outcome.malformed.json", false),
+            (
+                Family::Outcome,
+                "outcome/outcome.unknown-version.json",
                 false,
             ),
         ];

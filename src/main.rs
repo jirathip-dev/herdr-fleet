@@ -82,6 +82,12 @@ fn per_command_usage(command: &str) -> &'static str {
             "usage: herdr-fleet plan <repository> <issue> [--revision HEX40] [--config PATH] [--json]"
         }
         "capabilities" => "usage: herdr-fleet capabilities [--json]",
+        "daemon" => {
+            "usage: herdr-fleet daemon run [--socket PATH] [--config PATH]\n       herdr-fleet daemon status [--config PATH] [--json]"
+        }
+        "service" => {
+            "usage: herdr-fleet service <doctor|install-plan|status-plan|uninstall-plan> [--config PATH] [--json]"
+        }
         _ => "usage: herdr-fleet [--help] [--version] | herdr-fleet <command> [options]",
     }
 }

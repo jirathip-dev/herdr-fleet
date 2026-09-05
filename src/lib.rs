@@ -7,15 +7,22 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod backup;
 pub mod canonical;
+pub mod client;
 pub mod commands;
 pub mod config;
+pub mod daemon;
+pub mod dirs;
 pub mod formats;
+pub mod lock;
 pub mod observe;
 pub mod plan;
 pub mod process;
 pub mod redact;
 pub mod schema;
+pub mod service;
+pub mod state;
 pub mod time;
 pub mod value;
 

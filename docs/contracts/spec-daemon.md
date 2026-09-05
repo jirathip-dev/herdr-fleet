@@ -24,7 +24,9 @@ remain usable without it; SQLite owns state; no network control API).
 
 - `method` is a closed set: `capabilities`, `doctor`, `status`, `plan`,
   `apply`, `grants.list`, `grants.revoke`, `schedules.list`, `state.epoch`,
-  `backup.create`, `restore.begin`, `journal.tail`.
+  `backup.create`, `restore.begin`, `journal.tail`, `events.subscribe`
+  (issue #5 adds the event stream over the socket; the closed set above is
+  mirrored by the Rust schema validator and the fixture oracle).
 - `apply` **requires** `params.idempotency_key` (`ik_` format): an apply
   without a key is refused at parse time (`rpc/request.malformed.json`).
   Replaying the same request id + idempotency key returns the recorded
@@ -67,6 +69,24 @@ optional; nothing requires it):
   (`event/events.badline.jsonl` refuses at parse).
 - Event content is redacted by construction (shared adapter-boundary
   redaction, [spec-cli.md](spec-cli.md)); no credentials ever ride events.
+
+## `events.subscribe` (issue #5; AC7)
+
+A subscriber connection sends one `events.subscribe` request (params
+`{"cursor": <int>}` optional — absent means "fresh snapshot first"). The
+daemon answers with the ok response, then pushes `hf-event/v1` lines:
+
+- No cursor ⇒ one `state.snapshot` line first (current state at the latest
+  journal seq), then live events.
+- `cursor` inside the retained window ⇒ contiguous replay of `seq > cursor`
+  (no snapshot), then live events.
+- `cursor` at/behind the retained window edge or in the future ⇒ a fresh
+  `state.snapshot` line (gap/resnapshot semantics).
+- Lines are seq-ordered and strictly increasing; per-subscriber queues are
+  bounded, and a subscriber that does not drain is disconnected (bounded
+  backpressure; mutations keep succeeding).
+- A subscribe connection is push-only after the response: the client never
+  sends again on it.
 
 ## Read-only independence
 
