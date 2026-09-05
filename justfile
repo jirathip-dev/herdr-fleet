@@ -34,8 +34,6 @@ build-release:
     cargo build --release --locked
 
 # Public-tree/privacy scanner (self-test + scan) + supply-chain checks.
-# gitleaks is REQUIRED: a missing gitleaks fails this recipe with an
-# actionable message instead of silently skipping the content scan.
 security:
     #!/usr/bin/env bash
     set -euo pipefail
