@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target
+
+# Editor/OS junk
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Fleet lane-local files (never part of the public repository)
+.brief.md
+.hermes-context.md
+
+# Local environment scaffolding (never commit real credentials; see
+# scripts/check-public-tree.py — credential-class files are REJECTED from the
+# tracked tree even if listed here)
+.env
+.env.*

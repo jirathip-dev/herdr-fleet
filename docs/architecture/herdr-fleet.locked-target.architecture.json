@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "herdr-fleet — Locked Target Architecture",
+    "locale": "en",
+    "animation": "none",
+    "quality_profile": "showcase",
+    "viewBox": [1360, 840]
+  },
+  "components": [
+    {
+      "id": "operatorGrant",
+      "type": "external",
+      "label": "Operator + Route Grant",
+      "sublabel": "Issue intent · typed grant",
+      "pos": [20, 328],
+      "size": [180, 84]
+    },
+    {
+      "id": "fleetCli",
+      "type": "frontend",
+      "label": "CLI",
+      "sublabel": "Read-only without daemon",
+      "pos": [236, 328],
+      "size": [150, 84]
+    },
+    {
+      "id": "localDaemon",
+      "type": "backend",
+      "label": "Local Daemon",
+      "sublabel": "Sole state authority",
+      "pos": [422, 328],
+      "size": [180, 84]
+    },
+    {
+      "id": "planEngine",
+      "type": "security",
+      "label": "Typed Workflow + Plan Engine",
+      "sublabel": "Closed DAG · grant · digest",
+      "pos": [638, 328],
+      "size": [200, 84]
+    },
+    {
+      "id": "typedEffects",
+      "type": "messagebus",
+      "label": "Typed Effects + Adapters",
+      "sublabel": "Typed · keyed · exact read-back",
+      "pos": [874, 328],
+      "size": [200, 84]
+    },
+    {
+      "id": "herdrHost",
+      "type": "external",
+      "label": "Herdr",
+      "sublabel": "Workspace · terminal · agent",
+      "pos": [1150, 150],
+      "size": [190, 84]
+    },
+    {
+      "id": "gitHub",
+      "type": "external",
+      "label": "Git + GitHub",
+      "sublabel": "Branch · PR · check · read-back",
+      "brand": "github",
+      "pos": [1150, 328],
+      "size": [190, 84]
+    },
+    {
+      "id": "harnesses",
+      "type": "external",
+      "label": "Harnesses",
+      "sublabel": "Hermes · Claude Code · Codex",
+      "pos": [1150, 506],
+      "size": [190, 84]
+    },
+    {
+      "id": "xdgConfig",
+      "type": "frontend",
+      "label": "XDG Config",
+      "sublabel": "Canonical XDG TOML",
+      "pos": [570, 82],
+      "size": [180, 80]
+    },
+    {
+      "id": "privatePolicy",
+      "type": "security",
+      "label": "Private Policy Overlay",
+      "sublabel": "Optional · downstream example",
+      "pos": [800, 82],
+      "size": [220, 80]
+    },
+    {
+      "id": "sqliteState",
+      "type": "database",
+      "label": "SQLite State + Audit",
+      "sublabel": "Leases · journal · recovery · epoch",
+      "pos": [568, 514],
+      "size": [340, 84]
+    },
+    {
+      "id": "corralObserve",
+      "type": "external",
+      "label": "Corral (Optional Read-Only)",
+      "sublabel": "No dependency · no authority",
+      "pos": [412, 700],
+      "size": [200, 84]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "herdr-fleet core · trusted local host",
+      "wraps": ["fleetCli", "localDaemon", "planEngine", "typedEffects", "sqliteState"],
+      "pad": 28
+    }
+  ],
+  "connections": [
+    {
+      "id": "intentGrant",
+      "from": "operatorGrant",
+      "to": "fleetCli",
+      "label": "intent + grant",
+      "fromSide": "right",
+      "toSide": "left",
+      "route": "straight",
+      "labelAt": [218, 426],
+      "variant": "emphasis"
+    },
+    {
+      "id": "cliMutations",
+      "from": "fleetCli",
+      "to": "localDaemon",
+      "label": "Unix socket mutations",
+      "fromSide": "right",
+      "toSide": "left",
+      "route": "straight",
+      "labelAt": [404, 426],
+      "variant": "security"
+    },
+    {
+      "id": "daemonAuthority",
+      "from": "localDaemon",
+      "to": "planEngine",
+      "label": "sole authority",
+      "fromSide": "right",
+      "toSide": "left",
+      "route": "straight",
+      "labelAt": [620, 426],
+      "variant": "emphasis"
+    },
+    {
+      "id": "plannedEffects",
+      "from": "planEngine",
+      "to": "typedEffects",
+      "label": "journaled plan / apply / verify",
+      "fromSide": "right",
+      "toSide": "left",
+      "route": "straight",
+      "labelAt": [856, 426],
+      "variant": "security"
+    },
+    {
+      "id": "effectsHerdr",
+      "from": "typedEffects",
+      "to": "herdrHost",
+      "label": "workspace / pane / process",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "via": [[974, 270], [1245, 270]],
+      "labelAt": [1110, 252]
+    },
+    {
+      "id": "effectsGitHub",
+      "from": "typedEffects",
+      "to": "gitHub",
+      "label": "branch / PR / check / read-back",
+      "fromSide": "right",
+      "toSide": "left",
+      "route": "straight",
+      "labelAt": [1112, 426]
+    },
+    {
+      "id": "effectsHarnesses",
+      "from": "typedEffects",
+      "to": "harnesses",
+      "label": "capability / start / prompt / observe / cancel",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [[974, 460], [1245, 460]],
+      "labelAt": [1110, 478]
+    },
+    {
+      "id": "configPlan",
+      "from": "xdgConfig",
+      "to": "planEngine",
+      "label": "portable config",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "policyPlan",
+      "from": "privatePolicy",
+      "to": "planEngine",
+      "label": "explicit policy overlay",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "variant": "security"
+    },
+    {
+      "id": "planState",
+      "from": "planEngine",
+      "to": "sqliteState",
+      "label": "leases / journal / epoch",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [738, 468],
+      "variant": "emphasis"
+    },
+    {
+      "id": "daemonCorral",
+      "from": "localDaemon",
+      "to": "corralObserve",
+      "label": "read-only snapshots / events",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [512, 650],
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "Target contract",
+      "items": [
+        "Approved target architecture—not current implementation.",
+        "Arrows show direction; purple dashed = optional read-only; rose dashed = guarded control."
+      ]
+    }
+  ]
+}
