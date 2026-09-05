@@ -317,6 +317,59 @@ fn doctor_reports_missing_prerequisites_as_partial() {
 }
 
 #[test]
+fn doctor_degrades_on_mid_char_adapter_version_output() {
+    // Regression (review r1-1): hostile adapter text whose byte 200 falls
+    // mid-char (here: "herdr " + 67 x U+3042 = 207 bytes) must degrade into
+    // a typed result with a valid hf-output/v1 envelope and a closed 0-5
+    // exit code — never a String::truncate panic / exit 101.
+    let sandbox = Sandbox::new("doctor-midchar");
+    let home = home_dir(&sandbox);
+    let fake_dir = sandbox.path("fakebin-midchar");
+    std::fs::create_dir_all(&fake_dir).expect("fake dir");
+    let mut script = b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s' 'herdr ".to_vec();
+    for _ in 0..67 {
+        script.extend_from_slice(&[0xE3, 0x81, 0x82]); // U+3042, 3 bytes each
+    }
+    script.extend_from_slice(b"'\nexit 0\nfi\nexit 1\n");
+    std::fs::write(fake_dir.join("herdr"), &script).expect("hostile herdr");
+    sandbox.chmod_x("fakebin-midchar/herdr");
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let path = format!("{}:{}", fake_dir.display(), host_path);
+
+    let out = run_cli(&sandbox, &["doctor", "--json"], &path, Some(&home), None);
+    let code = out.status.code().expect("process exit code");
+    assert!(
+        (0..=5).contains(&code),
+        "hostile adapter text must stay inside the closed 0-5 exit codes, got {code} (panic: {})",
+        stderr(&out)
+    );
+    assert_eq!(
+        code, 3,
+        "unparsable herdr version degrades doctor to partial"
+    );
+    let doc = assert_envelope_valid("doctor", &out);
+    assert_eq!(doc.get("kind").and_then(Val::as_str), Some("partial"));
+    let data = doc.get("data").expect("data");
+    let checks = data.get("checks").expect("checks");
+    let Val::Arr(items) = checks else {
+        panic!("checks array")
+    };
+    let herdr = items
+        .iter()
+        .find(|check| check.get("name").and_then(Val::as_str) == Some("herdr"))
+        .expect("herdr row");
+    assert_eq!(herdr.get("status").and_then(Val::as_str), Some("degraded"));
+    let detail = herdr
+        .get("detail")
+        .and_then(Val::as_str)
+        .expect("herdr detail");
+    assert!(
+        detail.contains("unparsable version output"),
+        "degradation must name the cause: {detail}"
+    );
+}
+
+#[test]
 fn doctor_refuses_an_invalid_config_with_exit_5() {
     let sandbox = Sandbox::new("doctor-invalid-config");
     let home = home_dir(&sandbox);

@@ -652,10 +652,14 @@ fn execute_doctor(invocation: &Invocation) -> CmdResult {
                 HERDR_MINIMUM.0, HERDR_MINIMUM.1, HERDR_MINIMUM.2
             ),
         ),
-        (true, None, _) => (
-            "degraded",
-            "herdr present but its version could not be determined".to_string(),
-        ),
+        (true, None, _) => {
+            let cause = herdr
+                .payload
+                .get("detail")
+                .and_then(Val::as_str)
+                .unwrap_or("its version could not be determined");
+            ("degraded", format!("herdr present but {cause}"))
+        }
     };
     rows.push(DoctorRow {
         name: "herdr",

@@ -131,6 +131,11 @@ pub fn percentile_ms(samples: &[u64], percentile: f64) -> u64 {
 }
 
 /// Cap and redact captured adapter text for diagnostics.
+///
+/// Adapter output is hostile and may be lossy UTF-8, so the final byte cap
+/// must land on a char boundary: truncating mid-char panics (review r1-1)
+/// and would destroy the hf-output/v1 framing. All call sites go through
+/// this one primitive.
 fn diagnostics(text: &str) -> String {
     let redacted = redact(text);
     let mut lines = redacted.lines().map(str::trim).filter(|l| !l.is_empty());
@@ -144,8 +149,20 @@ fn diagnostics(text: &str) -> String {
             break;
         }
     }
-    out.truncate(DIAGNOSTIC_CAP);
+    out.truncate(floor_char_boundary(&out, DIAGNOSTIC_CAP));
     out
+}
+
+/// Largest char boundary at or below `limit` bytes (see [`diagnostics`]).
+fn floor_char_boundary(text: &str, limit: usize) -> usize {
+    if text.len() <= limit {
+        return text.len();
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 /// Run one adapter command, returning a typed result plus the process count.
