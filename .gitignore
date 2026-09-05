@@ -11,6 +11,7 @@
 # Fleet lane-local files (never part of the public repository)
 .brief.md
 .hermes-context.md
+.herdr-build-cache.json
 
 # Local environment scaffolding (never commit real credentials; see
 # scripts/check-public-tree.py — credential-class files are REJECTED from the

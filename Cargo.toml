@@ -10,3 +10,15 @@ readme = "README.md"
 license = "Apache-2.0 OR MIT"
 
 [dependencies]
+# Read-only slice (issue #4): TOML parsing for hf-config/hf-policy documents,
+# SHA-256 for deterministic plan digests/acceptance revisions, and serde for
+# the typed TOML decode path. No async/HTTP/clap/tracing dependencies: the
+# slice is stdlib-first and spawns only bounded child processes.
+serde = "1"
+sha2 = "0.10"
+toml = "0.8"
+
+[dev-dependencies]
+# Reference JSON parser used only to cross-check the crate's own strict
+# parser/canonical writer against the committed #3 fixture corpus.
+serde_json = "1"
