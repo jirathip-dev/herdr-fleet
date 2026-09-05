@@ -51,6 +51,13 @@ chrome-headless-shell --headless --disable-gpu --hide-scrollbars \
 (`?theme=` is honored by the artifact's own pre-paint theme resolver; the
 file's default theme is dark.)
 
+The light preview re-renders byte-exactly. The dark preview is not
+byte-reproducible on re-render with the current local Chromium /
+chrome-headless-shell: re-renders differ from the committed PNG only by
+antialiasing-level raster noise (geometry and content are identical). If
+dark byte-reproducibility is ever required, the exact renderer binary must
+be pinned here.
+
 ## SHA-256 (of the committed files)
 
 | File | SHA-256 |
