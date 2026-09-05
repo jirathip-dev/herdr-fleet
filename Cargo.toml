@@ -1,0 +1,12 @@
+[package]
+name = "herdr-fleet"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+description = "Typed, plan-first CLI companion for operating Herdr coding-agent fleets (pre-alpha scaffold)."
+repository = "https://github.com/jirathip-dev/herdr-fleet"
+readme = "README.md"
+license = "Apache-2.0 OR MIT"
+
+[dependencies]

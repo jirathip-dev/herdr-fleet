@@ -1,0 +1,35 @@
+name: Feature request
+description: Propose a feature for herdr-fleet. Public repository — never include credentials, tokens, host paths, or private configuration.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repository is public: do NOT paste secrets, private host paths,
+        private repository names, or provider/model policy. Roadmap children
+        of the umbrella are routed separately; a request here starts a
+        discussion, not an implementation.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What gap or pain does this address? Keep it public-safe.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should herdr-fleet do differently?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What else did you consider (including doing nothing)?
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope notes
+      description: If known, which surface is affected (CLI, docs, CI, tooling)? The bootstrap implements no daemon/workflow/mutation behavior yet.

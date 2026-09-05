@@ -1,0 +1,314 @@
+# CI for herdr-fleet (public repository).
+# Job names are STABLE contract: they become required-check contexts later.
+# Do not rename jobs without a conductor-coordinated change.
+
+name: ci
+
+on:
+  pull_request:
+    branches: [staging, main]
+  push:
+    branches: [staging, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Promotion policy (main PRs must come from staging; hotfix exception)
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "promotion policy: not a pull_request event; pass"
+            exit 0
+          fi
+          BASE_REF="${{ github.base_ref }}"
+          HEAD_REF="${{ github.head_ref }}"
+          if [ "$BASE_REF" = "main" ]; then
+            if [ "$HEAD_REF" = "staging" ]; then
+              echo "promotion policy: staging -> main promotion PR; pass"
+              exit 0
+            fi
+            case "$HEAD_REF" in
+              hotfix/*)
+                echo "::warning::HOTFIX exception engaged (hotfix/* PR to main): CI does NOT grant approval. This path requires fresh human approval, focused review, required CI, patch-release evidence, and mandatory main->staging reconciliation before promotion completes."
+                exit 0
+                ;;
+              *)
+                echo "::error::promotion policy: PRs to main must come from staging (or an incident/security hotfix/* branch); head branch is '${HEAD_REF}'"
+                exit 1
+                ;;
+            esac
+          fi
+          echo "promotion policy: PR to staging; pass"
+
+      - name: External-contributor distinction (fork PRs need human approval)
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            HEAD_REPO="${{ github.event.pull_request.head.repo.full_name }}"
+            BASE_REPO="${{ github.repository }}"
+            if [ -n "${HEAD_REPO}" ] && [ "${HEAD_REPO}" != "${BASE_REPO}" ]; then
+              echo "::notice::EXTERNAL_CONTRIBUTOR — human maintainer approval required (fork PR; branch protection metadata is applied by repository maintainers, not by CI)"
+            fi
+          fi
+
+      - name: Forbidden workflow-trigger spellings
+        run: |
+          set -euo pipefail
+          TAIL="target"
+          BAD="pull_request_${TAIL}"
+          FILES=$(find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) -print)
+          if [ -z "$FILES" ]; then
+            echo "::error::no workflow files found under .github/workflows"
+            exit 1
+          fi
+          HITS=""
+          for f in $FILES; do
+            if grep -q "$BAD" "$f"; then
+              echo "::error::$f contains the forbidden trigger spelling '$BAD'"
+              HITS=1
+            fi
+          done
+          if [ -n "$HITS" ]; then
+            echo "::error::forbidden workflow triggers are not allowed in this repository"
+            exit 1
+          fi
+          echo "forbidden-trigger scan: clean"
+
+      - name: Action SHA pins (full 40-hex + same-line comment)
+        run: |
+          python3 - <<'PY'
+          import glob
+          import re
+          import sys
+
+          failures = []
+          files = sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml"))
+          if not files:
+              print("::error::no workflow files found")
+              sys.exit(1)
+          uses_re = re.compile(r"^\s*uses:\s+[^\s#@]+@([^\s#]+)")
+          for path in files:
+              for lineno, line in enumerate(open(path, encoding="utf-8"), start=1):
+                  match = uses_re.match(line)
+                  if not match:
+                      continue
+                  ref = match.group(1).strip()
+                  if not re.fullmatch(r"[0-9a-f]{40}", ref):
+                      failures.append(f"{path}:{lineno}: action ref '{ref}' is not a full 40-hex SHA")
+                  elif "#" not in line:
+                      failures.append(f"{path}:{lineno}: action pin lacks a human-readable '# comment' on the same line")
+          if failures:
+              for item in failures:
+                  print(f"::error::{item}")
+              sys.exit(1)
+          print("action SHA-pin scan: clean")
+          PY
+
+      - name: Public-tree scanner self-test
+        run: python3 scripts/test-check-public-tree.py
+
+      - name: Public-tree scan (git-index privacy parser)
+        run: python3 scripts/check-public-tree.py .
+
+      - name: Required-files existence
+        run: |
+          set -euo pipefail
+          required=(
+            .github/CODEOWNERS
+            .github/PULL_REQUEST_TEMPLATE.md
+            .github/ISSUE_TEMPLATE/bug.yml
+            .github/ISSUE_TEMPLATE/feature.yml
+            .github/ISSUE_TEMPLATE/config.yml
+            .github/workflows/ci.yml
+            .github/workflows/security.yml
+            .github/dependabot.yml
+            src/lib.rs
+            src/main.rs
+            tests/cli_smoke.rs
+            scripts/check-public-tree.py
+            scripts/test-check-public-tree.py
+            docs/ARCHITECTURE.md
+            docs/DEVELOPMENT.md
+            docs/WORKFLOW.md
+            docs/RELEASING.md
+            docs/decisions/0001-public-core-private-overlays.md
+            docs/decisions/0002-staging-integration-main-release.md
+            docs/decisions/0003-companion-boundary-and-harness-neutrality.md
+            docs/architecture/README.md
+            docs/architecture/herdr-fleet.locked-target.architecture.json
+            docs/architecture/herdr-fleet.locked-target.architecture.html
+            docs/architecture/herdr-fleet.locked-target.architecture.preview.light.png
+            docs/architecture/herdr-fleet.locked-target.architecture.preview.dark.png
+            skills/herdr-fleet/SKILL.md
+            SECURITY.md
+            .editorconfig
+            .gitignore
+            AGENTS.md
+            CHANGELOG.md
+            CODE_OF_CONDUCT.md
+            CONTRIBUTING.md
+            Cargo.toml
+            Cargo.lock
+            deny.toml
+            justfile
+            LICENSE-APACHE
+            LICENSE-MIT
+            README.md
+            rust-toolchain.toml
+          )
+          fail=0
+          for f in "${required[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::missing required file: $f"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+          echo "required-files check: all present"
+
+      - name: Documentation-link and README-contract check
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+          import urllib.parse
+
+          failures = []
+
+          # README must link the architecture doc and every ADR (Amendment 1).
+          readme = open("README.md", encoding="utf-8").read()
+          for target in [
+              "docs/ARCHITECTURE.md",
+              "docs/decisions/0001-public-core-private-overlays.md",
+              "docs/decisions/0002-staging-integration-main-release.md",
+              "docs/decisions/0003-companion-boundary-and-harness-neutrality.md",
+          ]:
+              pattern = re.compile(r"\[[^\]]*\]\(\s*" + re.escape(target) + r"\s*\)")
+              if not pattern.search(readme):
+                  failures.append(f"README.md must link {target}")
+
+          link_re = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]+)\)")
+          doc_roots = ["."]
+          for dirpath, _dirnames, filenames in os.walk("docs"):
+              doc_roots.append(dirpath)
+          files = []
+          for root in doc_roots:
+              for name in sorted(filenames):
+                  if name.endswith(".md"):
+                      files.append(os.path.join(root, name))
+
+          for path in sorted(files):
+              try:
+                  text = open(path, encoding="utf-8").read()
+              except OSError as exc:
+                  failures.append(f"{path}: unreadable ({exc})")
+                  continue
+              base = os.path.dirname(path) or "."
+              for lineno, line in enumerate(text.splitlines(), start=1):
+                  for target in link_re.findall(line):
+                      target = target.strip()
+                      if not target or target.startswith(("#", "http://", "https://", "mailto:", "data:")):
+                          continue
+                      if target.startswith("http"):
+                          continue
+                      target = target.split("#", 1)[0]
+                      if not target:
+                          continue
+                      target = urllib.parse.unquote(target)
+                      resolved = os.path.normpath(os.path.join(base, target))
+                      if not os.path.isfile(resolved):
+                          failures.append(f"{path}:{lineno}: broken link -> {target}")
+
+          if failures:
+              for item in failures:
+                  print(f"::error::{item}")
+              sys.exit(1)
+          print("documentation-link check: clean")
+          PY
+
+  rust-ubuntu:
+    name: rust-ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned toolchain from rust-toolchain.toml
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+
+      # Formatting gate runs FIRST, before any download/compile of the crate.
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Locked check (all targets)
+        run: cargo check --locked --all-targets
+
+      - name: Clippy (warnings denied)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Docs
+        run: cargo doc --locked --no-deps
+
+      - name: Release build
+        run: cargo build --release --locked
+
+  rust-macos:
+    name: rust-macos
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned toolchain from rust-toolchain.toml
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+
+      - name: Locked build (all targets)
+        run: cargo build --locked --all-targets
+
+      - name: Real CLI smoke (exit codes asserted)
+        run: |
+          set -euo pipefail
+          BIN="target/debug/herdr-fleet"
+          "$BIN" --help > /tmp/hf-help.txt
+          "$BIN" -h > /tmp/hf-help-short.txt
+          "$BIN" --version > /tmp/hf-version.txt
+          "$BIN" -V > /tmp/hf-version-short.txt
+          if [ ! -s /tmp/hf-help.txt ] || ! grep -q "USAGE" /tmp/hf-help.txt; then
+            echo "::error::--help output missing usage text"
+            exit 1
+          fi
+          if ! grep -q "herdr-fleet" /tmp/hf-version.txt || ! grep -q "0.1.0" /tmp/hf-version.txt; then
+            echo "::error::--version output missing package identity"
+            exit 1
+          fi
+          if "$BIN" --definitely-not-a-command > /dev/null 2>&1; then
+            echo "::error::unknown argument must exit non-zero"
+            exit 1
+          fi
+          if "$BIN" > /dev/null 2>&1; then
+            echo "::error::no arguments must exit non-zero"
+            exit 1
+          fi
+          echo "CLI smoke: help/version/unknown/no-args all asserted"
+
+      - name: Locked tests
+        run: cargo test --locked
