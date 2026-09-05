@@ -1,0 +1,46 @@
+{
+  "edges": [
+    {
+      "from": "start",
+      "to": "plan"
+    },
+    {
+      "from": "plan",
+      "to": "impl"
+    },
+    {
+      "from": "impl",
+      "to": "rev1"
+    },
+    {
+      "from": "rev1",
+      "to": "gate"
+    },
+    {
+      "from": "gate",
+      "to": "human"
+    },
+    {
+      "from": "human",
+      "to": "merge"
+    },
+    {
+      "from": "merge",
+      "to": "term"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "start",
+      "kind": "start",
+      "params": null
+    },
+    {
+      "id": "bad",
+      "kind": "shell",
+      "params": null
+    }
+  ],
+  "schema": "hf-workflow/v1",
+  "workflow_id": "fleet-doctrine-1"
+}

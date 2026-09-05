@@ -1,0 +1,10 @@
+{
+  "command": "status",
+  "data": {
+    "freshness": "fresh",
+    "repository": "example-org/widgets"
+  },
+  "exit_code": 0,
+  "kind": "maybe",
+  "schema": "hf-output/v1"
+}

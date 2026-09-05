@@ -1,0 +1,24 @@
+{
+  "caps": [
+    "read",
+    "worktree",
+    "spawn",
+    "prompt",
+    "review",
+    "merge"
+  ],
+  "created_at": "2026-09-06T00:00:00Z",
+  "expires_at": "2026-09-13T00:00:00Z",
+  "grant_id": "gr_0123456789abcdef",
+  "issue": {
+    "number": 123,
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "phase": "merge",
+  "policy_hash": "feedface01234567feedface01234567feedface01234567feedface01234567",
+  "repository": "example-org/widgets",
+  "schema": "hf-grant/v2",
+  "scope": "worktrees/issues/123",
+  "state_epoch": 3,
+  "workflow_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}

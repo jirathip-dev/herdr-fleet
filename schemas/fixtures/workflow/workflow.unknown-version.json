@@ -1,0 +1,76 @@
+{
+  "edges": [
+    {
+      "from": "start",
+      "to": "plan"
+    },
+    {
+      "from": "plan",
+      "to": "impl"
+    },
+    {
+      "from": "impl",
+      "to": "rev1"
+    },
+    {
+      "from": "rev1",
+      "to": "gate"
+    },
+    {
+      "from": "gate",
+      "to": "human"
+    },
+    {
+      "from": "human",
+      "to": "merge"
+    },
+    {
+      "from": "merge",
+      "to": "term"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "start",
+      "kind": "start",
+      "params": null
+    },
+    {
+      "id": "plan",
+      "kind": "plan",
+      "params": null
+    },
+    {
+      "id": "impl",
+      "kind": "implementer",
+      "params": null
+    },
+    {
+      "id": "rev1",
+      "kind": "reviewer",
+      "params": null
+    },
+    {
+      "id": "gate",
+      "kind": "gate",
+      "params": null
+    },
+    {
+      "id": "human",
+      "kind": "human_approval",
+      "params": null
+    },
+    {
+      "id": "merge",
+      "kind": "merge",
+      "params": null
+    },
+    {
+      "id": "term",
+      "kind": "terminal",
+      "params": null
+    }
+  ],
+  "schema": "hf-workflow/v2",
+  "workflow_id": "fleet-doctrine-1"
+}

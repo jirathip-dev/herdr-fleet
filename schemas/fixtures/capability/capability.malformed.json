@@ -1,0 +1,8 @@
+{
+  "actor": "hermes",
+  "axis": "harness",
+  "capabilities": [
+    "teleport"
+  ],
+  "schema": "hf-capability/v1"
+}

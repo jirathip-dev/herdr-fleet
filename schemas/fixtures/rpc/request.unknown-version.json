@@ -1,0 +1,6 @@
+{
+  "id": "0123456789abcdef0123",
+  "method": "status",
+  "params": null,
+  "schema": "hf-rpc-request/v2"
+}

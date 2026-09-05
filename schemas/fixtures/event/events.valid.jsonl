@@ -1,0 +1,3 @@
+{"data":{"epoch":3,"repository":"example-org/widgets"},"event":"state.snapshot","schema":"hf-event/v1","seq":0,"ts":"2026-09-06T00:00:00Z"}
+{"data":{"agent":"impl-1","state":"working"},"event":"agent.updated","schema":"hf-event/v1","seq":1,"ts":"2026-09-06T00:00:00Z"}
+{"data":{"action":"mutate.merge","seq":41},"event":"journal.appended","schema":"hf-event/v1","seq":2,"ts":"2026-09-06T00:00:00Z"}

@@ -1,0 +1,7 @@
+{
+  "code": "refusal.grant.expired",
+  "details": null,
+  "message": "route grant expired",
+  "retryable": "yes",
+  "schema": "hf-error/v1"
+}

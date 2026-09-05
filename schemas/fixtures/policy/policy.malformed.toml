@@ -1,0 +1,4 @@
+schema = "hf-policy/v1"
+repositories = ["example-org/widgets"]
+# Overlay may only tighten: "relaxed" is outside tty|deny.
+production_confirmation = "relaxed"

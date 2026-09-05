@@ -1,0 +1,14 @@
+{
+  "actor": "hermes",
+  "axis": "harness",
+  "capabilities": [
+    "discover",
+    "start",
+    "prompt",
+    "observe",
+    "interrupt",
+    "outcome",
+    "identity"
+  ],
+  "schema": "hf-capability/v2"
+}

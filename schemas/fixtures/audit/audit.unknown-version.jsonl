@@ -1,0 +1,1 @@
+{"action":"read.status","at":"2026-09-06T00:00:00Z","epoch":3,"grant_id":null,"idempotency_key":"ik_read-20260906-0005","plan_hash":null,"recorded_before_mutation":false,"schema":"hf-audit/v2","seq":44,"target":"example-org/widgets"}
