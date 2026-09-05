@@ -1,0 +1,1 @@
+{"error":{"code":"refusal.stale_state","message":"state epoch rotated"},"id":"0123456789abcdef0124","ok":false,"result":null,"schema":"hf-rpc-response/v1"}

@@ -1,0 +1,24 @@
+{
+  "issue": {
+    "number": 123,
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "plan_id": "hf_plan_0123456789abcdef",
+  "repository": "example-org/widgets",
+  "schema": "hf-plan/v1",
+  "state_epoch": 3,
+  "steps": [
+    {
+      "id": "p1",
+      "kind": "checkout",
+      "params": null
+    },
+    {
+      "id": "p2",
+      "kind": "shell_exec",
+      "params": null
+    }
+  ],
+  "workflow_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "workflow_id": "fleet-doctrine-1"
+}

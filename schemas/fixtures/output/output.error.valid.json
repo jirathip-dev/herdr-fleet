@@ -1,0 +1,1 @@
+{"command":"status","error":{"code":"refusal.stale_state","message":"observation is stale; refresh first"},"exit_code":1,"kind":"error","schema":"hf-output/v1"}

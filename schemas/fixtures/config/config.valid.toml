@@ -1,0 +1,24 @@
+schema = "hf-config/v1"
+
+# One canonical XDG TOML config; no implicit profile/repository merge stack.
+# Optional tables only: daemon, policy, repository, harness, workflow, role.
+
+[daemon]
+enabled = true
+
+[policy]
+overlay = "policy.toml"
+
+[repository.widgets]
+origin = "https://github.com/example-org/widgets"
+branch = "staging"
+enabled = true
+
+[harness.cli]
+kind = "argv"
+executable = "hf-cli-example"
+env_allow = ["PATH", "HOME"]
+
+[workflow.bundle]
+id = "fleet-doctrine-1"
+hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

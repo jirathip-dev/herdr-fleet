@@ -1,0 +1,4 @@
+schema = "hf-config/v2"
+
+[daemon]
+enabled = true

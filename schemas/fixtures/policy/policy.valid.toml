@@ -1,0 +1,8 @@
+schema = "hf-policy/v1"
+
+# Explicit optional policy overlay: it may only constrain the base config.
+repositories = ["example-org/widgets"]
+production_confirmation = "tty"
+
+[role.implementer]
+hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

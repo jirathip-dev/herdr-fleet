@@ -1,0 +1,3 @@
+schema = "hf-policy/v2"
+repositories = ["example-org/widgets"]
+production_confirmation = "tty"

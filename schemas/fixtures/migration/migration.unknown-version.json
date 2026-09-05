@@ -1,0 +1,8 @@
+{
+  "applies_from": 0,
+  "applies_to": 1,
+  "checksum": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "description": "create leases, idempotency claims, journal, and audit tables",
+  "migration_id": "m0001_create_state_v1",
+  "schema": "hf-migration/v2"
+}

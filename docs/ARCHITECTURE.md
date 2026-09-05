@@ -114,10 +114,24 @@ installers, or UI/demo tooling. Any future code reuse follows normal open-
 source provenance (license-compatible, attributed), reviewed in the slice
 that needs it.
 
+## Contract artifacts (issue #3)
+
+The locked 1.0 decisions are decomposed into machine-checked contract
+artifacts under [`contracts/`](contracts/README.md): capability map,
+schema registry, per-surface specifications (config, CLI output,
+plans/grants/epochs/outcomes, workflow DAGs, daemon protocol, state and
+journal, capability negotiation, review evidence), trust and risk models,
+the Corral archaeology/provenance matrix, compatibility and benchmark
+policy. Synthetic fixtures live under `schemas/fixtures/` and are verified
+by `scripts/check-contract-fixtures.py` + its self-test. The registry and
+specs bind the *target* only; no `src/`, daemon, adapter, or migration
+behavior exists yet (bootstrap rule).
+
 ## Links
 
 - Committed target artifacts: [`architecture/`](architecture/README.md)
 - ADR-0001 (public core / private overlays), ADR-0002 (branch model),
   ADR-0003 (companion boundary + harness neutrality)
+- 1.0 contracts (issue #3): [`contracts/`](contracts/README.md)
 - [README](../README.md) · [DEVELOPMENT](DEVELOPMENT.md) ·
   [WORKFLOW](WORKFLOW.md) · [RELEASING](RELEASING.md)

@@ -1,0 +1,12 @@
+{
+  "error": null,
+  "idempotency_key": "ik_apply-20260906-0001",
+  "observed_at": "2026-09-06T00:00:00Z",
+  "plan_id": "hf_plan_0123456789abcdef",
+  "result": {
+    "exit_code": 0
+  },
+  "schema": "hf-outcome/v2",
+  "status": "succeeded",
+  "step_id": "p5"
+}
