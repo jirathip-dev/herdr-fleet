@@ -29,8 +29,14 @@ Normative rules:
   the old revision.
 - Step `kind` is a closed set (`checkout`, `worktree_create`,
   `harness_start`, `prompt`, `collect_outcome`, `review_evidence`, `merge`,
-  `cleanup`, `publish`). There is no shell/embedded-code step; a document
-  carrying an unknown kind is refused (`plan.malformed.json`).
+  `cleanup`, `publish`, `branch_push`, `pr_update`, `issue_update`,
+  `hosted_check`, `post_merge_verify`, `branch_delete`, `approve`). The
+  granular kinds after `publish` are added by issue #8 so a plan document
+  can express the full daemon-mediated control-plane mutation surface
+  (worktree/branch ops, forge issue/PR updates, hosted-check observation,
+  post-merge verification, branch deletion, first-write approval). There is
+  no shell/embedded-code step; a document carrying an unknown kind is
+  refused (`plan.malformed.json`).
 - Plans do not classify risk; risk comes from the target/effect table in
   the daemon ([risk-model.md](risk-model.md)) — nodes cannot downgrade it.
 
@@ -103,6 +109,37 @@ Format: `ik_` + 8-64 `[a-z0-9-]` (registry scalar table). Rules:
   the recorded outcome instead of re-executing.
 - Exactly-once across external systems is never claimed; the key gives
   at-most-once dispatch plus exactly-once read-back of the recorded result.
+
+### Apply semantics (issue #8; daemon `apply`, one plan step per request)
+
+The daemon `apply` method executes ONE plan step per request (the plan is
+bound by digest; the step is addressed by id) and is the only path that
+runs control-plane effects:
+
+- The request carries the canonical plan document; the daemon recomputes
+  the digest and the content-derived `plan_id` before anything is journaled
+  (`refusal.plan.identity` on tamper). The plan hash and grant id ride the
+  journaled intent.
+- Immediately before the effect the daemon revalidates, under the state
+  lock: live epoch vs plan/grant/instance, grant status and expiry (an
+  expired grant refuses with `refusal.grant.expired`), the observed issue
+  revision vs the grant binding, workflow/policy hashes vs the grant and
+  the pinned instance, and the step's required capability (`caps`, AC3).
+- Kind-specific gates run before the effect: an integration merge requires
+  current review evidence (distinct exact-head reviewer + passed checks
+  bound to head/base/workflow/policy — any moved binding refuses with
+  `refusal.evidence.stale`); issue closure requires the instance to sit at
+  the plan's `post_merge_verify` step with passing evidence; cleanup keeps
+  its salvage audit pair (`mutate.cleanup` before, `salvage.cleanup`
+  after); production-branch effects require a fresh interactive
+  TTY-confirmed digest; a real-external target scope requires the recorded
+  first-write approval (AC10; the canary itself is a separate human gate).
+- The effect runs outside the state lock through allowlisted subprocesses
+  (`git` against disposable local repositories in tests; `gh`/workspace
+  fakes) and resolves with a typed `hf-outcome/v1` (succeeded/failed/
+  refused/ambiguous) plus the exact external read-back; ambiguous effects
+  (timeout, process death, post-effect record failure) resolve the claim as
+  `ambiguous` — external reconciliation is required before a new key.
 
 ## 5. Typed outcomes: `hf-outcome/v1`
 

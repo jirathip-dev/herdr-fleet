@@ -38,7 +38,7 @@
 //!   independent read-only operations (observe.rs pattern, AC4).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::formats::{is_actor, parse_semver};
@@ -920,6 +920,28 @@ pub fn execute_op(
     request: &OpRequest<'_>,
     env: &BTreeMap<String, String>,
 ) -> OpResult {
+    execute_op_at(profile, request, env, None)
+}
+
+/// Execute an operation with the child process confined to `cwd` (issue #8:
+/// harness work may edit, test, and commit only inside the assigned
+/// worktree, so the daemon passes the lane worktree as the child working
+/// directory). Everything else matches [`execute_op`].
+pub fn execute_op_in_worktree(
+    profile: &Profile,
+    request: &OpRequest<'_>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> OpResult {
+    execute_op_at(profile, request, env, Some(cwd))
+}
+
+fn execute_op_at(
+    profile: &Profile,
+    request: &OpRequest<'_>,
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+) -> OpResult {
     let started = std::time::Instant::now();
     let session_id = request.session.session_id.clone();
     let capability = request.op.capability();
@@ -1001,7 +1023,7 @@ pub fn execute_op(
             // Data-last rule (AC5): the payload is appended as one literal
             // argv element; nothing else in the argv depends on it.
             args.push(payload.to_string());
-            let out = run_typed(&profile.executable, &args, request.timeout, env);
+            let out = run_typed(&profile.executable, &args, request.timeout, env, cwd);
             match out {
                 ProcessOutcome::Ok(text) => op_result(
                     profile,
@@ -1028,7 +1050,7 @@ pub fn execute_op(
         Op::Observe | Op::Identity | Op::Interrupt | Op::Outcome => {
             let workspace_session = &request.session.identity.herdr_session;
             let args = workspace_args(request.op, workspace_session);
-            let out = run_typed(WORKSPACE_EXECUTABLE, &args, request.timeout, env);
+            let out = run_typed(WORKSPACE_EXECUTABLE, &args, request.timeout, env, cwd);
             let out = match out {
                 ProcessOutcome::Ok(text) => text,
                 ProcessOutcome::Failed(err) => {
@@ -1309,6 +1331,7 @@ fn run_typed(
     args: &[String],
     timeout: Duration,
     env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
 ) -> ProcessOutcome {
     let resolved = match resolve_executable(program, env) {
         Ok(path) => path,
@@ -1324,7 +1347,7 @@ fn run_typed(
         program: resolved.to_str().unwrap_or_default(),
         args,
         env,
-        cwd: None,
+        cwd,
         timeout,
     });
     match out.status {

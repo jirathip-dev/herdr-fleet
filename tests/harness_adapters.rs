@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -864,4 +864,134 @@ fn unknown_harness_kind_fails_typed_and_independent_probes_keep_working() {
     assert!(probe.present);
     let observe = run_op_retry(&profile, &workspace_request(Op::Observe), &bins.env());
     assert_eq!(observe.status, "succeeded");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #8 C1: the "verified absolute identity is spawned" layer is
+// WITNESSED — a fake asserts $0 (its own argv[0]) equals the absolute
+// resolved location, and lane ops can be confined to an assigned worktree.
+// ---------------------------------------------------------------------------
+
+/// A fake harness whose stdout is its own `$0` — the path the kernel used
+/// to exec the script. The adapter contract resolves the bare executable
+/// through the allowlisted PATH and spawns the resolved absolute path, so a
+/// prompt's transcript must equal that absolute location (never a bare
+/// name, never a relative resolution).
+#[test]
+fn spawned_identity_is_the_resolved_absolute_path_witness() {
+    let bins = FakeBins::new();
+    let fake = bins.bin("hf-argv", "printf '%s' \"$0\"\n");
+    let profile = Profile::argv(
+        "lane",
+        "hf-argv",
+        &[
+            "start",
+            "prompt",
+            "observe",
+            "interrupt",
+            "outcome",
+            "identity",
+        ],
+        BTreeMap::new(),
+    )
+    .expect("argv profile");
+    let identity = bind_identity("ws-session-8", "tty-8-c1", 1).expect("identity");
+    let session = new_session("sess-c1-witness", identity).expect("session");
+    let result = run_op_retry(
+        &profile,
+        &OpRequest {
+            op: Op::Prompt,
+            session: &session,
+            payload: Some("synthetic payload"),
+            timeout: ADAPTER_TIMEOUT,
+        },
+        &bins.env(),
+    );
+    assert_eq!(result.status, "succeeded");
+    let transcript = result
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("transcript"))
+        .and_then(Val::as_str)
+        .expect("transcript");
+    // $0 must be the absolute resolved location of the fake executable.
+    assert!(
+        PathBuf::from(transcript).is_absolute(),
+        "spawned identity must be absolute: {transcript}"
+    );
+    // Compare canonical forms on BOTH sides: on macOS the temp dir is
+    // reached through a symlink (/var/folders -> /private/var/folders),
+    // so the spawned argv[0] literal and the canonicalized expectation
+    // must not be compared byte-wise across that boundary.
+    let canonical_fake = fs::canonicalize(&fake).expect("canonical fake");
+    let spawned =
+        fs::canonicalize(Path::new(transcript)).unwrap_or_else(|_| PathBuf::from(transcript));
+    assert_eq!(
+        spawned, canonical_fake,
+        "the spawned $0 must equal the resolved absolute executable"
+    );
+}
+
+/// Lane harness work is confined to the assigned worktree: the child's cwd
+/// must be the worktree path passed through `execute_op_in_worktree`.
+#[test]
+fn harness_prompt_runs_confined_to_the_assigned_worktree() {
+    let bins = FakeBins::new();
+    bins.bin("hf-argv", "pwd\n");
+    let profile = Profile::argv(
+        "lane",
+        "hf-argv",
+        &[
+            "start",
+            "prompt",
+            "observe",
+            "interrupt",
+            "outcome",
+            "identity",
+        ],
+        BTreeMap::new(),
+    )
+    .expect("argv profile");
+    let identity = bind_identity("ws-session-8", "tty-8-c1", 1).expect("identity");
+    let session = new_session("sess-c1-confinement", identity).expect("session");
+    // A fake "worktree" directory (the test stands in for the lane root).
+    let base = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let worktree = base.join(format!("hf-adapters-wt-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&worktree);
+    fs::create_dir_all(&worktree).expect("worktree dir");
+    // Capture the canonical expectation WHILE the directory exists: on
+    // macOS the temp dir is reached through a symlink (/var/folders ->
+    // /private/var/folders) and a child's getcwd/pwd reports the canonical
+    // form, while the assigned (spawn) path may be the non-canonical one.
+    // The directory is removed below before the transcript is compared, so
+    // canonicalization after the run would fall back to the raw literal and
+    // byte-compare two different spellings of the same directory.
+    let expected_cwd = fs::canonicalize(&worktree).unwrap_or_else(|_| worktree.clone());
+
+    let result = herdr_fleet::adapters::execute_op_in_worktree(
+        &profile,
+        &OpRequest {
+            op: Op::Prompt,
+            session: &session,
+            payload: Some("synthetic payload"),
+            timeout: ADAPTER_TIMEOUT,
+        },
+        &bins.env(),
+        &worktree,
+    );
+    let _ = fs::remove_dir_all(&worktree);
+    assert_eq!(result.status, "succeeded");
+    let transcript = result
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("transcript"))
+        .and_then(Val::as_str)
+        .expect("transcript");
+    assert_eq!(
+        PathBuf::from(transcript.trim()),
+        expected_cwd,
+        "harness child must run inside the assigned worktree"
+    );
 }

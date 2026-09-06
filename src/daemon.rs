@@ -512,16 +512,8 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "grants.revoke" => method_grants_revoke(shared, request),
         "backup.create" => method_backup_create(shared, request),
         "restore.begin" => method_restore_begin(shared, request),
-        "plan" => err_response(
-            &request.id,
-            "refusal.plan.unavailable",
-            "plan execution arrives with the workflow-engine slice; plans render with the read-only CLI",
-        ),
-        "apply" => err_response(
-            &request.id,
-            "refusal.effect.unregistered",
-            "no plan-step effect handlers are registered in this slice; apply cannot dispatch a plan yet",
-        ),
+        "plan" => method_plan(shared, request),
+        "apply" => method_apply(shared, request),
         other => {
             shared.log.write("warn", "method.unknown", other);
             err_response(
@@ -621,6 +613,1104 @@ fn method_state_epoch(shared: &Arc<Shared>, request: &Request) -> String {
         },
         Err(response) => response,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Control-plane mutations (issue #8): `plan` render + `apply` dispatch
+// ---------------------------------------------------------------------------
+
+/// `plan`: render a deterministic `hf-plan/v1` document for one repository
+/// issue from typed params (the same offline plan family the read-only CLI
+/// renders, validated and digest-bound here so `apply` can bind it).
+fn method_plan(_shared: &Arc<Shared>, request: &Request) -> String {
+    let params = match &request.params {
+        Some(params) => params,
+        None => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "plan requires params: repository, issue.number, issue.revision",
+            );
+        }
+    };
+    let repository = match params.get("repository").and_then(Val::as_str) {
+        Some(value) if crate::formats::is_repository_identity(value) => value.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "plan requires an owner/name repository identity",
+            );
+        }
+    };
+    let (owner, name) = repository.split_once('/').expect("validated identity");
+    let issue_number = match params
+        .get("issue")
+        .and_then(|issue| issue.get("number"))
+        .and_then(Val::as_int)
+    {
+        Some(number) if number > 0 => number,
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "plan requires a positive issue.number",
+            );
+        }
+    };
+    let revision = match params
+        .get("issue")
+        .and_then(|issue| issue.get("revision"))
+        .and_then(Val::as_str)
+    {
+        Some(value) if crate::formats::is_hex40(value) => value.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "plan requires an exact 40-hex issue.revision",
+            );
+        }
+    };
+    let branch = params
+        .get("branch")
+        .and_then(Val::as_str)
+        .unwrap_or("staging")
+        .to_string();
+    // Repository origin is not part of a rendered plan document; the
+    // synthesized value is never persisted or displayed (identity only).
+    let repo = crate::config::Repository {
+        key: name.to_string(),
+        owner: owner.to_string(),
+        name: name.to_string(),
+        origin: format!("https://example.invalid/{owner}/{name}"),
+        branch: Some(branch),
+        enabled: true,
+    };
+    let input = crate::plan::PlanInput {
+        repository: &repo,
+        issue_number: issue_number as u64,
+        revision: revision.clone(),
+        workflow: None,
+    };
+    match crate::plan::render_plan(&input) {
+        Ok(rendered) => ok_response(
+            &request.id,
+            object(vec![
+                ("plan", rendered.doc),
+                ("digest", string(&rendered.digest)),
+                ("plan_id", string(&rendered.plan_id)),
+                ("workflow_id", string(&rendered.workflow_id)),
+                ("workflow_hash", string(&rendered.workflow_hash)),
+            ]),
+        ),
+        Err(refusal) => err_response(
+            &request.id,
+            "refusal.plan.unavailable",
+            format!("cannot render plan: {:?}", refusal),
+        ),
+    }
+}
+
+/// Typed apply params (parsed once, then validated under the state lock).
+struct ApplyParams {
+    /// Plan document (schema-validated and digest-bound by the caller).
+    plan: Val,
+    /// Step id within the plan.
+    step: String,
+    /// Route grant id.
+    grant_id: String,
+    /// Workflow instance id.
+    instance_id: String,
+    /// Fresh observations (issue revision, policy hash, optional heads).
+    issue_revision: String,
+    policy_hash: String,
+    /// Exact heads observed before the effect (merge gate bindings).
+    feature_head: Option<String>,
+    integration_base: Option<String>,
+    /// Topology: integration branch + production branches + lane paths.
+    integration_branch: String,
+    production_branches: Vec<String>,
+    worktrees_root: std::path::PathBuf,
+    integration_repo: std::path::PathBuf,
+    /// Production/hotfix/first-write flag bundle (typed, from the caller's
+    /// interactive session — never from recurring automation).
+    interactive: bool,
+    digest_confirmed: bool,
+    scheduled: bool,
+    production_confirmation: Option<String>,
+    target_scope: Option<String>,
+}
+
+fn apply_params(request: &Request) -> Result<ApplyParams, (String, String)> {
+    let params = request.params.as_ref().ok_or_else(|| {
+        (
+            "refusal.malformed".to_string(),
+            "apply requires params".to_string(),
+        )
+    })?;
+    let get_str = |key: &str| -> Result<String, (String, String)> {
+        params
+            .get(key)
+            .and_then(Val::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                (
+                    "refusal.malformed".to_string(),
+                    format!("apply requires params.{key}"),
+                )
+            })
+    };
+    let plan = match params.get("plan") {
+        Some(Val::Obj(_)) => params.get("plan").expect("checked").clone(),
+        _ => {
+            return Err((
+                "refusal.malformed".to_string(),
+                "apply requires params.plan (hf-plan/v1 object)".to_string(),
+            ));
+        }
+    };
+    let step = get_str("step")?;
+    let grant_id = get_str("grant_id")?;
+    if !crate::formats::is_grant_id(&grant_id) {
+        return Err((
+            "refusal.malformed".to_string(),
+            "grant_id must be a gr_ id".to_string(),
+        ));
+    }
+    let instance_id = get_str("instance_id")?;
+    // The observed field must be an object when present.
+    let observed = match params.get("observed") {
+        Some(Val::Obj(_)) => params.get("observed").expect("checked"),
+        None | Some(Val::Null) => {
+            return Err((
+                "refusal.malformed".to_string(),
+                "apply requires params.observed with fresh issue_revision/policy_hash".to_string(),
+            ));
+        }
+        Some(_) => {
+            return Err((
+                "refusal.malformed".to_string(),
+                "apply params.observed must be an object".to_string(),
+            ));
+        }
+    };
+    let issue_revision = observed
+        .get("issue_revision")
+        .and_then(Val::as_str)
+        .filter(|text| crate::formats::is_hex40(text))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            (
+                "refusal.malformed".to_string(),
+                "observed.issue_revision must be 40-hex".to_string(),
+            )
+        })?;
+    let policy_hash = observed
+        .get("policy_hash")
+        .and_then(Val::as_str)
+        .filter(|text| crate::formats::is_hex64(text))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            (
+                "refusal.malformed".to_string(),
+                "observed.policy_hash must be 64-hex".to_string(),
+            )
+        })?;
+    let hex40 = |key: &str| -> Result<Option<String>, (String, String)> {
+        match observed.get(key).and_then(Val::as_str) {
+            Some(text) if crate::formats::is_hex40(text) => Ok(Some(text.to_string())),
+            Some(_) => Err((
+                "refusal.malformed".to_string(),
+                format!("observed.{key} must be 40-hex when present"),
+            )),
+            None => Ok(None),
+        }
+    };
+    let feature_head = hex40("feature_head")?;
+    let integration_base = hex40("integration_base")?;
+    let topology = match params.get("topology") {
+        Some(Val::Obj(_)) => params.get("topology").expect("checked"),
+        _ => {
+            return Err((
+                "refusal.malformed".to_string(),
+                "apply requires params.topology (integration_branch, lane paths)".to_string(),
+            ));
+        }
+    };
+    let integration_branch = topology
+        .get("integration_branch")
+        .and_then(Val::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            (
+                "refusal.malformed".to_string(),
+                "topology.integration_branch is required".to_string(),
+            )
+        })?;
+    let production_branches = match topology.get("production_branches") {
+        None | Some(Val::Null) => Vec::new(),
+        Some(Val::Arr(items)) => items
+            .iter()
+            .filter_map(Val::as_str)
+            .map(str::to_string)
+            .collect(),
+        Some(_) => {
+            return Err((
+                "refusal.malformed".to_string(),
+                "topology.production_branches must be an array".to_string(),
+            ));
+        }
+    };
+    let absolute = |key: &str| -> Result<std::path::PathBuf, (String, String)> {
+        let text = topology.get(key).and_then(Val::as_str).ok_or_else(|| {
+            (
+                "refusal.malformed".to_string(),
+                format!("topology.{key} is required"),
+            )
+        })?;
+        let path = std::path::PathBuf::from(text);
+        if !path.is_absolute() {
+            return Err((
+                "refusal.malformed".to_string(),
+                format!("topology.{key} must be an absolute path"),
+            ));
+        }
+        Ok(path)
+    };
+    let worktrees_root = absolute("worktrees_root")?;
+    let integration_repo = absolute("integration_repo")?;
+    let flags = match params.get("flags") {
+        None | Some(Val::Null) => None,
+        Some(Val::Obj(_)) => params.get("flags"),
+        Some(_) => {
+            return Err((
+                "refusal.malformed".to_string(),
+                "apply params.flags must be an object".to_string(),
+            ));
+        }
+    };
+    let flag = |key: &str| -> bool {
+        flags
+            .and_then(|f| f.get(key))
+            .and_then(Val::as_bool)
+            .unwrap_or(false)
+    };
+    Ok(ApplyParams {
+        plan,
+        step,
+        grant_id,
+        instance_id,
+        issue_revision,
+        policy_hash,
+        feature_head,
+        integration_base,
+        integration_branch,
+        production_branches,
+        worktrees_root,
+        integration_repo,
+        interactive: flag("interactive"),
+        digest_confirmed: flag("digest_confirmed"),
+        scheduled: flag("scheduled"),
+        production_confirmation: flags
+            .and_then(|f| f.get("production_confirmation"))
+            .and_then(Val::as_str)
+            .map(str::to_string),
+        target_scope: flags
+            .and_then(|f| f.get("target_scope"))
+            .and_then(Val::as_str)
+            .map(str::to_string),
+    })
+}
+
+/// `apply`: bind the plan digest, revalidate every binding freshly under
+/// the state lock, journal the intent, execute the typed effect, and
+/// resolve with a typed outcome + exact read-back (issue #8 AC1/AC2/AC4).
+fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
+    let parsed = match apply_params(request) {
+        Ok(parsed) => parsed,
+        Err((code, message)) => return err_response(&request.id, &code, message),
+    };
+    // Bind the plan digest + content identity BEFORE any journaling
+    // (malformed/tampered plans never leave a claim behind).
+    let plan = match crate::mutation::bind_plan(&parsed.plan) {
+        Ok(plan) => plan,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let step = match crate::mutation::plan_step(&plan, &parsed.step) {
+        Ok(step) => step,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let kind = match crate::mutation::step_kind(step) {
+        Ok(kind) => kind,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let params = match step.get("params") {
+        Some(Val::Obj(_)) => step.get("params"),
+        None | Some(Val::Null) => None,
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "plan step params must be an object or null",
+            );
+        }
+    };
+    // Daemon-level risk gates that need no state: destructive/production
+    // effects are never schedulable; production-branch effects require a
+    // fresh interactive TTY-confirmed digest; real-external effects require
+    // the recorded first-write approval (AC10 plumbing).
+    let risk = crate::mutation::risk_class(&kind).unwrap_or("production");
+    let branch_target = params
+        .and_then(|p| p.get("branch").or_else(|| p.get("base")))
+        .and_then(Val::as_str)
+        .unwrap_or("");
+    if crate::mutation::classify_branch(
+        branch_target,
+        &parsed.integration_branch,
+        &parsed.production_branches,
+    ) == crate::mutation::BranchKind::Production
+        && let Err(err) = crate::mutation::check_production_confirmation(
+            parsed.production_confirmation.as_deref(),
+            parsed.interactive,
+            parsed.digest_confirmed,
+            parsed.scheduled,
+        )
+    {
+        return err_response(&request.id, err.code, err.message);
+    }
+    if parsed.scheduled && matches!(risk, "production" | "destructive") {
+        return err_response(
+            &request.id,
+            "refusal.policy.scheduled",
+            "schedules and automation can never carry production or destructive effects",
+        );
+    }
+    let _ = &risk;
+    // Journal the durable intent (pre-action audit record + idempotency
+    // claim; action mutate.<kind>, target repo:instance:step).
+    let action = format!("mutate.{kind}");
+    let target = format!("{}:{}:{}", plan.repository, parsed.instance_id, parsed.step);
+    let key = match request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("idempotency_key"))
+        .and_then(Val::as_str)
+        .map(str::to_string)
+    {
+        Some(key) => key,
+        None => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "apply requires params.idempotency_key",
+            );
+        }
+    };
+    let grant_id = parsed.grant_id.clone();
+    let journaled = {
+        let state = match shared.lock_state() {
+            Ok(state) => state,
+            Err(message) => {
+                return err_response(&request.id, "state.unavailable", message);
+            }
+        };
+        match state.journal_intent(
+            &action,
+            &target,
+            &key,
+            &request.id,
+            &request.method,
+            Some(&plan.digest),
+            Some(&grant_id),
+            &request.line,
+        ) {
+            Ok((ClaimAttempt::Claimed, _)) => true,
+            Ok((ClaimAttempt::Replay { response }, _)) => return replay(shared, &response),
+            Ok((ClaimAttempt::Reused { owner_request_id }, _)) => {
+                return err_response(
+                    &request.id,
+                    "refusal.idempotency",
+                    format!(
+                        "idempotency key {key:?} already belongs to request {owner_request_id}"
+                    ),
+                );
+            }
+            Err(err) => return err_response(&request.id, err.code, err.message),
+        }
+    };
+    let _ = journaled;
+    // No publish here: every post-journal terminal path below publishes
+    // once after its state change (hub-lock ordering rule).
+
+    // Revalidate plan/grant/instance/epoch against FRESH state, then run
+    // kind-specific gates that need durable state (evidence, closure).
+    // Everything runs inside one state-guard scope; refusals are returned
+    // as values and resolved only AFTER the guard drops (re-locking while
+    // the guard is held would self-deadlock).
+    type SnapshotOutcome = Result<
+        (
+            crate::mutation::GrantSnapshot,
+            crate::mutation::InstanceSnapshot,
+            Option<crate::mutation::EvidenceView>,
+            Option<crate::state::ApprovalRow>,
+        ),
+        (String, String),
+    >;
+    let snapshot_outcome = (|| -> SnapshotOutcome {
+        let state = shared
+            .lock_state()
+            .map_err(|message| ("state.unavailable".to_string(), message))?;
+        let epoch = state
+            .current_epoch()
+            .map_err(|err| (err.code.to_string(), err.message))?;
+        let grant = state
+            .grant_by_id(&parsed.grant_id)
+            .map_err(|err| (err.code.to_string(), err.message))?
+            .ok_or_else(|| {
+                (
+                    "refusal.grant.inactive".to_string(),
+                    format!("no grant {} exists", parsed.grant_id),
+                )
+            })?;
+        let instance = state
+            .instance_by_id(&parsed.instance_id)
+            .map_err(|err| (err.code.to_string(), err.message))?
+            .ok_or_else(|| {
+                (
+                    "refusal.instance.state".to_string(),
+                    format!("no instance {} exists", parsed.instance_id),
+                )
+            })?;
+        let caps = |text: &str| -> Vec<String> {
+            Val::parse_json(text)
+                .ok()
+                .and_then(|value| value.as_array().cloned())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Val::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let grant_snapshot = crate::mutation::GrantSnapshot {
+            grant_id: grant.grant_id.clone(),
+            repository: grant.repository.clone(),
+            issue_number: grant.issue_number,
+            issue_revision: grant.issue_revision.clone(),
+            workflow_hash: grant.workflow_hash.clone(),
+            policy_hash: grant.policy_hash.clone(),
+            phase: grant.phase.clone(),
+            scope: grant.scope.clone(),
+            caps: caps(&grant.caps),
+            expires_at: grant.expires_at.clone(),
+            status: grant.status.clone(),
+            state_epoch: grant.state_epoch,
+        };
+        let instance_snapshot = crate::mutation::InstanceSnapshot {
+            instance_id: instance.instance_id.clone(),
+            repository: instance.repository.clone(),
+            workflow_id: instance.workflow_id.clone(),
+            workflow_hash: instance.workflow_hash.clone(),
+            policy_hash: instance.policy_hash.clone(),
+            grant_id: instance.grant_id.clone(),
+            issue_number: instance.issue_number,
+            issue_revision: instance.issue_revision.clone(),
+            phase: instance.phase.clone(),
+            scope: instance.scope.clone(),
+            caps: caps(&instance.caps),
+            current_node: instance.current_node.clone(),
+            paused: instance.paused,
+            status: instance.status.clone(),
+            state_epoch: instance.state_epoch,
+        };
+        let observed = crate::mutation::Observed {
+            issue_revision: parsed.issue_revision.clone(),
+            policy_hash: parsed.policy_hash.clone(),
+            state_epoch: epoch,
+            now: time::rfc3339_now(),
+        };
+        let evidence = state
+            .evidence_for_instance(&parsed.instance_id)
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .map(|row| crate::mutation::EvidenceView {
+                evidence_id: row.evidence_id,
+                feature_head: row.feature_head,
+                integration_base: row.integration_base,
+                workflow_hash: row.workflow_hash,
+                policy_hash: row.policy_hash,
+                verdict: row.verdict,
+                reviewer: row.reviewer,
+                checks: row.checks,
+                created_at: row.created_at,
+            });
+        let approval = state
+            .approval_for_scope("first-write-canary")
+            .map_err(|err| (err.code.to_string(), err.message))?;
+        crate::mutation::revalidate_effect(
+            &plan,
+            &kind,
+            &grant_snapshot,
+            &instance_snapshot,
+            &observed,
+        )
+        .map_err(|err| (err.code.to_string(), err.message))?;
+        // Kind-specific durable gates.
+        match kind.as_str() {
+            "merge" => {
+                let Some(feature_head) = parsed.feature_head.clone() else {
+                    return Err((
+                        "refusal.malformed".to_string(),
+                        "merge requires observed.feature_head".to_string(),
+                    ));
+                };
+                let Some(integration_base) = parsed.integration_base.clone() else {
+                    return Err((
+                        "refusal.malformed".to_string(),
+                        "merge requires observed.integration_base".to_string(),
+                    ));
+                };
+                crate::mutation::check_merge_evidence(
+                    evidence.as_ref(),
+                    &feature_head,
+                    &integration_base,
+                    &instance_snapshot.workflow_hash,
+                    &parsed.policy_hash,
+                )
+                .map_err(|err| (err.code.to_string(), err.message))?;
+            }
+            "issue_update" => {
+                let closing =
+                    params.and_then(|p| p.get("action")).and_then(Val::as_str) == Some("close");
+                if closing {
+                    // The closure gate keys on the post-merge-verify STEP of
+                    // THIS plan (step ids are plan-local slugs; the engine
+                    // persists the achieved step id as current_node). The
+                    // refusal decision itself is the single unit-tested
+                    // gate in mutation.rs (check_issue_closure) — the daemon
+                    // calls it here and nowhere else.
+                    let verify_step = plan
+                        .doc
+                        .get("steps")
+                        .and_then(Val::as_array)
+                        .and_then(|steps| {
+                            steps.iter().find(|step| {
+                                step.get("kind").and_then(Val::as_str) == Some("post_merge_verify")
+                            })
+                        })
+                        .and_then(|step| step.get("id").and_then(Val::as_str))
+                        .unwrap_or("")
+                        .to_string();
+                    if verify_step.is_empty() {
+                        return Err((
+                            "refusal.malformed".to_string(),
+                            "the plan has no post_merge_verify step; closure is not routable"
+                                .to_string(),
+                        ));
+                    }
+                    crate::mutation::check_issue_closure(
+                        evidence.as_ref(),
+                        &instance_snapshot.current_node,
+                        &verify_step,
+                    )
+                    .map_err(|err| (err.code.to_string(), err.message))?;
+                }
+            }
+            _ => {}
+        }
+        Ok((grant_snapshot, instance_snapshot, evidence, approval))
+    })();
+    let (grant_snapshot, instance_snapshot, latest_evidence, approval) = match snapshot_outcome {
+        Ok(bundle) => bundle,
+        Err((code, message)) => {
+            return resolve_apply_refusal(shared, request, &key, &code, message);
+        }
+    };
+
+    // The AC10 gate runs before any effect that declares a real external
+    // target scope (fakes only in this slice; the real canary is a later
+    // separately approved step).
+    if matches!(risk, "production" | "destructive")
+        && let Err(err) = crate::mutation::check_first_write_approval(
+            approval.as_ref(),
+            parsed.target_scope.as_deref(),
+        )
+    {
+        return resolve_apply_refusal(shared, request, &key, err.code, err.message);
+    }
+    let _ = latest_evidence;
+
+    // Execute the effect OUTSIDE the state lock (bounded subprocesses never
+    // stall other daemon work; the claim already journals the intent).
+    let effect_env = crate::config::adapter_environment();
+    let ctx = crate::mutation::EffectContext {
+        plan: &plan,
+        step_id: &parsed.step,
+        kind: &kind,
+        params,
+        repository: &plan.repository,
+        integration_branch: &parsed.integration_branch,
+        production_branches: &parsed.production_branches,
+        worktrees_root: &parsed.worktrees_root,
+        integration_repo: &parsed.integration_repo,
+        observed_feature_head: parsed.feature_head.as_deref(),
+        observed_integration_base: parsed.integration_base.as_deref(),
+        env: &effect_env,
+    };
+    let effect = crate::mutation::execute_step(&ctx);
+    let mut result = effect.result;
+    let effect_status = effect.status;
+    let effect_code = effect.code.clone();
+    let effect_message = effect.message.clone();
+    if effect_status == "succeeded" {
+        match kind.as_str() {
+            "review_evidence" => {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return finish_apply_refused(
+                            shared,
+                            request,
+                            &key,
+                            &action,
+                            &plan.plan_id,
+                            &parsed.step,
+                            "state.unavailable",
+                            message,
+                        );
+                    }
+                };
+                let checks = result.get("checks").cloned().unwrap_or_else(null);
+                let repository = result
+                    .get("repository")
+                    .and_then(Val::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let feature_head = result
+                    .get("feature_head")
+                    .and_then(Val::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let integration_base = result
+                    .get("integration_base")
+                    .and_then(Val::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let verdict = result
+                    .get("verdict")
+                    .and_then(Val::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let reviewer = result
+                    .get("reviewer")
+                    .and_then(Val::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                match state.record_evidence(
+                    &parsed.instance_id,
+                    &repository,
+                    &feature_head,
+                    &integration_base,
+                    &plan.workflow_hash,
+                    &parsed.policy_hash,
+                    &verdict,
+                    &reviewer,
+                    &checks,
+                ) {
+                    Ok(row) => {
+                        let mut fields = match result {
+                            Val::Obj(map) => map,
+                            _ => unreachable!(),
+                        };
+                        fields.insert("evidence_id".to_string(), string(&row.evidence_id));
+                        fields.insert("recorded_at".to_string(), string(&row.created_at));
+                        result = Val::Obj(fields);
+                    }
+                    Err(err) => {
+                        return finish_apply_refused(
+                            shared,
+                            request,
+                            &key,
+                            &action,
+                            &plan.plan_id,
+                            &parsed.step,
+                            err.code,
+                            err.message,
+                        );
+                    }
+                }
+            }
+            "cleanup" => {
+                // AC8: after the destructive effect succeeded, preserve the
+                // required salvage evidence as a post-deletion audit record
+                // (the mutate.cleanup intent is the pre-effect record).
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return finish_apply_refused(
+                            shared,
+                            request,
+                            &key,
+                            &action,
+                            &plan.plan_id,
+                            &parsed.step,
+                            "state.unavailable",
+                            message,
+                        );
+                    }
+                };
+                let salvage_target = params
+                    .and_then(|p| p.get("worktree"))
+                    .and_then(Val::as_str)
+                    .unwrap_or("");
+                if let Err(err) = state.journal_salvage(
+                    &format!("{}:{}", plan.repository, salvage_target),
+                    &parsed.instance_id,
+                ) {
+                    return finish_apply_refused(
+                        shared,
+                        request,
+                        &key,
+                        &action,
+                        &plan.plan_id,
+                        &parsed.step,
+                        err.code,
+                        err.message,
+                    );
+                }
+            }
+            "approve" => {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return finish_apply_refused(
+                            shared,
+                            request,
+                            &key,
+                            &action,
+                            &plan.plan_id,
+                            &parsed.step,
+                            "state.unavailable",
+                            message,
+                        );
+                    }
+                };
+                let digest = result
+                    .get("digest")
+                    .and_then(Val::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let interactive = matches!(result.get("interactive"), Some(Val::Bool(true)));
+                match state.record_approval("first-write-canary", &digest, interactive) {
+                    Ok(row) => {
+                        let mut fields = match result {
+                            Val::Obj(map) => map,
+                            _ => unreachable!(),
+                        };
+                        fields.insert("approval_id".to_string(), string(&row.approval_id));
+                        fields.insert("recorded_at".to_string(), string(&row.recorded_at));
+                        result = Val::Obj(fields);
+                    }
+                    Err(err) => {
+                        return finish_apply_refused(
+                            shared,
+                            request,
+                            &key,
+                            &action,
+                            &plan.plan_id,
+                            &parsed.step,
+                            err.code,
+                            err.message,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    drop(grant_snapshot);
+    drop(instance_snapshot);
+
+    // Note the achieved step on the instance (current_node), then resolve
+    // the claim with the typed outcome (succeeded/failed/refused/ambiguous).
+    let state = match shared.lock_state() {
+        Ok(state) => state,
+        Err(message) => {
+            shared.log.write(
+                "error",
+                "outcome.journal_failed",
+                &format!("state lock lost: {message}"),
+            );
+            return err_response(
+                &request.id,
+                "state.unavailable",
+                "the mutation effect completed but its outcome could not be journaled (fail closed)",
+            );
+        }
+    };
+    if effect_status == "succeeded"
+        && let Err(err) = state.advance_instance(
+            &parsed.instance_id,
+            &parsed.step,
+            0,
+            0,
+            false,
+            0,
+            &time::rfc3339_now(),
+        )
+    {
+        // The effect already landed; a failed node advance must never
+        // silently succeed — journal the drift so the outcome stays
+        // auditable (kind-gates re-derive most drift, but the record
+        // must exist).
+        shared.log.write(
+            "error",
+            "outcome.advance_failed",
+            &format!(
+                "instance {} did not advance to {} after a succeeded {}: {}",
+                parsed.instance_id, parsed.step, action, err.message
+            ),
+        );
+    }
+    let response = resolve_apply_effect(
+        &state,
+        &shared.log,
+        request,
+        &key,
+        &action,
+        &plan.plan_id,
+        &parsed.step,
+        &crate::mutation::EffectOutcome {
+            status: effect_status,
+            code: effect_code,
+            message: effect_message,
+            result: null(),
+        },
+        result,
+    );
+    drop(state);
+    publish_after_state_change(shared, None);
+    response
+}
+
+/// Resolve an apply whose preconditions refused before any effect ran.
+fn resolve_apply_refusal(
+    shared: &Arc<Shared>,
+    request: &Request,
+    key: &str,
+    code: &str,
+    message: String,
+) -> String {
+    let state = match shared.lock_state() {
+        Ok(state) => state,
+        Err(lock_message) => {
+            return err_response(&request.id, "state.unavailable", lock_message);
+        }
+    };
+    let outcome = apply_outcome(
+        crate::daemon::DAEMON_PLAN_ID,
+        crate::daemon::DAEMON_STEP_ID,
+        key,
+        "refused",
+        null(),
+        Some((code, message.clone())),
+    );
+    let response = err_response(&request.id, code, message);
+    let resolved = match state.resolve_claim(
+        key,
+        &request.method,
+        "spent",
+        &canonical_text(&outcome),
+        Some(&response),
+    ) {
+        Ok(_) => response,
+        Err(err) => {
+            shared.log.write(
+                "error",
+                "outcome.journal_failed",
+                &format!("{}: {}", err.code, err.message),
+            );
+            err_response(
+                &request.id,
+                err.code,
+                format!(
+                    "the refusal could not be journaled (fail closed): {}",
+                    err.message
+                ),
+            )
+        }
+    };
+    drop(state);
+    publish_after_state_change(shared, None);
+    resolved
+}
+
+/// Resolve an apply whose post-effect durable record failed (the effect
+/// itself must be treated as ambiguous: its external side effects may have
+/// happened even though the record could not be stored).
+#[allow(clippy::too_many_arguments)]
+fn finish_apply_refused(
+    shared: &Arc<Shared>,
+    request: &Request,
+    key: &str,
+    action: &str,
+    plan_id: &str,
+    step_id: &str,
+    code: &'static str,
+    message: String,
+) -> String {
+    let state = match shared.lock_state() {
+        Ok(state) => state,
+        Err(lock_message) => {
+            return err_response(&request.id, "state.unavailable", lock_message);
+        }
+    };
+    let outcome = apply_outcome(
+        plan_id,
+        step_id,
+        key,
+        "ambiguous",
+        null(),
+        Some((code, message.clone())),
+    );
+    let response = err_response(&request.id, code, message);
+    let resolved = match state.resolve_claim(
+        key,
+        action,
+        "ambiguous",
+        &canonical_text(&outcome),
+        Some(&response),
+    ) {
+        Ok(_) => response,
+        Err(err) => {
+            shared.log.write(
+                "error",
+                "outcome.journal_failed",
+                &format!("{}: {}", err.code, err.message),
+            );
+            err_response(
+                &request.id,
+                err.code,
+                format!(
+                    "the outcome could not be journaled (fail closed): {}",
+                    err.message
+                ),
+            )
+        }
+    };
+    drop(state);
+    publish_after_state_change(shared, None);
+    resolved
+}
+
+/// Resolve a claimed apply effect with its typed outcome (AC1): the outcome
+/// status mirrors the effect status; the response records the exact
+/// read-back result on success.
+#[allow(clippy::too_many_arguments)]
+fn resolve_apply_effect(
+    state: &State,
+    log: &DaemonLog,
+    request: &Request,
+    key: &str,
+    action: &str,
+    plan_id: &str,
+    step_id: &str,
+    effect: &crate::mutation::EffectOutcome,
+    result: Val,
+) -> String {
+    let succeeded = effect.status == "succeeded";
+    let (claim_status, response, outcome) = if succeeded {
+        let response = ok_response(&request.id, result);
+        (
+            "spent",
+            response.clone(),
+            apply_outcome(plan_id, step_id, key, "succeeded", null(), None),
+        )
+    } else {
+        let code = effect
+            .code
+            .clone()
+            .unwrap_or_else(|| "effect.failed".to_string());
+        let message = effect
+            .message
+            .clone()
+            .unwrap_or_else(|| "effect failed".to_string());
+        let response = err_response(&request.id, &code, &message);
+        let claim_status = if effect.status == "ambiguous" {
+            "ambiguous"
+        } else {
+            "spent"
+        };
+        (
+            claim_status,
+            response.clone(),
+            apply_outcome(
+                plan_id,
+                step_id,
+                key,
+                effect.status,
+                null(),
+                Some((code.as_str(), message)),
+            ),
+        )
+    };
+    match state.resolve_claim(
+        key,
+        action,
+        claim_status,
+        &canonical_text(&outcome),
+        Some(&response),
+    ) {
+        Ok(_) => response,
+        Err(err) => {
+            log.write(
+                "error",
+                "outcome.journal_failed",
+                &format!("{}: {}", err.code, err.message),
+            );
+            err_response(
+                &request.id,
+                err.code,
+                format!(
+                    "the mutation effect completed but its outcome could not be journaled \
+                     (fail closed): {}",
+                    err.message
+                ),
+            )
+        }
+    }
+}
+
+/// A typed hf-outcome/v1 document for one applied plan step.
+fn apply_outcome(
+    plan_id: &str,
+    step_id: &str,
+    key: &str,
+    status: &str,
+    result: Val,
+    error: Option<(&str, String)>,
+) -> Val {
+    let failed = matches!(status, "failed" | "refused" | "ambiguous");
+    object(vec![
+        ("schema", string("hf-outcome/v1")),
+        ("plan_id", string(plan_id)),
+        ("step_id", string(step_id)),
+        ("status", string(status)),
+        ("idempotency_key", string(key)),
+        ("observed_at", string(&time::rfc3339_now())),
+        ("result", if failed { null() } else { result }),
+        (
+            "error",
+            match error {
+                Some((code, message)) => error_val(code, &message),
+                None => null(),
+            },
+        ),
+    ])
 }
 
 fn method_schedules(shared: &Arc<Shared>, request: &Request) -> String {

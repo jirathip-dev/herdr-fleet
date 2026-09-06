@@ -935,7 +935,12 @@ fn validate_plan(obj: &Val) -> Verdict {
     let Some(steps) = obj.get("steps") else {
         return Verdict::refuse(Refusal::Malformed, "plan: missing required steps");
     };
-    const STEP_KINDS: [&str; 9] = [
+    // Closed plan step kinds. The base kinds ship from issue #3/#4; the
+    // granular control-plane kinds (branch_push, pr_update, issue_update,
+    // hosted_check, post_merge_verify, branch_delete, approve) are added by
+    // issue #8 so a plan document can express the full daemon-mediated
+    // mutation surface (docs/contracts/spec-plans.md §1 apply semantics).
+    const STEP_KINDS: [&str; 16] = [
         "checkout",
         "worktree_create",
         "harness_start",
@@ -945,6 +950,13 @@ fn validate_plan(obj: &Val) -> Verdict {
         "merge",
         "cleanup",
         "publish",
+        "branch_push",
+        "pr_update",
+        "issue_update",
+        "hosted_check",
+        "post_merge_verify",
+        "branch_delete",
+        "approve",
     ];
     match steps {
         Val::Arr(items) if !items.is_empty() => {

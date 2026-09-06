@@ -18,6 +18,7 @@ pub mod dirs;
 pub mod engine;
 pub mod formats;
 pub mod lock;
+pub mod mutation;
 pub mod observe;
 pub mod plan;
 pub mod process;

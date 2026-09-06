@@ -29,7 +29,7 @@ use crate::time;
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The schema version this binary understands (also `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Bounded-retention defaults (rows kept besides the chain genesis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,6 +231,54 @@ pub struct InstanceRow {
     pub updated_at: String,
 }
 
+/// A durable review-evidence row (issue #8; spec-review-evidence.md):
+/// exact feature head + integration base + workflow/policy hashes plus the
+/// reviewer verdict and named checks. Invalidated only by revalidation
+/// against live state before an integration merge (never edited in place).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvidenceRow {
+    /// Evidence id (`ev_` + 16 hex).
+    pub evidence_id: String,
+    /// Owning workflow instance id.
+    pub instance_id: String,
+    /// Repository identity.
+    pub repository: String,
+    /// Exact reviewed feature-branch head (40-hex).
+    pub feature_head: String,
+    /// Exact integration-base SHA the review was performed against (40-hex).
+    pub integration_base: String,
+    /// Workflow hash (64-hex).
+    pub workflow_hash: String,
+    /// Policy hash (64-hex).
+    pub policy_hash: String,
+    /// Verdict (`pass` | `fail`).
+    pub verdict: String,
+    /// Reviewer identity (distinct from the implementer).
+    pub reviewer: String,
+    /// Canonical JSON array of named checks (`[{"name","status"}]`).
+    pub checks: String,
+    /// Recorded at (RFC3339 UTC).
+    pub created_at: String,
+}
+
+/// A recorded first-real-write approval (issue #8 AC10 plumbing). The
+/// approval is recorded by a human-gated flow BEFORE any real external
+/// write canary; this slice only proves the gate with fakes and never runs
+/// a real canary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalRow {
+    /// Approval id (`ap_` + 16 hex).
+    pub approval_id: String,
+    /// Recorded scope (`first-write-canary` is the closed scope).
+    pub scope: String,
+    /// 64-hex human-confirmed digest bound to the approval.
+    pub digest: String,
+    /// Whether the digest was confirmed on an interactive TTY.
+    pub interactive: bool,
+    /// Recorded at (RFC3339 UTC).
+    pub recorded_at: String,
+}
+
 /// The daemon-owned state handle. All methods serialize on an internal
 /// mutex (one writer); a failed write poisons the handle (fail closed).
 pub struct State {
@@ -332,6 +380,10 @@ impl State {
             run_m0002(&mut conn)?;
             user_version = M0002_APPLIES_TO;
         }
+        if user_version == M0003_APPLIES_FROM {
+            run_m0003(&mut conn)?;
+            user_version = M0003_APPLIES_TO;
+        }
         match user_version {
             v if v == SCHEMA_VERSION => {
                 for (migration_id, _, _) in MIGRATIONS {
@@ -429,6 +481,8 @@ impl State {
 
     /// Invalidate every active grant issued against an epoch older than
     /// `current_epoch` (restore semantics: grants die with their epoch).
+    /// Bound running instances are invalidated with their grants (C3:
+    /// restore rotates the epoch; instances die with their epoch too).
     pub fn invalidate_grants_below_current(&self) -> Result<i64, StateError> {
         let conn = self.lock("invalidate_grants")?;
         let epoch: i64 = conn
@@ -441,6 +495,13 @@ impl State {
             params![epoch],
         )
         .map_err(|err| StateError::from_sqlite("invalidate_grants: update", err))?;
+        conn.execute(
+            "UPDATE instances SET status = 'invalidated', updated_at = ?2
+              WHERE state_epoch < ?1 AND status IN
+                    ('new', 'running', 'paused', 'human_queue', 'blocked')",
+            params![epoch, time::rfc3339_now()],
+        )
+        .map_err(|err| StateError::from_sqlite("invalidate_grants: instances", err))?;
         Ok(epoch)
     }
 
@@ -921,8 +982,8 @@ impl State {
     }
 
     /// Invalidate an active grant (material issue/acceptance edit — AC2).
-    /// The engine refuses every further mutation once the grant is
-    /// invalidated; bound instances are paused by the caller.
+    /// Bound instances are invalidated with it (C3: an instance bound to an
+    /// invalidated grant can never advance again).
     pub fn invalidate_grant(&self, grant_id: &str, at: &str) -> Result<(), StateError> {
         let conn = self.lock("invalidate_grant")?;
         let affected = conn
@@ -938,6 +999,13 @@ impl State {
                 format!("no active grant {grant_id:?} to invalidate"),
             ));
         }
+        conn.execute(
+            "UPDATE instances SET status = 'invalidated', updated_at = ?2
+              WHERE grant_id = ?1 AND status IN
+                    ('new', 'running', 'paused', 'human_queue', 'blocked')",
+            params![grant_id, at],
+        )
+        .map_err(|err| StateError::from_sqlite("invalidate_grant: instances", err))?;
         Ok(())
     }
 
@@ -1132,6 +1200,286 @@ impl State {
             out.push(row.map_err(|err| StateError::from_sqlite("list_instances: row", err))?);
         }
         Ok(out)
+    }
+
+    // ---------------------------------------------------------------------
+    // Control-plane mutation state (issue #8): durable review evidence,
+    // recorded first-write approvals, salvage journal records
+    // ---------------------------------------------------------------------
+
+    /// Durably record a review-evidence row bound to an exact feature head,
+    /// integration base, workflow hash, and policy hash. Every binding is
+    /// shape-checked here; semantic freshness is revalidated before the
+    /// merge (evidence dies with its epoch: rows never carry their epoch,
+    /// so an epoch rotation makes every row stale — see
+    /// [`State::rotate_epoch`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_evidence(
+        &self,
+        instance_id: &str,
+        repository: &str,
+        feature_head: &str,
+        integration_base: &str,
+        workflow_hash: &str,
+        policy_hash: &str,
+        verdict: &str,
+        reviewer: &str,
+        checks: &Val,
+    ) -> Result<EvidenceRow, StateError> {
+        use crate::formats::{is_hex40, is_hex64, is_repository_identity, is_slug};
+        if !matches!(verdict, "pass" | "fail") {
+            return Err(state_error(
+                "state.evidence_invalid",
+                format!("evidence verdict {verdict:?} outside {{pass, fail}}"),
+            ));
+        }
+        if !is_slug(instance_id) || !is_repository_identity(repository) {
+            return Err(state_error(
+                "state.evidence_invalid",
+                "evidence instance/repository binding invalid",
+            ));
+        }
+        if !is_hex40(feature_head) || !is_hex40(integration_base) {
+            return Err(state_error(
+                "state.evidence_invalid",
+                "evidence head/base bindings must be exact 40-hex SHAs",
+            ));
+        }
+        if !is_hex64(workflow_hash) || !is_hex64(policy_hash) {
+            return Err(state_error(
+                "state.evidence_invalid",
+                "evidence workflow/policy hashes must be 64-hex",
+            ));
+        }
+        if reviewer.is_empty() || reviewer.len() > 64 {
+            return Err(state_error(
+                "state.evidence_invalid",
+                "evidence reviewer identity must be a non-empty identifier <= 64 chars",
+            ));
+        }
+        let checks_ok = matches!(checks, Val::Arr(items) if !items.is_empty() && items.iter().all(|item| matches!(item, Val::Obj(_))
+            && matches!(item.get("name"), Some(Val::Str(name)) if !name.is_empty())
+            && matches!(item.get("status"), Some(Val::Str(status)) if matches!(status.as_str(), "passed" | "failed" | "pending"))));
+        if !checks_ok {
+            return Err(state_error(
+                "state.evidence_invalid",
+                "evidence checks must be a non-empty list of {{name, status(passed|failed|pending)}}",
+            ));
+        }
+        let checks_line = canonical_text(checks);
+        let created_at = time::rfc3339_now();
+        let seed = canonical_text(&object(vec![
+            ("instance_id", string(instance_id)),
+            ("feature_head", string(feature_head)),
+            ("integration_base", string(integration_base)),
+            ("workflow_hash", string(workflow_hash)),
+            ("policy_hash", string(policy_hash)),
+            ("verdict", string(verdict)),
+            ("reviewer", string(reviewer)),
+            ("created_at", string(&created_at)),
+        ]));
+        let evidence_id = format!("ev_{}", &sha256_hex(seed.as_bytes())[..16]);
+        let conn = self.lock("record_evidence")?;
+        conn.execute(
+            "INSERT INTO evidence (evidence_id, instance_id, repository, feature_head,
+                                   integration_base, workflow_hash, policy_hash,
+                                   verdict, reviewer, checks, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                evidence_id,
+                instance_id,
+                repository,
+                feature_head,
+                integration_base,
+                workflow_hash,
+                policy_hash,
+                verdict,
+                reviewer,
+                checks_line,
+                created_at
+            ],
+        )
+        .map_err(|err| {
+            if err.to_string().contains("UNIQUE") {
+                state_error(
+                    "state.evidence_exists",
+                    format!("evidence {evidence_id} already exists"),
+                )
+            } else {
+                StateError::from_sqlite("record_evidence: insert", err)
+            }
+        })?;
+        Ok(EvidenceRow {
+            evidence_id,
+            instance_id: instance_id.to_string(),
+            repository: repository.to_string(),
+            feature_head: feature_head.to_string(),
+            integration_base: integration_base.to_string(),
+            workflow_hash: workflow_hash.to_string(),
+            policy_hash: policy_hash.to_string(),
+            verdict: verdict.to_string(),
+            reviewer: reviewer.to_string(),
+            checks: checks_line,
+            created_at,
+        })
+    }
+
+    /// One evidence row by id.
+    pub fn evidence_by_id(&self, evidence_id: &str) -> Result<Option<EvidenceRow>, StateError> {
+        let conn = self.lock("evidence_by_id")?;
+        conn.query_row(
+            "SELECT evidence_id, instance_id, repository, feature_head, integration_base,
+                    workflow_hash, policy_hash, verdict, reviewer, checks, created_at
+               FROM evidence WHERE evidence_id = ?1",
+            params![evidence_id],
+            evidence_row_from,
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("evidence_by_id: query", err))
+    }
+
+    /// Latest-first evidence rows for one instance (the merge gate reads the
+    /// most recent record and revalidates every binding live).
+    pub fn evidence_for_instance(&self, instance_id: &str) -> Result<Vec<EvidenceRow>, StateError> {
+        let conn = self.lock("evidence_for_instance")?;
+        let mut statement = conn
+            .prepare(
+                "SELECT evidence_id, instance_id, repository, feature_head, integration_base,
+                        workflow_hash, policy_hash, verdict, reviewer, checks, created_at
+                   FROM evidence WHERE instance_id = ?1 ORDER BY created_at DESC, evidence_id DESC",
+            )
+            .map_err(|err| StateError::from_sqlite("evidence_for_instance: prepare", err))?;
+        let rows = statement
+            .query_map(params![instance_id], evidence_row_from)
+            .map_err(|err| StateError::from_sqlite("evidence_for_instance: query", err))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(
+                row.map_err(|err| StateError::from_sqlite("evidence_for_instance: row", err))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Record the separate explicit human approval required before the
+    /// first real external write canary (issue #8 AC10; the canary itself
+    /// is never run by this slice). Refused when a newer recorded approval
+    /// already exists for the scope (approvals are monotonic — an older
+    /// digest must never overwrite a newer one).
+    pub fn record_approval(
+        &self,
+        scope: &str,
+        digest: &str,
+        interactive: bool,
+    ) -> Result<ApprovalRow, StateError> {
+        use crate::formats::{is_hex64, is_slug};
+        if !is_slug(scope) || scope != "first-write-canary" {
+            return Err(state_error(
+                "state.approval_invalid",
+                format!(
+                    "approval scope {scope:?} is outside the closed {{first-write-canary}} set"
+                ),
+            ));
+        }
+        if !is_hex64(digest) {
+            return Err(state_error(
+                "state.approval_invalid",
+                "approval digest must be 64-hex",
+            ));
+        }
+        let recorded_at = time::rfc3339_now();
+        let seed = canonical_text(&object(vec![
+            ("scope", string(scope)),
+            ("digest", string(digest)),
+            ("recorded_at", string(&recorded_at)),
+        ]));
+        let approval_id = format!("ap_{}", &sha256_hex(seed.as_bytes())[..16]);
+        let conn = self.lock("record_approval")?;
+        let newest: Option<String> = conn
+            .query_row(
+                "SELECT recorded_at FROM approvals WHERE scope = ?1 AND revoked_at IS NULL
+                  ORDER BY recorded_at DESC LIMIT 1",
+                params![scope],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("record_approval: read", err))?;
+        if let Some(prior) = newest
+            && prior > recorded_at
+        {
+            return Err(state_error(
+                "state.approval_stale",
+                "a newer recorded approval exists for the scope; refusing the stale record",
+            ));
+        }
+        conn.execute(
+            "INSERT INTO approvals (approval_id, scope, digest, interactive, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![approval_id, scope, digest, interactive as i64, recorded_at],
+        )
+        .map_err(|err| StateError::from_sqlite("record_approval: insert", err))?;
+        Ok(ApprovalRow {
+            approval_id,
+            scope: scope.to_string(),
+            digest: digest.to_string(),
+            interactive,
+            recorded_at,
+        })
+    }
+
+    /// The newest un-revoked recorded approval for a scope, if any.
+    pub fn approval_for_scope(&self, scope: &str) -> Result<Option<ApprovalRow>, StateError> {
+        let conn = self.lock("approval_for_scope")?;
+        conn.query_row(
+            "SELECT approval_id, scope, digest, interactive, recorded_at
+               FROM approvals WHERE scope = ?1 AND revoked_at IS NULL
+              ORDER BY recorded_at DESC LIMIT 1",
+            params![scope],
+            |row| {
+                let interactive: i64 = row.get(3)?;
+                Ok(ApprovalRow {
+                    approval_id: row.get(0)?,
+                    scope: row.get(1)?,
+                    digest: row.get(2)?,
+                    interactive: interactive != 0,
+                    recorded_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("approval_for_scope: query", err))
+    }
+
+    /// Append a `salvage.cleanup` audit record capturing the required
+    /// salvage evidence of a completed worktree/branch cleanup deletion
+    /// (issue #8 AC8: cleanup preserves required salvage evidence; the
+    /// deletion intent itself is journaled before the effect as
+    /// `mutate.cleanup`, and this post-deletion evidence record completes
+    /// the audit pair).
+    pub fn journal_salvage(&self, target: &str, instance_id: &str) -> Result<AuditRow, StateError> {
+        let outcome = self.journal_salvage_inner(target, instance_id);
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn journal_salvage_inner(
+        &self,
+        target: &str,
+        instance_id: &str,
+    ) -> Result<AuditRow, StateError> {
+        self.ensure_writable()?;
+        let mut conn = self.lock("journal_salvage")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("journal_salvage: begin", err))?;
+        let mut key = format!("ik_salvage-{instance_id}");
+        key.truncate(64);
+        let audit = self.append_audit_locked(&tx, "salvage.cleanup", target, &key, None, None)?;
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("journal_salvage: commit", err))?;
+        Ok(audit)
     }
 
     // ---------------------------------------------------------------------
@@ -1705,6 +2053,24 @@ fn instance_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<InstanceRow> {
     })
 }
 
+/// Map one SQLite row onto [`EvidenceRow`] (column order of the evidence
+/// SELECTs in [`State::evidence_by_id`]/[`State::evidence_for_instance`]).
+fn evidence_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceRow> {
+    Ok(EvidenceRow {
+        evidence_id: row.get(0)?,
+        instance_id: row.get(1)?,
+        repository: row.get(2)?,
+        feature_head: row.get(3)?,
+        integration_base: row.get(4)?,
+        workflow_hash: row.get(5)?,
+        policy_hash: row.get(6)?,
+        verdict: row.get(7)?,
+        reviewer: row.get(8)?,
+        checks: row.get(9)?,
+        created_at: row.get(10)?,
+    })
+}
+
 /// Prune audit rows beyond the retention bound, always keeping the chain
 /// genesis (seq 0) so verification keeps its anchor.
 fn prune_audit_locked(
@@ -1864,11 +2230,20 @@ const M0002_ID: &str = "m0002_workflow_engine_instances_v2";
 const M0002_APPLIES_FROM: i64 = 1;
 const M0002_APPLIES_TO: i64 = 2;
 
+/// m0003 adds the control-plane mutation tables (issue #8): durable review
+/// evidence rows bound to exact heads/workflow/policy hashes
+/// (spec-review-evidence.md) and recorded first-real-write approval rows
+/// (issue #8 AC10 plumbing — the canary itself is a separate human gate).
+const M0003_ID: &str = "m0003_control_plane_evidence_v3";
+const M0003_APPLIES_FROM: i64 = 2;
+const M0003_APPLIES_TO: i64 = 3;
+
 /// Ordered migration chain (id, applies_from, applies_to). The runner in
 /// [`State::open`] applies every pending migration before serving.
-const MIGRATIONS: [(&str, i64, i64); 2] = [
+const MIGRATIONS: [(&str, i64, i64); 3] = [
     (M0001_ID, M0001_APPLIES_FROM, M0001_APPLIES_TO),
     (M0002_ID, M0002_APPLIES_FROM, M0002_APPLIES_TO),
+    (M0003_ID, M0003_APPLIES_FROM, M0003_APPLIES_TO),
 ];
 
 /// Engine-state columns added to `instances` by m0002 (SQLite ALTER ADD
@@ -1890,6 +2265,36 @@ ALTER TABLE instances ADD COLUMN human_queue INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE instances ADD COLUMN terminal_blockers INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE instances ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE instances ADD COLUMN resume_digest TEXT NOT NULL DEFAULT '';
+";
+
+/// m0003 control-plane mutation tables (issue #8). `evidence` durably
+/// records review evidence bound to exact heads/workflow/policy hashes;
+/// `approvals` records the separate explicit human approval required
+/// before the first real external write canary (AC10 — the canary itself
+/// is never run by this slice).
+const M0003_SQL: &str = "\
+CREATE TABLE evidence (
+    evidence_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    feature_head TEXT NOT NULL,
+    integration_base TEXT NOT NULL,
+    workflow_hash TEXT NOT NULL,
+    policy_hash TEXT NOT NULL,
+    verdict TEXT NOT NULL CHECK (verdict IN ('pass', 'fail')),
+    reviewer TEXT NOT NULL,
+    checks TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_evidence_instance ON evidence(instance_id, created_at);
+CREATE TABLE approvals (
+    approval_id TEXT PRIMARY KEY,
+    scope TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    interactive INTEGER NOT NULL,
+    recorded_at TEXT NOT NULL,
+    revoked_at TEXT
+);
 ";
 
 const M0001_SQL: &str = "\
@@ -2072,6 +2477,35 @@ fn run_m0002(conn: &mut Connection) -> Result<(), StateError> {
         .map_err(|err| StateError::from_sqlite("migrate m0002: user_version", err))?;
     tx.commit()
         .map_err(|err| StateError::from_sqlite("migrate m0002: commit", err))?;
+    Ok(())
+}
+
+/// Run migration m0003 in one transaction: durable review-evidence rows and
+/// recorded first-real-write approval rows (issue #8 control-plane
+/// mutations; AC4 evidence + AC10 recorded-approval plumbing).
+fn run_m0003(conn: &mut Connection) -> Result<(), StateError> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| StateError::from_sqlite("migrate m0003: begin", err))?;
+    let checksum = sha256_hex(M0003_SQL.as_bytes());
+    tx.execute_batch(M0003_SQL)
+        .map_err(|err| StateError::from_sqlite("migrate m0003", err))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (migration_id, applies_from, applies_to, checksum, applied_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            M0003_ID,
+            M0003_APPLIES_FROM,
+            M0003_APPLIES_TO,
+            checksum,
+            time::rfc3339_now()
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("migrate m0003: bookkeeping", err))?;
+    tx.pragma_update(None, "user_version", M0003_APPLIES_TO)
+        .map_err(|err| StateError::from_sqlite("migrate m0003: user_version", err))?;
+    tx.commit()
+        .map_err(|err| StateError::from_sqlite("migrate m0003: commit", err))?;
     Ok(())
 }
 
@@ -2613,5 +3047,192 @@ mod tests {
             .expect("put overwrite (stale recovery)");
         state.drop_daemon_lease().expect("drop");
         assert_eq!(state.list_schedules().expect("schedules").len(), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #8: durable review evidence, recorded approvals (m0003), and C3
+    // instance invalidation wiring
+    // ---------------------------------------------------------------------
+
+    fn sample_checks() -> Val {
+        Val::Arr(vec![
+            object(vec![
+                ("name", string("exact-head-review")),
+                ("status", string("passed")),
+            ]),
+            object(vec![
+                ("name", string("hosted-ci")),
+                ("status", string("passed")),
+            ]),
+        ])
+    }
+
+    #[test]
+    fn m0003_evidence_round_trips_and_refuses_bad_bindings() {
+        let path = temp_db("m0003-evidence.db");
+        let state = State::open(&path, Retention::default()).expect("open");
+        let (_, _, _, version) = state.summary().expect("summary");
+        assert_eq!(version, 3, "schema version 3 after m0003");
+        state.issue_grant(&sample_grant_doc()).expect("issue");
+        state
+            .start_instance(
+                "run-1",
+                "gr_0123456789abcdef",
+                "fleet-doctrine-1",
+                "2026-09-06T00:00:00Z",
+            )
+            .expect("start");
+        let row = state
+            .record_evidence(
+                "run-1",
+                "example-org/widgets",
+                &"a".repeat(40),
+                &"b".repeat(40),
+                &"0".repeat(64),
+                &"f".repeat(64),
+                "pass",
+                "reviewer-1",
+                &sample_checks(),
+            )
+            .expect("record evidence");
+        assert!(row.evidence_id.starts_with("ev_"));
+        let by_id = state.evidence_by_id(&row.evidence_id).expect("by id");
+        assert_eq!(by_id.expect("row").feature_head, "a".repeat(40));
+        let rows = state.evidence_for_instance("run-1").expect("for instance");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].verdict, "pass");
+        // Bad bindings refuse at the record boundary.
+        let bad = state.record_evidence(
+            "run-1",
+            "example-org/widgets",
+            "not-a-sha",
+            &"b".repeat(40),
+            &"0".repeat(64),
+            &"f".repeat(64),
+            "pass",
+            "reviewer-1",
+            &sample_checks(),
+        );
+        assert_eq!(
+            bad.expect_err("bad head refused").code,
+            "state.evidence_invalid"
+        );
+        let bad_verdict = state.record_evidence(
+            "run-1",
+            "example-org/widgets",
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"0".repeat(64),
+            &"f".repeat(64),
+            "maybe",
+            "reviewer-1",
+            &sample_checks(),
+        );
+        assert_eq!(
+            bad_verdict.expect_err("bad verdict refused").code,
+            "state.evidence_invalid"
+        );
+    }
+
+    #[test]
+    fn first_write_approval_records_are_monotonic_and_scoped() {
+        let path = temp_db("m0003-approvals.db");
+        let state = State::open(&path, Retention::default()).expect("open");
+        let approval = state
+            .record_approval("first-write-canary", &"a".repeat(64), true)
+            .expect("record approval");
+        assert!(approval.approval_id.starts_with("ap_"));
+        assert!(approval.interactive);
+        let found = state
+            .approval_for_scope("first-write-canary")
+            .expect("lookup")
+            .expect("row");
+        assert_eq!(found.digest, "a".repeat(64));
+        // Closed scope only; bad digests refuse.
+        assert_eq!(
+            state
+                .record_approval("some-other-scope", &"a".repeat(64), true)
+                .expect_err("scope refused")
+                .code,
+            "state.approval_invalid"
+        );
+        assert_eq!(
+            state
+                .record_approval("first-write-canary", "short", true)
+                .expect_err("digest refused")
+                .code,
+            "state.approval_invalid"
+        );
+    }
+
+    #[test]
+    fn c3_instance_invalidation_follows_grant_invalidation_and_epoch_rotation() {
+        // C3 RED/GREEN: invalidating a grant invalidates its bound running
+        // instances; rotating the epoch (restore) invalidates instances
+        // below the new epoch.
+        let path = temp_db("c3-invalidation.db");
+        let state = State::open(&path, Retention::default()).expect("open");
+        let at = "2026-09-06T00:00:00Z";
+        state.issue_grant(&sample_grant_doc()).expect("issue");
+        state
+            .start_instance("run-1", "gr_0123456789abcdef", "fleet-doctrine-1", at)
+            .expect("start");
+        let row = state.instance_by_id("run-1").expect("read").expect("row");
+        assert_eq!(row.status, "new");
+
+        state
+            .invalidate_grant("gr_0123456789abcdef", at)
+            .expect("invalidate");
+        let row = state.instance_by_id("run-1").expect("read").expect("row");
+        assert_eq!(
+            row.status, "invalidated",
+            "C3: an instance bound to an invalidated grant must be invalidated"
+        );
+        // A done/absent instance is untouched by the wiring.
+        assert_eq!(state.instance_by_id("run-9").expect("read"), None);
+
+        // Restore rotation: a fresh grant+instance under epoch 1 die when
+        // the epoch rotates to 2.
+        let path2 = temp_db("c3-restore.db");
+        let state2 = State::open(&path2, Retention::default()).expect("open");
+        state2.issue_grant(&sample_grant_doc()).expect("issue");
+        state2
+            .start_instance("run-1", "gr_0123456789abcdef", "fleet-doctrine-1", at)
+            .expect("start");
+        state2.rotate_epoch("restore").expect("rotate");
+        state2
+            .invalidate_grants_below_current()
+            .expect("invalidate below");
+        let row = state2.instance_by_id("run-1").expect("read").expect("row");
+        assert_eq!(
+            row.status, "invalidated",
+            "C3: restore rotation invalidates instances that died with their epoch"
+        );
+        assert!(state2.list_grants().expect("list").is_empty());
+    }
+
+    #[test]
+    fn salvage_journal_record_completes_the_cleanup_audit_pair() {
+        let path = temp_db("salvage.db");
+        let state = State::open(&path, Retention::default()).expect("open");
+        let audit = state
+            .journal_salvage("example-org/widgets:worktrees/issues/123", "run-1")
+            .expect("salvage journal");
+        assert_eq!(audit.seq, 1, "salvage follows the genesis row");
+        let lines = state.journal_tail(0, 10).expect("tail").1;
+        let line = lines
+            .iter()
+            .find(|line| line.contains("salvage.cleanup"))
+            .expect("salvage line in the journal");
+        let doc = Val::parse_json(line).expect("parse");
+        assert_eq!(
+            doc.get("action").and_then(Val::as_str),
+            Some("salvage.cleanup")
+        );
+        assert_eq!(
+            doc.get("recorded_before_mutation").and_then(Val::as_bool),
+            Some(false),
+            "salvage is post-deletion evidence (the mutate.cleanup intent is the before record)"
+        );
     }
 }
