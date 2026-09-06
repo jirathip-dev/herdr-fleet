@@ -185,15 +185,26 @@ struct Fixture {
     dir: PathBuf,
     state_dir: PathBuf,
     socket: PathBuf,
+    stderr_log: PathBuf,
 }
 
 impl Fixture {
     fn new(sandbox: &Sandbox, name: &str) -> Fixture {
         let dir = sandbox.path(&format!("daemon-{name}"));
         std::fs::create_dir_all(&dir).expect("fixture dir");
+        // The daemon SOCKET path must stay short on every platform: macOS
+        // Unix sockets use sockaddr_un (~104-byte sun_path limit) and CI
+        // temp dirs live under a long /var/folders/... prefix, so nesting
+        // the socket inside the (already long) sandbox root + daemon-{name}
+        // subdir exceeds the limit and the daemon can never bind. State and
+        // logs may keep the descriptive long layout (files have no such
+        // limit); only the socket is placed at a short direct child of the
+        // sandbox root (tests/daemon_rpc.rs passes on macOS the same way —
+        // short dir + short socket filename).
         Fixture {
             state_dir: dir.join("state"),
-            socket: dir.join("daemon.sock"),
+            socket: sandbox.path("sock"),
+            stderr_log: dir.join("daemon.stderr.log"),
             dir,
         }
     }
@@ -214,11 +225,7 @@ impl Fixture {
     }
 
     fn spawn(&self, path: &str) -> Child {
-        let stderr_path = std::env::temp_dir().join(format!(
-            "hf-mut8-daemon-{}.stderr.log",
-            self.dir.file_name().unwrap().to_string_lossy()
-        ));
-        let stderr_file = std::fs::File::create(&stderr_path).expect("stderr log");
+        let stderr_file = std::fs::File::create(&self.stderr_log).expect("stderr log");
         Command::new(bin())
             .args(["daemon", "run", "--socket"])
             .arg(&self.socket)
@@ -251,7 +258,19 @@ fn wait_ready(fixture: &Fixture) {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("daemon did not become ready");
+    // Fail with the daemon's own output so a macOS-style bind failure (long
+    // socket path > sockaddr_un limit) or any other startup error is
+    // self-explanatory in CI instead of an opaque timeout.
+    let stderr_text = std::fs::read_to_string(&fixture.stderr_log).unwrap_or_default();
+    let daemon_log = fixture.state_dir.join("herdr-fleet").join("daemon.log");
+    let log_text = std::fs::read_to_string(&daemon_log).unwrap_or_default();
+    panic!(
+        "daemon did not become ready on {} ({} bytes; macOS sockaddr_un ~104-byte limit); stderr:\n{}\ndaemon.log:\n{}",
+        fixture.socket.display(),
+        fixture.socket.as_os_str().to_string_lossy().len(),
+        stderr_text,
+        log_text
+    );
 }
 
 fn rpc(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
