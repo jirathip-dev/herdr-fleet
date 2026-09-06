@@ -109,6 +109,8 @@ impl Git {
 struct Repos {
     checkout: PathBuf,
     worktrees_root: PathBuf,
+    /// Daemon-owned archive/salvage root (issue #9 AC7 cleanup probes).
+    archive_root: PathBuf,
 }
 
 fn make_repos(sandbox: &Sandbox) -> Repos {
@@ -142,6 +144,7 @@ fn make_repos(sandbox: &Sandbox) -> Repos {
     Repos {
         checkout,
         worktrees_root: sandbox.path("worktrees"),
+        archive_root: sandbox.path("archives"),
     }
 }
 
@@ -700,6 +703,32 @@ impl Scenario {
             ("digest_confirmed", herdr_fleet::value::bool_(true)),
             ("scheduled", herdr_fleet::value::bool_(scheduled)),
             ("production_confirmation", string("tty")),
+            // Issue #9 AC1: fan-out steps (harness_start/prompt) require a
+            // fresh host-resource proof + declared concurrency caps. These
+            // scenarios declare generous caps and a fresh measurement so the
+            // admission gate is satisfied (its refusals are probed in
+            // tests/daemon_lifecycle.rs).
+            (
+                "admission",
+                object(vec![
+                    (
+                        "caps",
+                        object(vec![
+                            ("global", herdr_fleet::value::integer(16)),
+                            ("repository", herdr_fleet::value::integer(8)),
+                            ("harness", herdr_fleet::value::integer(8)),
+                        ]),
+                    ),
+                    ("harness_lanes", herdr_fleet::value::integer(0)),
+                    (
+                        "host_proof",
+                        object(vec![(
+                            "measured_at",
+                            string(&herdr_fleet::time::rfc3339_now()),
+                        )]),
+                    ),
+                ]),
+            ),
         ];
         if let Some(scope) = target_scope {
             flags.push(("target_scope", string(scope)));
@@ -733,6 +762,10 @@ impl Scenario {
                     (
                         "worktrees_root",
                         string(&self.repos.worktrees_root.to_string_lossy()),
+                    ),
+                    (
+                        "archive_root",
+                        string(&self.repos.archive_root.to_string_lossy()),
                     ),
                     (
                         "integration_repo",
@@ -1268,5 +1301,142 @@ fn fork_pr_update_requires_maintainer_approval_over_the_wire_and_trusted_head_pa
         created.get("number").and_then(Val::as_int),
         Some(1001),
         "trusted same-repo PR update must reach the forge adapter"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC7 (issue #9): dirty lanes are never deleted; `archive` preserves the
+// exact bytes into the daemon-owned archive root with a checksummed
+// manifest (removed stays false); symlinked cleanup targets are refused.
+// ---------------------------------------------------------------------------
+
+fn archive_x1_step() -> Val {
+    step(
+        "x1",
+        "cleanup",
+        Some(object(vec![
+            ("worktree", string("issues-123")),
+            ("branch", string("issue-123")),
+            ("archive", herdr_fleet::value::bool_(true)),
+        ])),
+    )
+}
+
+#[test]
+fn dirty_cleanup_archive_preserves_exact_bytes_and_manifest_and_never_deletes() {
+    let scenario = Scenario::new("lc-archive", "2999-01-01T00:00:00Z", flow_steps());
+    scenario.apply_ok(60, "w1", None, None);
+    scenario.apply_ok(61, "h1", None, None);
+    scenario.apply_ok(62, "p1", None, None);
+    // Deterministic dirty payload: 5 KiB of mixed text (no network, no
+    // host paths; archived bytes must match byte-for-byte).
+    let payload: String = (0..40)
+        .map(|i| format!("salvage-me line {i:03}: the quick brown fox\n"))
+        .collect();
+    let lane = scenario.repos.worktrees_root.join("issues-123");
+    std::fs::write(lane.join("uncommitted.txt"), &payload).expect("dirty file");
+
+    // RED: plain cleanup still refuses the dirty work (never deleted).
+    let (code, _) = scenario.apply_err(63, "x1", None, None);
+    assert_eq!(code, "refusal.cleanup.dirty");
+    assert!(lane.exists() && lane.join("uncommitted.txt").exists());
+
+    // The archive-enabled cleanup step preserves bytes + manifest.
+    let plan_steps = {
+        let mut steps = flow_steps();
+        let last = steps.len() - 1;
+        steps[last] = archive_x1_step();
+        steps
+    };
+    let archive_scenario = Scenario::new("lc-archive2", "2999-01-01T00:00:00Z", plan_steps);
+    archive_scenario.apply_ok(64, "w1", None, None);
+    archive_scenario.apply_ok(65, "h1", None, None);
+    archive_scenario.apply_ok(66, "p1", None, None);
+    let lane2 = archive_scenario.repos.worktrees_root.join("issues-123");
+    std::fs::write(lane2.join("uncommitted.txt"), &payload).expect("dirty file 2");
+    let archived = archive_scenario.apply_ok(67, "x1", None, None);
+    let archive_doc = archived.get("archived").expect("archived doc");
+    // The whole dirty lane is preserved (worktree files + the dirty
+    // payload); find the uncommitted.txt entry to byte-compare.
+    let files = archive_doc
+        .get("files")
+        .and_then(Val::as_array)
+        .expect("files");
+    assert_eq!(files.len(), 3, "all lane files are archived, dirty or not");
+    let manifest_sha = archive_doc
+        .get("manifest_sha256")
+        .and_then(Val::as_str)
+        .expect("manifest sha")
+        .to_string();
+    let total_bytes = archive_doc.get("total_bytes").and_then(Val::as_int);
+    assert_eq!(
+        total_bytes,
+        Some(payload.len() as i64 + 17),
+        "byte count must match the archived lane files"
+    );
+    let entry = files
+        .iter()
+        .find(|file| file.get("path").and_then(Val::as_str) == Some("uncommitted.txt"))
+        .expect("uncommitted.txt entry");
+    let rel = entry.get("path").and_then(Val::as_str).expect("rel path");
+    let entry_sha = entry
+        .get("sha256")
+        .and_then(Val::as_str)
+        .expect("entry sha");
+    let archive_dir = std::path::PathBuf::from(
+        archive_doc
+            .get("archive_dir")
+            .and_then(Val::as_str)
+            .expect("dir"),
+    );
+    let archived_bytes = std::fs::read(archive_dir.join(rel)).expect("read archived file");
+    assert_eq!(
+        archived_bytes,
+        payload.as_bytes(),
+        "archived bytes must equal the original"
+    );
+    let expected_sha = herdr_fleet::canonical::sha256_hex(payload.as_bytes());
+    assert_eq!(
+        entry_sha, expected_sha,
+        "manifest sha256 must match the bytes"
+    );
+    // The manifest on disk pins the same digest.
+    let manifest_text =
+        std::fs::read_to_string(archive_dir.join("manifest.json")).expect("manifest");
+    assert_eq!(
+        herdr_fleet::canonical::sha256_hex(manifest_text.as_bytes()),
+        manifest_sha,
+        "manifest file digest must equal the reported manifest_sha256"
+    );
+    // Archive NEVER deletes: the dirty lane stays in place, and a repeat
+    // archive within the same second refuses to overwrite the existing
+    // archive directory (fail closed — salvage bytes are never clobbered).
+    assert!(lane2.exists() && lane2.join("uncommitted.txt").exists());
+    let (repeat_code, _) = archive_scenario.apply_err(68, "x1", None, None);
+    assert_eq!(
+        repeat_code, "effect.archive.failed",
+        "an existing archive dir is never overwritten"
+    );
+    assert!(
+        lane2.join("uncommitted.txt").exists(),
+        "dirty file survives"
+    );
+}
+
+#[test]
+fn symlinked_cleanup_targets_are_refused() {
+    // A symlinked lane path inside the worktrees root (pointing at another
+    // real dir inside the root) is refused: cleanup never follows or
+    // removes symlinks (canonical target classification).
+    let scenario = Scenario::new("lc-symlink", "2999-01-01T00:00:00Z", flow_steps());
+    let wt_root = &scenario.repos.worktrees_root;
+    std::fs::create_dir_all(wt_root.join("issues-123-real")).expect("real dir");
+    std::os::unix::fs::symlink(wt_root.join("issues-123-real"), wt_root.join("issues-123"))
+        .expect("symlink");
+    let (code, message) = scenario.apply_err(69, "x1", None, None);
+    assert_eq!(code, "refusal.cleanup.symlink", "{message}");
+    assert!(
+        wt_root.join("issues-123").exists(),
+        "symlink stays in place"
     );
 }

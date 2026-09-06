@@ -24,6 +24,7 @@ commitment.
 | Versioned specs + fixtures: identities/observations/errors/exit codes/partial-freshness/human-vs-JSON | AC2 | [spec-cli.md](spec-cli.md) · `hf-error/v1`, `hf-output/v1`, `hf-observation/v1` fixtures |
 | Versioned specs + fixtures: plans/digests/grants/epochs/idempotency keys/typed outcomes | AC2 · AC3 | [spec-plans.md](spec-plans.md) · `hf-plan/v1`, `hf-grant/v1`, `hf-epoch/v1`, `hf-outcome/v1` fixtures |
 | Versioned specs + fixtures: closed typed workflow DAGs + canonical hashing/serialization | AC2 | [spec-workflow.md](spec-workflow.md) · `hf-workflow/v1` fixtures |
+| Versioned specs + fixtures: lifecycle (recurring non-destructive schedules, fan-out admission, cleanup archive/salvage, remote transport contract, cold-boot recovery) | AC1 · AC2 · AC5 · AC6 · AC7 · AC8 · AC9 · AC10 | [spec-lifecycle.md](spec-lifecycle.md) · `hf-schedule/v1` fixtures |
 | Versioned specs + fixtures: daemon request/response + JSONL events | AC2 | [spec-daemon.md](spec-daemon.md) · `hf-rpc-request/v1`, `hf-rpc-response/v1`, `hf-event/v1` fixtures |
 | Versioned specs + fixtures: SQLite migration/journal/audit, backup/restore, retention | AC2 · AC6 · AC7 | [spec-state.md](spec-state.md) · `hf-migration/v1`, `hf-audit/v1` fixtures |
 | Versioned specs + fixtures: harness + forge capability negotiation | AC2 | [spec-capabilities.md](spec-capabilities.md) · `hf-capability/v1` fixtures |

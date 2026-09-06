@@ -311,6 +311,98 @@ pub fn new_backup_paths(backups_dir: &Path, epoch: i64) -> (PathBuf, PathBuf) {
     )
 }
 
+/// Bounded-retention policy for daemon-owned backups (issue #9 AC8): keep
+/// at most `keep` point-in-time snapshots, none older than `max_age_secs`,
+/// and never more than `max_total_bytes` on disk. Age/size bounds are
+/// measured against the manifest's own checksum-verified records; the
+/// default is the bootstrap design commitment (the policy struct is the
+/// configuration point — overlay wiring is a later slice).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackupPolicy {
+    /// Maximum point-in-time backup pairs to keep (newest kept first).
+    pub keep: usize,
+    /// Maximum age of a kept backup in seconds.
+    pub max_age_secs: u64,
+    /// Maximum total bytes across kept snapshot databases.
+    pub max_total_bytes: u64,
+}
+
+impl Default for BackupPolicy {
+    fn default() -> BackupPolicy {
+        BackupPolicy {
+            keep: 8,
+            max_age_secs: 90 * 24 * 3600,
+            max_total_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// Prune verified backup pairs outside the bounded-retention policy
+/// (issue #9 AC8). Returns the removed snapshot names, oldest first.
+/// Unreadable/incomplete pairs are never touched by this function (they are
+/// not offered by [`list_backups`] either); the caller journals the pruning
+/// intent before invoking this — deleting retention records is itself a
+/// journaled daemon-state operation.
+pub fn prune_backups(backups_dir: &Path, policy: BackupPolicy) -> Result<Vec<String>, BackupError> {
+    let mut backups = list_backups(backups_dir)?;
+    let now = time::unix_now();
+    let mut removed = Vec::new();
+    let mut total_bytes: u64 = backups.iter().map(|b| b.db_bytes.max(0) as u64).sum();
+    while backups.len() > policy.keep {
+        let oldest = backups.remove(0);
+        total_bytes = total_bytes.saturating_sub(oldest.db_bytes.max(0) as u64);
+        remove_backup_pair(backups_dir, &oldest)?;
+        removed.push(oldest.snapshot_name.clone());
+    }
+    // Age bound: remove verified pairs older than the policy window.
+    let mut keep_backups: Vec<BackupManifest> = Vec::with_capacity(backups.len());
+    for backup in backups {
+        let age = time::unix_from_rfc3339(&backup.created_at)
+            .map(|created| now.saturating_sub(created).max(0) as u64)
+            .unwrap_or(u64::MAX);
+        if age > policy.max_age_secs {
+            total_bytes = total_bytes.saturating_sub(backup.db_bytes.max(0) as u64);
+            remove_backup_pair(backups_dir, &backup)?;
+            removed.push(backup.snapshot_name.clone());
+        } else {
+            keep_backups.push(backup);
+        }
+    }
+    // Size bound: drop the oldest remaining pairs until under budget.
+    keep_backups.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    let mut final_keep: Vec<BackupManifest> = Vec::with_capacity(keep_backups.len());
+    for backup in keep_backups {
+        if total_bytes > policy.max_total_bytes {
+            total_bytes = total_bytes.saturating_sub(backup.db_bytes.max(0) as u64);
+            remove_backup_pair(backups_dir, &backup)?;
+            removed.push(backup.snapshot_name.clone());
+        } else {
+            final_keep.push(backup);
+        }
+    }
+    let _ = final_keep;
+    Ok(removed)
+}
+
+/// Remove one verified snapshot+manifest pair (both files must exist).
+fn remove_backup_pair(backups_dir: &Path, manifest: &BackupManifest) -> Result<(), BackupError> {
+    let snapshot = backups_dir.join(&manifest.snapshot_name);
+    let manifest_path = manifest_path_for(&snapshot);
+    for path in [&snapshot, &manifest_path] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(backup_error(
+                    "backup.io",
+                    format!("prune remove {}: {err}", path.display()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +527,100 @@ mod tests {
         let listed = list_backups(&backups).expect("list");
         assert_eq!(listed.len(), 1, "only the verified pair is offered");
         assert_eq!(listed[0].db_sha256, digest_a);
+    }
+
+    #[test]
+    fn prune_bounds_backups_by_keep_and_removes_only_verified_pairs() {
+        let dir = temp_dir("prune");
+        let db_path = dir.join("state.db");
+        let state = State::open(&db_path, Retention::default()).expect("open");
+        drop(state);
+        let backups = dir.join("backups");
+        // Four verified pairs (epochs 1..4) plus one incomplete pair that
+        // retention must never touch.
+        for epoch in 1..=4i64 {
+            let (snapshot, _) = new_backup_paths(&backups, epoch);
+            let (digest, bytes) = create_snapshot(&db_path, &snapshot).expect("snapshot");
+            let manifest = manifest_for(epoch, 0, 0, digest, bytes, &snapshot);
+            write_manifest(&snapshot, &manifest).expect("manifest");
+        }
+        let (snapshot_incomplete, manifest_incomplete) = new_backup_paths(&backups, 5);
+        let (digest_i, bytes_i) = create_snapshot(&db_path, &snapshot_incomplete).expect("snap i");
+        fs::remove_file(&snapshot_incomplete).expect("remove incomplete snapshot");
+        let manifest_i = manifest_for(5, 0, 0, digest_i, bytes_i, &snapshot_incomplete);
+        write_manifest(&snapshot_incomplete, &manifest_i).expect("manifest i");
+
+        assert_eq!(list_backups(&backups).expect("list before").len(), 4);
+        // Keep the 2 newest: the oldest two verified pairs are removed.
+        let policy = BackupPolicy {
+            keep: 2,
+            max_age_secs: u64::MAX,
+            max_total_bytes: u64::MAX,
+        };
+        let removed = prune_backups(&backups, policy).expect("prune");
+        assert_eq!(removed.len(), 2, "oldest pairs pruned by count");
+        let remaining = list_backups(&backups).expect("list after");
+        assert_eq!(remaining.len(), 2);
+        // The manifest of a pruned pair is gone with its snapshot.
+        assert!(
+            !backups.join(&removed[0]).exists(),
+            "pruned snapshot file removed"
+        );
+        assert!(
+            !manifest_path_for(&backups.join(&removed[0])).exists(),
+            "pruned manifest removed"
+        );
+        // The incomplete pair is untouched (never offered, never pruned).
+        assert!(
+            manifest_incomplete.exists(),
+            "incomplete pair manifest untouched by retention"
+        );
+    }
+
+    #[test]
+    fn prune_enforces_age_and_size_bounds() {
+        let dir = temp_dir("prune-bounds");
+        let db_path = dir.join("state.db");
+        let state = State::open(&db_path, Retention::default()).expect("open");
+        drop(state);
+        let backups = dir.join("backups");
+        for epoch in 1..=3i64 {
+            let (snapshot, _) = new_backup_paths(&backups, epoch);
+            let (digest, bytes) = create_snapshot(&db_path, &snapshot).expect("snapshot");
+            let mut manifest = manifest_for(epoch, 0, 0, digest, bytes, &snapshot);
+            // Age the two older backups beyond any sane window by rewriting
+            // their created_at (a synthetic clock is not available; the
+            // manifest's own timestamp is the retention clock).
+            if epoch < 3 {
+                manifest.created_at = "2020-01-01T00:00:00Z".to_string();
+                write_manifest(&snapshot, &manifest).expect("manifest aged");
+            } else {
+                write_manifest(&snapshot, &manifest).expect("manifest fresh");
+            }
+        }
+        let policy = BackupPolicy {
+            keep: usize::MAX,
+            max_age_secs: 3600,
+            max_total_bytes: u64::MAX,
+        };
+        let removed = prune_backups(&backups, policy).expect("age prune");
+        assert_eq!(removed.len(), 2, "aged pairs removed by the age bound");
+        let remaining = list_backups(&backups).expect("list");
+        assert_eq!(remaining.len(), 1);
+        assert!(
+            remaining[0]
+                .created_at
+                .starts_with(&time::rfc3339_now()[..10]),
+            "the fresh backup survives"
+        );
+        // Size bound: a zero budget removes everything verified.
+        let policy = BackupPolicy {
+            keep: usize::MAX,
+            max_age_secs: u64::MAX,
+            max_total_bytes: 0,
+        };
+        let removed = prune_backups(&backups, policy).expect("size prune");
+        assert_eq!(removed.len(), 1, "size bound removes the last pair");
+        assert!(list_backups(&backups).expect("empty list").is_empty());
     }
 }

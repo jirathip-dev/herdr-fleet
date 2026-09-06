@@ -283,6 +283,39 @@ pub fn serve(paths: &DaemonPaths) -> Result<(), DaemonError> {
         );
     }
     let reconciled = reconcile_claims(&state, &log)?;
+    // Cold-boot schedule recovery (issue #9 AC2/AC9): every due schedule
+    // fires at most ONE fresh coalesced evaluation per boot (missed windows
+    // are skipped, never replayed), refused schedules park themselves, and
+    // paused schedules stay paused. Runs even when Herdr is absent or
+    // unhealthy: the evaluation path is daemon-state only and never spawns.
+    match crate::lifecycle::reconcile_schedules(&state, time::unix_now(), None) {
+        Ok(summary) => {
+            if !summary.ran.is_empty() || !summary.paused.is_empty() {
+                log.write(
+                    "info",
+                    "schedules.reconciled",
+                    &format!(
+                        "{} ran once; {} parked ({}); {} idle",
+                        summary.ran.len(),
+                        summary.paused.len(),
+                        summary
+                            .paused
+                            .iter()
+                            .map(|(_, reason)| reason.as_str())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        summary.idle.len()
+                    ),
+                );
+            }
+        }
+        Err(err) => {
+            return Err(daemon_error(
+                "daemon.reconcile",
+                format!("schedule recovery failed: {}: {}", err.code, err.message),
+            ));
+        }
+    }
 
     let (max_seq, _) = state
         .event_bounds()
@@ -507,6 +540,11 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "status" => method_status(shared, request),
         "state.epoch" => method_state_epoch(shared, request),
         "schedules.list" => method_schedules(shared, request),
+        "schedules.create" => method_schedule_create(shared, request),
+        "schedules.pause" => method_schedule_pause(shared, request),
+        "schedules.resume" => method_schedule_resume(shared, request),
+        "schedules.delete" => method_schedule_delete(shared, request),
+        "schedules.evaluate" => method_schedule_evaluate(shared, request),
         "grants.list" => method_grants_list(shared, request),
         "journal.tail" => method_journal_tail(shared, request),
         "grants.revoke" => method_grants_revoke(shared, request),
@@ -733,6 +771,8 @@ struct ApplyParams {
     production_branches: Vec<String>,
     worktrees_root: std::path::PathBuf,
     integration_repo: std::path::PathBuf,
+    /// Daemon-owned archive/salvage root (optional; issue #9 AC7).
+    archive_root: Option<std::path::PathBuf>,
     /// Production/hotfix/first-write flag bundle (typed, from the caller's
     /// interactive session — never from recurring automation).
     interactive: bool,
@@ -740,6 +780,26 @@ struct ApplyParams {
     scheduled: bool,
     production_confirmation: Option<String>,
     target_scope: Option<String>,
+    /// Fan-out admission bundle (issue #9 AC1): concurrency caps, the
+    /// attested same-harness lane count, and the fresh host-resource proof.
+    admission: Option<AdmissionParams>,
+}
+
+/// Typed `flags.admission` bundle for fan-out steps (harness_start/prompt).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdmissionParams {
+    /// Global concurrency cap declared for this fan-out (>= 0).
+    global_cap: Option<i64>,
+    /// Per-repository concurrency cap declared for this fan-out (>= 0).
+    repository_cap: Option<i64>,
+    /// Per-harness concurrency cap declared for this fan-out (>= 0).
+    harness_cap: Option<i64>,
+    /// Client-attested count of active lanes on the same harness key
+    /// (>= 0). Harness occupancy is not durable daemon state, so it is
+    /// attested like the apply `observed` params (same trust boundary).
+    harness_lanes: Option<i64>,
+    /// Unix seconds when the host-resource measurement was taken.
+    host_proof_at: Option<i64>,
 }
 
 fn apply_params(request: &Request) -> Result<ApplyParams, (String, String)> {
@@ -881,6 +941,17 @@ fn apply_params(request: &Request) -> Result<ApplyParams, (String, String)> {
     };
     let worktrees_root = absolute("worktrees_root")?;
     let integration_repo = absolute("integration_repo")?;
+    // archive_root is optional but must be absolute when present.
+    let archive_root = match topology.get("archive_root") {
+        None | Some(Val::Null) => None,
+        Some(Val::Str(_)) => Some(absolute("archive_root")?),
+        Some(_) => {
+            return Err((
+                "refusal.malformed".to_string(),
+                "topology.archive_root must be a string when present".to_string(),
+            ));
+        }
+    };
     let flags = match params.get("flags") {
         None | Some(Val::Null) => None,
         Some(Val::Obj(_)) => params.get("flags"),
@@ -897,6 +968,45 @@ fn apply_params(request: &Request) -> Result<ApplyParams, (String, String)> {
             .and_then(Val::as_bool)
             .unwrap_or(false)
     };
+    // Fan-out admission bundle (issue #9 AC1): flags.admission object with
+    // caps, an attested same-harness lane count, and host-resource proof.
+    // Optional for non-fan-out steps; REQUIRED for harness_start/prompt
+    // (the gate refuses fan-out without it).
+    let non_negative = |value: Option<&Val>| -> Option<i64> {
+        match value {
+            Some(Val::Int(seconds)) if *seconds >= 0 => Some(*seconds),
+            _ => None,
+        }
+    };
+    let admission = match flags.and_then(|f| f.get("admission")) {
+        None | Some(Val::Null) => None,
+        Some(Val::Obj(_)) => {
+            let admission = flags.and_then(|f| f.get("admission")).expect("checked");
+            let caps = admission
+                .get("caps")
+                .filter(|caps| matches!(caps, Val::Obj(_)));
+            let int_field =
+                |key: &str| -> Option<i64> { caps.and_then(|c| non_negative(c.get(key))) };
+            let host_proof_at = admission
+                .get("host_proof")
+                .and_then(|proof| proof.get("measured_at"))
+                .and_then(Val::as_str)
+                .and_then(crate::time::unix_from_rfc3339);
+            Some(AdmissionParams {
+                global_cap: int_field("global"),
+                repository_cap: int_field("repository"),
+                harness_cap: int_field("harness"),
+                harness_lanes: non_negative(admission.get("harness_lanes")),
+                host_proof_at,
+            })
+        }
+        Some(_) => {
+            return Err((
+                "refusal.malformed".to_string(),
+                "apply flags.admission must be an object".to_string(),
+            ));
+        }
+    };
     Ok(ApplyParams {
         plan,
         step,
@@ -910,6 +1020,7 @@ fn apply_params(request: &Request) -> Result<ApplyParams, (String, String)> {
         production_branches,
         worktrees_root,
         integration_repo,
+        archive_root,
         interactive: flag("interactive"),
         digest_confirmed: flag("digest_confirmed"),
         scheduled: flag("scheduled"),
@@ -921,12 +1032,128 @@ fn apply_params(request: &Request) -> Result<ApplyParams, (String, String)> {
             .and_then(|f| f.get("target_scope"))
             .and_then(Val::as_str)
             .map(str::to_string),
+        admission,
     })
 }
 
 /// `apply`: bind the plan digest, revalidate every binding freshly under
 /// the state lock, journal the intent, execute the typed effect, and
 /// resolve with a typed outcome + exact read-back (issue #8 AC1/AC2/AC4).
+/// Issue #9 AC1 fan-out admission gate (harness_start/prompt): refuse
+/// before any intent is journaled when
+/// - the caller omitted `flags.admission` or its host-resource proof
+///   (`refusal.admission.proof_missing`) or the proof is stale
+///   (`refusal.admission.proof_stale`) — unknown/stale measurements refuse;
+/// - any applicable cap is missing (`refusal.admission.cap_missing`);
+/// - any declared cap is exhausted (cap_global/cap_repository/cap_harness —
+///   global and per-repository counts come from durable instance rows, the
+///   per-harness count is client-attested like the apply `observed` params
+///   because harness occupancy is not durable daemon state);
+/// - the lane's declared scope overlaps a concurrent lane's scope in the
+///   same repository (`refusal.admission.monorepo_overlap`).
+fn admission_gate(
+    shared: &Arc<Shared>,
+    request: &Request,
+    plan: &crate::mutation::PlanBindings,
+    parsed: &ApplyParams,
+    params: Option<&Val>,
+) -> Result<(), String> {
+    let Some(admission) = &parsed.admission else {
+        return Err(err_response(
+            &request.id,
+            crate::lifecycle::code::PROOF_MISSING,
+            "fan-out requires flags.admission with caps and a fresh host-resource proof (unknown measurements refuse new work)",
+        ));
+    };
+    let caps = match (
+        admission.global_cap,
+        admission.repository_cap,
+        admission.harness_cap,
+    ) {
+        (Some(global), Some(repository), Some(harness)) => crate::lifecycle::ConcurrencyCaps {
+            global: usize::try_from(global).unwrap_or(usize::MAX),
+            per_repository: usize::try_from(repository).unwrap_or(usize::MAX),
+            per_harness: usize::try_from(harness).unwrap_or(usize::MAX),
+        },
+        _ => {
+            return Err(err_response(
+                &request.id,
+                crate::lifecycle::code::CAP_MISSING,
+                "fan-out requires flags.admission.caps {global, repository, harness}",
+            ));
+        }
+    };
+    // Per-harness axis: the attested active-lane count on this harness key.
+    let harness_lanes = admission.harness_lanes.unwrap_or(0);
+    if usize::try_from(harness_lanes).unwrap_or(usize::MAX) >= caps.per_harness {
+        return Err(err_response(
+            &request.id,
+            crate::lifecycle::code::CAP_HARNESS,
+            format!(
+                "the per-harness concurrency cap ({}) is reached ({} attested lanes on this harness); refuse fan-out",
+                caps.per_harness, harness_lanes
+            ),
+        ));
+    }
+    let harness_key = params
+        .and_then(|p| p.get("harness_key"))
+        .and_then(Val::as_str)
+        .unwrap_or("")
+        .to_string();
+    // State-derived lanes + the proposed footprint.
+    let state = match shared.lock_state() {
+        Ok(state) => state,
+        Err(message) => return Err(err_response(&request.id, "state.unavailable", message)),
+    };
+    let instance = match state.instance_by_id(&parsed.instance_id) {
+        Ok(Some(instance)) => instance,
+        Ok(None) => {
+            return Err(err_response(
+                &request.id,
+                "refusal.instance.state",
+                format!("no instance {} exists", parsed.instance_id),
+            ));
+        }
+        Err(err) => return Err(err_response(&request.id, err.code, err.message)),
+    };
+    let proposed = crate::lifecycle::LaneFootprint {
+        repository: plan.repository.clone(),
+        harness_key,
+        scope: instance.scope.clone(),
+    };
+    let mut running = Vec::new();
+    for row in state
+        .list_instances()
+        .map_err(|err| err_response(&request.id, err.code, err.message))?
+    {
+        if row.instance_id == parsed.instance_id {
+            continue;
+        }
+        if matches!(
+            row.status.as_str(),
+            "new" | "running" | "human_queue" | "blocked"
+        ) {
+            running.push(crate::lifecycle::LaneFootprint {
+                repository: row.repository.clone(),
+                harness_key: String::new(),
+                scope: row.scope.clone(),
+            });
+        }
+    }
+    drop(state);
+    let host_proof = admission
+        .host_proof_at
+        .map(|measured_at_unix| crate::lifecycle::HostProof { measured_at_unix });
+    crate::lifecycle::check_fanout_admission(
+        &proposed,
+        &running,
+        &caps,
+        host_proof,
+        time::unix_now(),
+    )
+    .map_err(|err| err_response(&request.id, err.code, err.message))
+}
+
 fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
     let parsed = match apply_params(request) {
         Ok(parsed) => parsed,
@@ -988,6 +1215,15 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
         );
     }
     let _ = &risk;
+    // Issue #9 AC1 fan-out admission: harness_start/prompt spawn lane work.
+    // Refuse before any intent is journaled when an applicable cap or a
+    // fresh host-resource proof is missing/stale, or when the lane's
+    // declared scope overlaps a concurrent lane in the same repository.
+    if matches!(kind.as_str(), "harness_start" | "prompt")
+        && let Err(response) = admission_gate(shared, request, &plan, &parsed, params)
+    {
+        return response;
+    }
     // Journal the durable intent (pre-action audit record + idempotency
     // claim; action mutate.<kind>, target repo:instance:step).
     let action = format!("mutate.{kind}");
@@ -1257,6 +1493,7 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
         production_branches: &parsed.production_branches,
         worktrees_root: &parsed.worktrees_root,
         integration_repo: &parsed.integration_repo,
+        archive_root: parsed.archive_root.as_deref(),
         observed_feature_head: parsed.feature_head.as_deref(),
         observed_integration_base: parsed.integration_base.as_deref(),
         env: &effect_env,
@@ -1726,6 +1963,314 @@ fn method_schedules(shared: &Arc<Shared>, request: &Request) -> String {
     }
 }
 
+/// `schedules.create`: upsert a validated hf-schedule/v1 document (issue
+/// #9). Create (or re-arm) resets the cadence: enabled, due immediately,
+/// one fresh evaluation — never a replay of missed windows. The durable
+/// intent is journaled before the row write like every daemon mutation.
+fn method_schedule_create(shared: &Arc<Shared>, request: &Request) -> String {
+    let doc = match request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("schedule"))
+    {
+        Some(Val::Obj(_)) => request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("schedule"))
+            .expect("checked")
+            .clone(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "schedules.create requires params.schedule (hf-schedule/v1 document)",
+            );
+        }
+    };
+    let verdict = crate::schema::validate_doc(crate::schema::Family::Schedule, &doc);
+    if !verdict.is_accepted() {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            format!("schedule document refused: {}", verdict.message()),
+        );
+    }
+    let schedule_id = doc
+        .get("schedule_id")
+        .and_then(Val::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let target = format!("schedule:{schedule_id}");
+    match journal_mutation(shared, request, "mutate.schedule.create", &target) {
+        Intent::Claimed { key } => {
+            let outcome = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                match state.upsert_schedule(&doc) {
+                    Ok(row) => Ok(object(vec![("schedule", crate::state::schedule_val(&row))])),
+                    Err(err) => Err((err.code, err.message)),
+                }
+            };
+            match outcome {
+                Ok(result) => {
+                    finish_mutation(shared, request, &key, "schedule.create", true, result, None)
+                }
+                Err((code, message)) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "schedule.create",
+                    false,
+                    null(),
+                    Some((code, message)),
+                ),
+            }
+        }
+        Intent::Replay { response } => replay(shared, &response),
+        Intent::Refused { code, message } => err_response(&request.id, code, message),
+    }
+}
+
+/// `schedules.pause` / `schedules.resume`: durable pause/resume of a
+/// schedule (issue #9 AC2/AC3). A paused schedule stays paused across
+/// daemon/service/host restarts; nothing in the evaluation path ever
+/// enables it (resume is an explicit human RPC that also resets the window
+/// to due-now for one fresh evaluation).
+fn method_schedule_pause(shared: &Arc<Shared>, request: &Request) -> String {
+    method_schedule_set_enabled(shared, request, false)
+}
+
+fn method_schedule_resume(shared: &Arc<Shared>, request: &Request) -> String {
+    method_schedule_set_enabled(shared, request, true)
+}
+
+fn method_schedule_set_enabled(shared: &Arc<Shared>, request: &Request, enabled: bool) -> String {
+    let schedule_id = match request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("schedule_id"))
+        .and_then(Val::as_str)
+    {
+        Some(text) if crate::formats::is_schedule_id(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "schedule_id must be an sd_ id",
+            );
+        }
+    };
+    let action = if enabled {
+        "mutate.schedule.resume"
+    } else {
+        "mutate.schedule.pause"
+    };
+    let target = format!("schedule:{schedule_id}");
+    match journal_mutation(shared, request, action, &target) {
+        Intent::Claimed { key } => {
+            let outcome = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                match state.set_schedule_enabled(&schedule_id, enabled, &time::rfc3339_now()) {
+                    Ok(row) => Ok(object(vec![("schedule", crate::state::schedule_val(&row))])),
+                    Err(err) => Err((err.code, err.message)),
+                }
+            };
+            match outcome {
+                Ok(result) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    if enabled {
+                        "schedule.resume"
+                    } else {
+                        "schedule.pause"
+                    },
+                    true,
+                    result,
+                    None,
+                ),
+                Err((code, message)) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    if enabled {
+                        "schedule.resume"
+                    } else {
+                        "schedule.pause"
+                    },
+                    false,
+                    null(),
+                    Some((code, message)),
+                ),
+            }
+        }
+        Intent::Replay { response } => replay(shared, &response),
+        Intent::Refused { code, message } => err_response(&request.id, code, message),
+    }
+}
+
+/// `schedules.delete`: delete a schedule row (daemon-mediated; the deletion
+/// intent is journaled first — deleting schedule state is itself a
+/// journaled destructive daemon-state operation).
+fn method_schedule_delete(shared: &Arc<Shared>, request: &Request) -> String {
+    let schedule_id = match request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("schedule_id"))
+        .and_then(Val::as_str)
+    {
+        Some(text) if crate::formats::is_schedule_id(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "schedule_id must be an sd_ id",
+            );
+        }
+    };
+    let target = format!("schedule:{schedule_id}");
+    match journal_mutation(shared, request, "mutate.schedule.delete", &target) {
+        Intent::Claimed { key } => {
+            let outcome = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                match state.delete_schedule(&schedule_id) {
+                    Ok(()) => Ok(object(vec![
+                        ("schedule_id", string(&schedule_id)),
+                        ("deleted", bool_(true)),
+                    ])),
+                    Err(err) => Err((err.code, err.message)),
+                }
+            };
+            match outcome {
+                Ok(result) => {
+                    finish_mutation(shared, request, &key, "schedule.delete", true, result, None)
+                }
+                Err((code, message)) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "schedule.delete",
+                    false,
+                    null(),
+                    Some((code, message)),
+                ),
+            }
+        }
+        Intent::Replay { response } => replay(shared, &response),
+        Intent::Refused { code, message } => err_response(&request.id, code, message),
+    }
+}
+
+/// `schedules.evaluate`: run one fresh evaluation tick (issue #9 AC2).
+/// Each due schedule fires at most ONCE and persists its next window
+/// atomically with its journal record; refused schedules park themselves;
+/// a second evaluate in the same tick is a no-op (single-flight). The
+/// optional `observed` params attest the live policy hash / issue revision
+/// (same client-attestation boundary as apply); a mismatch parks the
+/// schedule with `policy_changed`/`issue_changed`. Evaluations are not
+/// idempotency-claimed: a crash between window advance and journal leaves
+/// at most one extra fresh evaluation, never a backlog replay.
+fn method_schedule_evaluate(shared: &Arc<Shared>, request: &Request) -> String {
+    let params = request.params.as_ref();
+    let schedule_id = match params
+        .and_then(|params| params.get("schedule_id"))
+        .and_then(Val::as_str)
+    {
+        Some(text) if crate::formats::is_schedule_id(text) => Some(text.to_string()),
+        Some(_) => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "schedule_id must be an sd_ id when present",
+            );
+        }
+        None => None,
+    };
+    let attest = params
+        .and_then(|params| params.get("observed"))
+        .and_then(|observed| {
+            let policy_hash = observed.get("policy_hash").and_then(Val::as_str);
+            let issue_revision = observed.get("issue_revision").and_then(Val::as_str);
+            match (policy_hash, issue_revision) {
+                (Some(policy_hash), Some(issue_revision))
+                    if crate::formats::is_hex64(policy_hash)
+                        && crate::formats::is_hex40(issue_revision) =>
+                {
+                    Some(crate::lifecycle::ScheduleAttest {
+                        policy_hash,
+                        issue_revision,
+                    })
+                }
+                _ => None,
+            }
+        });
+    let state = match shared.lock_state() {
+        Ok(state) => state,
+        Err(message) => return err_response(&request.id, "state.unavailable", message),
+    };
+    let now_unix = time::unix_now();
+    let summary = match &schedule_id {
+        Some(id) => {
+            match crate::lifecycle::reconcile_schedule(&state, id, now_unix, attest.as_ref()) {
+                Ok(Some(summary)) => summary,
+                Ok(None) => {
+                    return err_response(
+                        &request.id,
+                        "refusal.schedule.not_found",
+                        format!("no schedule {id:?} exists"),
+                    );
+                }
+                Err(err) => return err_response(&request.id, err.code, err.message),
+            }
+        }
+        None => match crate::lifecycle::reconcile_schedules(&state, now_unix, attest.as_ref()) {
+            Ok(summary) => summary,
+            Err(err) => return err_response(&request.id, err.code, err.message),
+        },
+    };
+    drop(state);
+    ok_response(
+        &request.id,
+        object(vec![
+            ("evaluated", integer(summary.total() as i64)),
+            (
+                "ran",
+                Val::Arr(summary.ran.iter().map(|id| string(id)).collect()),
+            ),
+            (
+                "paused",
+                Val::Arr(
+                    summary
+                        .paused
+                        .iter()
+                        .map(|(id, reason)| {
+                            object(vec![
+                                ("schedule_id", string(id)),
+                                ("reason", string(reason)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            ("idle", integer(summary.idle.len() as i64)),
+        ]),
+    )
+}
+
 fn method_grants_list(shared: &Arc<Shared>, request: &Request) -> String {
     match shared.lock_state() {
         Ok(state) => match state.list_grants() {
@@ -1952,6 +2497,67 @@ fn method_grants_revoke(shared: &Arc<Shared>, request: &Request) -> String {
     }
 }
 
+/// Journaled bounded-retention prune of daemon-owned backups (issue #9
+/// AC8): the pruning intent (`mutate.backup.prune`) is journaled with its
+/// own derived idempotency key before any pair is removed, and the claim is
+/// resolved after the prune. Returns the removed snapshot names.
+fn prune_backups_with_journal(
+    shared: &Arc<Shared>,
+    request: &Request,
+) -> Result<Vec<String>, (&'static str, String)> {
+    let mut key = format!("ik_backup-prune-{}", request.id);
+    key.truncate(64);
+    {
+        let state = shared
+            .lock_state()
+            .map_err(|message| ("state.unavailable", message))?;
+        match state.journal_intent(
+            "mutate.backup.prune",
+            "backups:prune",
+            &key,
+            &request.id,
+            &request.method,
+            None,
+            None,
+            &request.line,
+        ) {
+            Ok((ClaimAttempt::Claimed, _)) => {}
+            Ok((ClaimAttempt::Replay { response: _ }, _)) => {
+                return Err((
+                    "refusal.idempotency",
+                    "the prune for this request was already recorded".to_string(),
+                ));
+            }
+            Ok((ClaimAttempt::Reused { owner_request_id }, _)) => {
+                return Err((
+                    "refusal.idempotency",
+                    format!("prune key {key:?} belongs to request {owner_request_id}"),
+                ));
+            }
+            Err(err) => return Err((err.code, err.message)),
+        }
+    }
+    let pruned = backup::prune_backups(&shared.paths.backups_dir, backup::BackupPolicy::default())
+        .map_err(|err| (err.code, err.message))?;
+    let outcome = daemon_outcome(&key, "succeeded", null());
+    {
+        let state = shared
+            .lock_state()
+            .map_err(|message| ("state.unavailable", message))?;
+        state
+            .resolve_claim(
+                &key,
+                &request.method,
+                "spent",
+                &canonical_text(&outcome),
+                None,
+            )
+            .map_err(|err| (err.code, err.message))?;
+    }
+    publish_after_state_change(shared, None);
+    Ok(pruned)
+}
+
 fn method_backup_create(shared: &Arc<Shared>, request: &Request) -> String {
     match journal_mutation(shared, request, "mutate.backup.create", "backups") {
         Intent::Claimed { key } => {
@@ -2025,6 +2631,26 @@ fn method_backup_create(shared: &Arc<Shared>, request: &Request) -> String {
                 );
             }
             crash_point("backup.after-manifest");
+            // Bounded retention (issue #9 AC8): prune verified backup pairs
+            // outside the default policy. The pruning intent is journaled
+            // with its own idempotency key before any pair is removed and
+            // resolved after — deleting retention records is itself a
+            // journaled daemon-state operation.
+            let pruned = match prune_backups_with_journal(shared, request) {
+                Ok(pruned) => pruned,
+                Err((code, message)) => {
+                    return finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "backup.create",
+                        false,
+                        null(),
+                        Some((code, message)),
+                    );
+                }
+            };
+            let pruned_names: Vec<Val> = pruned.iter().map(|name| string(name)).collect();
             let result = object(vec![(
                 "backup",
                 object(vec![
@@ -2035,6 +2661,7 @@ fn method_backup_create(shared: &Arc<Shared>, request: &Request) -> String {
                     ("db_sha256", string(&manifest.db_sha256)),
                     ("db_bytes", integer(manifest.db_bytes)),
                     ("created_at", string(&manifest.created_at)),
+                    ("pruned", Val::Arr(pruned_names)),
                 ]),
             )]);
             finish_mutation(shared, request, &key, "backup.create", true, result, None)

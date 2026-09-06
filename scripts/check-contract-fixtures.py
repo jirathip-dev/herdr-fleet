@@ -62,6 +62,7 @@ RX_HEX_ID = re.compile(r"^[a-f0-9]{8,64}$")          # daemon request id
 RX_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")  # owner/name
 RX_PLAN_ID = re.compile(r"^hf_plan_[0-9a-f]{16}$")
 RX_GRANT_ID = re.compile(r"^gr_[0-9a-f]{16}$")
+RX_SCHEDULE_ID = re.compile(r"^sd_[0-9a-f]{16}$")
 RX_EVIDENCE_ID = re.compile(r"^ev_[0-9a-f]{16}$")
 RX_IDEMPOTENCY_KEY = re.compile(r"^ik_[a-z0-9-]{8,64}$")
 RX_SLUG_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -88,8 +89,10 @@ WORKFLOW_NODE_KINDS = frozenset(
 )
 RPC_METHODS = frozenset(
     {"capabilities", "doctor", "status", "plan", "apply", "grants.list",
-     "grants.revoke", "schedules.list", "state.epoch", "backup.create",
-     "restore.begin", "journal.tail", "events.subscribe"}
+     "grants.revoke", "schedules.list", "schedules.create", "schedules.pause",
+     "schedules.resume", "schedules.delete", "schedules.evaluate",
+     "state.epoch", "backup.create", "restore.begin", "journal.tail",
+     "events.subscribe"}
 )
 EVENT_KINDS = frozenset(
     {"state.snapshot", "agent.updated", "plan.updated", "grant.updated",
@@ -449,6 +452,50 @@ def validate_grant(obj: dict) -> tuple[str, str]:
     return _ref(ACCEPT, "grant ok")
 
 
+def validate_schedule(obj: dict) -> tuple[str, str]:
+    """hf-schedule/v1 (issue #9 lifecycle): recurring NON-DESTRUCTIVE
+    cadence record. Every field mirrors the recurring-grant bindings
+    (repository/issue, workflow+policy hash, phase, scope, caps, expiry)
+    plus the cadence (anchor + every_secs). Schedules are closed to the
+    read phase and to the single 'read' capability: a schedule document
+    can never carry production/destructive effects."""
+    err = _json_obj(obj, "hf-schedule",
+                    {"schema", "schedule_id", "repository", "issue",
+                     "workflow_hash", "policy_hash", "phase", "scope",
+                     "caps", "expires_at", "anchor", "every_secs"},
+                    {"schema", "schedule_id", "repository", "issue",
+                     "workflow_hash", "policy_hash", "phase", "scope",
+                     "caps", "expires_at", "anchor", "every_secs"})
+    if err:
+        return err
+    if not isinstance(obj["schedule_id"], str) or not RX_SCHEDULE_ID.match(obj["schedule_id"]):
+        return _ref(REFUSE_MALFORMED, "schedule.schedule_id invalid")
+    if not isinstance(obj["repository"], str) or not RX_REPOSITORY.match(obj["repository"]):
+        return _ref(REFUSE_MALFORMED, "schedule.repository must be owner/name")
+    if _issue_shaped(obj["issue"]):
+        return _ref(REFUSE_MALFORMED, "schedule.issue binding invalid")
+    for key in ("workflow_hash", "policy_hash"):
+        if not isinstance(obj[key], str) or not RX_HEX64.match(obj[key]):
+            return _ref(REFUSE_MALFORMED, "schedule.{} must be 64-hex".format(key))
+    if obj["phase"] != "read":
+        return _ref(REFUSE_MALFORMED,
+                    "schedule.phase must be exactly 'read' (schedules are "
+                    "non-destructive and never schedulable with more)")
+    if not isinstance(obj["scope"], str) or not obj["scope"] or len(obj["scope"]) > 256:
+        return _ref(REFUSE_MALFORMED, "schedule.scope must be a non-empty string <= 256 chars")
+    caps = obj["caps"]
+    if not isinstance(caps, list) or not caps or not all(item == "read" for item in caps):
+        return _ref(REFUSE_MALFORMED,
+                    "schedule.caps must be exactly ['read'] (recurring grants "
+                    "carry no other capability)")
+    for key in ("expires_at", "anchor"):
+        if _expect_timestamp(obj, key, "schedule"):
+            return _ref(REFUSE_MALFORMED, "schedule.{} invalid".format(key))
+    if not isinstance(obj["every_secs"], int) or obj["every_secs"] <= 0:
+        return _ref(REFUSE_MALFORMED, "schedule.every_secs must be a positive integer")
+    return _ref(ACCEPT, "schedule ok")
+
+
 def validate_epoch(obj: dict) -> tuple[str, str]:
     err = _json_obj(obj, "hf-epoch", {"schema", "epoch", "created_at", "reason", "prior_epoch"},
                     {"schema", "epoch", "created_at", "reason", "prior_epoch"})
@@ -780,6 +827,7 @@ VALIDATORS = {
     "hf-epoch": validate_epoch,
     "hf-outcome": validate_outcome,
     "hf-workflow": validate_workflow,
+    "hf-schedule": validate_schedule,
     "hf-rpc-request": validate_rpc_request,
     "hf-rpc-response": validate_rpc_response,
     "hf-event": validate_event,

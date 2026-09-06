@@ -150,6 +150,9 @@ Commands: `config init|validate|show [--config PATH] [--json]`,
   specs) that machine and human outputs of this slice conform to.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — current scaffold vs planned
   modules, boundaries, dependency direction, target flow.
+- [docs/contracts/spec-lifecycle.md](docs/contracts/spec-lifecycle.md) — lifecycle
+  semantics: schedules, admission, cleanup archive, remote transport, cold-boot
+  recovery (issue #9).
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — prerequisites, canonical gate
   list, toolchain process, troubleshooting.
 - [docs/WORKFLOW.md](docs/WORKFLOW.md) — contributor + maintainer workflow.
@@ -184,11 +187,18 @@ child #8 (control-plane mutations: daemon-mediated plan `apply`, durable
 review evidence + recorded first-write approvals, granular step kinds,
 grant/instance invalidation on material edits and epoch rotation, and
 worktree-confined harness execution) is implemented on `staging` (its PR
-is opened by the orchestrator after independent exact-head review).
-Children #9–#10 are **unrouted** and will each require their own route
-grant. No live workflow execution or releases exist yet, and no harness
-session runs from public CI or fork PRs (real harness parity is a
-human-gated clean-host smoke, issue #7 AC6).
+is opened by the orchestrator after independent exact-head review);
+child #9 (lifecycle: durable recurring non-destructive schedules with
+single-flight/coalesced evaluation, cold-boot recovery, fan-out admission
+with host-resource proofs + monorepo-overlap refusal, cleanup
+archive/salvage with byte-verified manifests, a verified system-SSH
+remote transport contract, and retention-bounded backup pruning) is
+implemented on this staging line too (its PR is opened by the
+orchestrator after independent exact-head review). Child #10 is
+**unrouted** and will require its own route grant. No live workflow
+execution or releases exist yet, and no harness session runs from public
+CI or fork PRs (real harness parity is a human-gated clean-host smoke,
+issue #7 AC6).
 
 ## License
 

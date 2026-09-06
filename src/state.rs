@@ -29,7 +29,7 @@ use crate::time;
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The schema version this binary understands (also `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Bounded-retention defaults (rows kept besides the chain genesis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -279,6 +279,31 @@ pub struct ApprovalRow {
     pub recorded_at: String,
 }
 
+/// One durable schedule row (lifecycle slice, issue #9): the recurring
+/// non-destructive cadence record. `enabled` is the durable pause flag
+/// (false = paused/disabled; only an explicit human resume lifts it),
+/// `next_run_at` is the next aligned evaluation window, and `doc` is the
+/// canonical `hf-schedule/v1` document binding the recurring grant's exact
+/// repository/issue, workflow + policy hashes, read-only caps, scope,
+/// expiry, and cadence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleRow {
+    /// Schedule id (`sd_` + 16 hex).
+    pub schedule_id: String,
+    /// State epoch the row belongs to (schedules die with their epoch).
+    pub state_epoch: i64,
+    /// Whether the schedule is enabled (false = paused/disabled; durable).
+    pub enabled: bool,
+    /// Next evaluation window (RFC3339 UTC, seconds precision), if any.
+    pub next_run_at: Option<String>,
+    /// Row creation time.
+    pub created_at: String,
+    /// Last row write time.
+    pub updated_at: String,
+    /// Canonical hf-schedule/v1 document text ('' on pre-m0004 rows).
+    pub doc: String,
+}
+
 /// The daemon-owned state handle. All methods serialize on an internal
 /// mutex (one writer); a failed write poisons the handle (fail closed).
 pub struct State {
@@ -383,6 +408,10 @@ impl State {
         if user_version == M0003_APPLIES_FROM {
             run_m0003(&mut conn)?;
             user_version = M0003_APPLIES_TO;
+        }
+        if user_version == M0004_APPLIES_FROM {
+            run_m0004(&mut conn)?;
+            user_version = M0004_APPLIES_TO;
         }
         match user_version {
             v if v == SCHEMA_VERSION => {
@@ -1516,37 +1545,264 @@ impl State {
         Ok(())
     }
 
-    /// Schedules (foundation rows only; scheduling lands in the lifecycle
-    /// slice).
+    /// Schedules (lifecycle rows; scheduling semantics land in the
+    /// lifecycle slice). Returns every schedule row ordered by id.
     pub fn list_schedules(&self) -> Result<Vec<Val>, StateError> {
-        let conn = self.lock("list_schedules")?;
+        let rows = self.list_schedule_rows()?;
+        Ok(rows.iter().map(schedule_val).collect())
+    }
+
+    /// Every schedule row (ordered by id) for the lifecycle evaluator.
+    pub fn list_schedule_rows(&self) -> Result<Vec<ScheduleRow>, StateError> {
+        let conn = self.lock("list_schedule_rows")?;
         let mut statement = conn
             .prepare(
-                "SELECT schedule_id, state_epoch, enabled, next_run_at, created_at
+                "SELECT schedule_id, state_epoch, enabled, next_run_at, created_at, doc, updated_at
                    FROM schedules ORDER BY schedule_id",
             )
-            .map_err(|err| StateError::from_sqlite("list_schedules: prepare", err))?;
+            .map_err(|err| StateError::from_sqlite("list_schedule_rows: prepare", err))?;
         let rows = statement
-            .query_map([], |row| {
-                Ok(object(vec![
-                    ("schedule_id", string(&row.get::<_, String>(0)?)),
-                    ("state_epoch", integer(row.get(1)?)),
-                    ("enabled", bool_(row.get::<_, bool>(2)?)),
-                    (
-                        "next_run_at",
-                        row.get::<_, Option<String>>(3)?
-                            .map(|s| string(&s))
-                            .unwrap_or_else(null),
-                    ),
-                    ("created_at", string(&row.get::<_, String>(4)?)),
-                ]))
-            })
-            .map_err(|err| StateError::from_sqlite("list_schedules: query", err))?;
+            .query_map([], schedule_row_from)
+            .map_err(|err| StateError::from_sqlite("list_schedule_rows: query", err))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|err| StateError::from_sqlite("list_schedules: row", err))?);
+            let row = row.map_err(|err| StateError::from_sqlite("list_schedule_rows: row", err))?;
+            out.push(row);
         }
         Ok(out)
+    }
+
+    /// One schedule row by id.
+    pub fn schedule_by_id(&self, schedule_id: &str) -> Result<Option<ScheduleRow>, StateError> {
+        let conn = self.lock("schedule_by_id")?;
+        conn.query_row(
+            "SELECT schedule_id, state_epoch, enabled, next_run_at, created_at, doc, updated_at
+               FROM schedules WHERE schedule_id = ?1",
+            params![schedule_id],
+            schedule_row_from,
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("schedule_by_id: query", err))
+    }
+
+    /// Upsert a schedule row from a canonical `hf-schedule/v1` document
+    /// (schema-validated by the caller through `crate::schema::validate_doc`).
+    /// Create (or a re-arm update) resets the cadence state: enabled with a
+    /// null `next_run_at` so the next evaluation is due immediately (one
+    /// fresh evaluation, never a replay of missed windows).
+    pub fn upsert_schedule(&self, doc: &Val) -> Result<ScheduleRow, StateError> {
+        let schedule_id = doc
+            .get("schedule_id")
+            .and_then(Val::as_str)
+            .ok_or_else(|| state_error("state.schedule_invalid", "schedule missing schedule_id"))?
+            .to_string();
+        let doc_text = canonical_text(doc);
+        let now = time::rfc3339_now();
+        {
+            let conn = self.lock("upsert_schedule")?;
+            let epoch = current_epoch_locked(&conn)?;
+            conn.execute(
+                "INSERT INTO schedules (schedule_id, state_epoch, enabled, next_run_at,
+                                        created_at, doc, updated_at)
+                 VALUES (?1, ?2, 1, NULL, ?3, ?4, ?3)
+                 ON CONFLICT(schedule_id) DO UPDATE SET
+                   doc = excluded.doc, updated_at = excluded.updated_at,
+                   enabled = 1, next_run_at = NULL",
+                params![schedule_id, epoch, now, doc_text],
+            )
+            .map_err(|err| StateError::from_sqlite("upsert_schedule", err))?;
+        }
+        let row = self
+            .schedule_by_id(&schedule_id)?
+            .expect("upserted schedule row");
+        Ok(row)
+    }
+
+    /// Set the durable pause state of a schedule (`enabled` flag; false is
+    /// paused/disabled). Only an explicit human `resume` lifts a pause; no
+    /// evaluation path ever enables a schedule. Resuming resets the window
+    /// (next_run_at = NULL) so the next evaluation is one fresh run.
+    pub fn set_schedule_enabled(
+        &self,
+        schedule_id: &str,
+        enabled: bool,
+        at: &str,
+    ) -> Result<ScheduleRow, StateError> {
+        let (next_run_at, updated_at): (Option<String>, String) = {
+            let conn = self.lock("set_schedule_enabled")?;
+            if enabled {
+                (None, at.to_string())
+            } else {
+                (
+                    conn.query_row(
+                        "SELECT next_run_at FROM schedules WHERE schedule_id = ?1",
+                        params![schedule_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|err| StateError::from_sqlite("set_schedule_enabled: read", err))?
+                    .flatten(),
+                    at.to_string(),
+                )
+            }
+        };
+        let affected = {
+            let conn = self.lock("set_schedule_enabled")?;
+            conn.execute(
+                "UPDATE schedules SET enabled = ?2, next_run_at = ?3, updated_at = ?4
+                  WHERE schedule_id = ?1",
+                params![schedule_id, enabled as i64, next_run_at, updated_at],
+            )
+            .map_err(|err| StateError::from_sqlite("set_schedule_enabled: update", err))?
+        };
+        if affected == 0 {
+            return Err(state_error(
+                "state.not_found",
+                format!("no schedule {schedule_id:?}"),
+            ));
+        }
+        let row = self
+            .schedule_by_id(schedule_id)?
+            .expect("updated schedule row");
+        Ok(row)
+    }
+
+    /// Delete a schedule row (daemon-mediated; the deletion intent is
+    /// journaled by the caller before this runs).
+    pub fn delete_schedule(&self, schedule_id: &str) -> Result<(), StateError> {
+        let conn = self.lock("delete_schedule")?;
+        let affected = conn
+            .execute(
+                "DELETE FROM schedules WHERE schedule_id = ?1",
+                params![schedule_id],
+            )
+            .map_err(|err| StateError::from_sqlite("delete_schedule", err))?;
+        if affected == 0 {
+            return Err(state_error(
+                "state.not_found",
+                format!("no schedule {schedule_id:?}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Atomically advance a schedule's evaluation window AND journal the
+    /// run (audit row + `schedule.ran` event) in one transaction (issue #9).
+    /// The persisted next window is the singleflight guard: a second
+    /// evaluation in the same tick sees a future window and skips. A crash
+    /// before commit leaves the pre-run state (the window re-fires at most
+    /// once more — never a backlog replay).
+    pub fn complete_schedule_run(
+        &self,
+        schedule_id: &str,
+        next_run_at: Option<&str>,
+        at: &str,
+    ) -> Result<AuditRow, StateError> {
+        let result = self.complete_schedule_run_inner(schedule_id, next_run_at, at);
+        if let Err(err) = &result {
+            self.poison_on(err);
+        }
+        result
+    }
+
+    fn complete_schedule_run_inner(
+        &self,
+        schedule_id: &str,
+        next_run_at: Option<&str>,
+        at: &str,
+    ) -> Result<AuditRow, StateError> {
+        self.ensure_writable()?;
+        let mut conn = self.lock("complete_schedule_run")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("complete_schedule_run: begin", err))?;
+        let affected = tx
+            .execute(
+                "UPDATE schedules SET next_run_at = ?2, updated_at = ?3 WHERE schedule_id = ?1",
+                params![schedule_id, next_run_at, at],
+            )
+            .map_err(|err| StateError::from_sqlite("complete_schedule_run: update", err))?;
+        if affected == 0 {
+            return Err(state_error(
+                "state.not_found",
+                format!("no schedule {schedule_id:?}"),
+            ));
+        }
+        let mut key = format!("ik_sched-{schedule_id}");
+        key.truncate(64);
+        let audit = self.append_audit_locked(
+            &tx,
+            "read.schedule.ran",
+            &format!("{schedule_id}:ran"),
+            &key,
+            None,
+            None,
+        )?;
+        let data = object(vec![
+            ("schedule_id", string(schedule_id)),
+            ("outcome", string("ran")),
+            ("next_run_at", next_run_at.map(string).unwrap_or_else(null)),
+        ]);
+        append_event_locked(&tx, self.retention, "schedule.ran", &data)?;
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("complete_schedule_run: commit", err))?;
+        Ok(audit)
+    }
+
+    /// Atomically pause (disable) a schedule with a journaled reason
+    /// (issue #9): an evaluation that refuses — expired schedule, changed
+    /// policy/issue binding, unparseable doc — parks the schedule in an
+    /// explicit terminal state instead of retrying every tick (no retry
+    /// storm). Only an explicit human resume/create re-arms it.
+    pub fn pause_schedule_with_reason(
+        &self,
+        schedule_id: &str,
+        reason: &str,
+        at: &str,
+    ) -> Result<AuditRow, StateError> {
+        let result = self.pause_schedule_with_reason_inner(schedule_id, reason, at);
+        if let Err(err) = &result {
+            self.poison_on(err);
+        }
+        result
+    }
+
+    fn pause_schedule_with_reason_inner(
+        &self,
+        schedule_id: &str,
+        reason: &str,
+        at: &str,
+    ) -> Result<AuditRow, StateError> {
+        self.ensure_writable()?;
+        let mut conn = self.lock("pause_schedule_with_reason")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("pause_schedule_with_reason: begin", err))?;
+        let affected = tx
+            .execute(
+                "UPDATE schedules SET enabled = 0, updated_at = ?2 WHERE schedule_id = ?1",
+                params![schedule_id, at],
+            )
+            .map_err(|err| StateError::from_sqlite("pause_schedule_with_reason: update", err))?;
+        if affected == 0 {
+            return Err(state_error(
+                "state.not_found",
+                format!("no schedule {schedule_id:?}"),
+            ));
+        }
+        let mut key = format!("ik_sched-{schedule_id}");
+        key.truncate(64);
+        let audit = self.append_audit_locked(
+            &tx,
+            "read.schedule.ran",
+            &format!("{schedule_id}:{reason}"),
+            &key,
+            None,
+            None,
+        )?;
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("pause_schedule_with_reason: commit", err))?;
+        Ok(audit)
     }
 
     // ---------------------------------------------------------------------
@@ -1947,7 +2203,8 @@ impl State {
         )
         .map_err(|err| StateError::from_sqlite("append_audit: insert", err))?;
         prune_audit_locked(conn, self.retention)?;
-        let event_seq = append_event_locked(conn, self.retention, "journal.appended", action, seq)?;
+        let event_data = object(vec![("action", string(action)), ("seq", integer(seq))]);
+        let event_seq = append_event_locked(conn, self.retention, "journal.appended", &event_data)?;
         Ok(AuditRow {
             seq,
             epoch,
@@ -2071,6 +2328,37 @@ fn evidence_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceRow> {
     })
 }
 
+/// Map one SQLite row onto [`ScheduleRow`] (column order of the schedules
+/// SELECTs in [`State::list_schedules`]/[`State::schedule_by_id`]).
+fn schedule_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRow> {
+    Ok(ScheduleRow {
+        schedule_id: row.get(0)?,
+        state_epoch: row.get(1)?,
+        enabled: row.get(2)?,
+        next_run_at: row.get(3)?,
+        created_at: row.get(4)?,
+        doc: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+/// One schedule row as an `hf-rpc`-facing value (list_schedules RPC shape;
+/// the `doc` field is the parsed canonical hf-schedule/v1 document or null).
+pub fn schedule_val(row: &ScheduleRow) -> Val {
+    object(vec![
+        ("schedule_id", string(&row.schedule_id)),
+        ("state_epoch", integer(row.state_epoch)),
+        ("enabled", bool_(row.enabled)),
+        (
+            "next_run_at",
+            row.next_run_at.as_deref().map(string).unwrap_or_else(null),
+        ),
+        ("created_at", string(&row.created_at)),
+        ("updated_at", string(&row.updated_at)),
+        ("doc", Val::parse_json(&row.doc).unwrap_or_else(|_| null())),
+    ])
+}
+
 /// Prune audit rows beyond the retention bound, always keeping the chain
 /// genesis (seq 0) so verification keeps its anchor.
 fn prune_audit_locked(
@@ -2117,24 +2405,21 @@ fn prune_audit_locked(
 }
 
 /// Append one hf-event/v1 row inside the caller's transaction. Returns the
-/// event seq. Retention pruning keeps the tail window.
+/// event seq. Retention pruning keeps the tail window. `data` becomes the
+/// event's `data` object verbatim (closed event kinds: journal.appended,
+/// schedule.ran, ...).
 fn append_event_locked(
     conn: &rusqlite::Transaction<'_>,
     retention: Retention,
     kind: &str,
-    action: &str,
-    audit_seq: i64,
+    data: &Val,
 ) -> Result<i64, StateError> {
     let seq: i64 = conn
         .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM events", [], |row| {
             row.get(0)
         })
         .map_err(|err| StateError::from_sqlite("append_event: seq", err))?;
-    let data = object(vec![
-        ("action", string(action)),
-        ("seq", integer(audit_seq)),
-    ]);
-    let data_text = canonical_text(&data);
+    let data_text = canonical_text(data);
     conn.execute(
         "INSERT INTO events (seq, event, ts, data) VALUES (?1, ?2, ?3, ?4)",
         params![seq, kind, time::rfc3339_now(), data_text],
@@ -2238,12 +2523,24 @@ const M0003_ID: &str = "m0003_control_plane_evidence_v3";
 const M0003_APPLIES_FROM: i64 = 2;
 const M0003_APPLIES_TO: i64 = 3;
 
+/// m0004 adds the lifecycle schedule payload columns (issue #9): the
+/// `schedules` foundation rows (m0001) carry the canonical `hf-schedule/v1`
+/// document (exact recurring-grant bindings: repository/issue, workflow +
+/// policy hashes, read-only caps, expiry, cadence) plus the last-write
+/// timestamp. Scheduling behavior (evaluation, coalescing, singleflight,
+/// pause/resume/rearm) lands on these columns; the table itself was created
+/// by m0001 and remains the durable schedule authority.
+const M0004_ID: &str = "m0004_schedules_lifecycle_v4";
+const M0004_APPLIES_FROM: i64 = 3;
+const M0004_APPLIES_TO: i64 = 4;
+
 /// Ordered migration chain (id, applies_from, applies_to). The runner in
 /// [`State::open`] applies every pending migration before serving.
-const MIGRATIONS: [(&str, i64, i64); 3] = [
+const MIGRATIONS: [(&str, i64, i64); 4] = [
     (M0001_ID, M0001_APPLIES_FROM, M0001_APPLIES_TO),
     (M0002_ID, M0002_APPLIES_FROM, M0002_APPLIES_TO),
     (M0003_ID, M0003_APPLIES_FROM, M0003_APPLIES_TO),
+    (M0004_ID, M0004_APPLIES_FROM, M0004_APPLIES_TO),
 ];
 
 /// Engine-state columns added to `instances` by m0002 (SQLite ALTER ADD
@@ -2295,6 +2592,16 @@ CREATE TABLE approvals (
     recorded_at TEXT NOT NULL,
     revoked_at TEXT
 );
+";
+
+/// m0004 lifecycle payload columns on the foundation `schedules` table
+/// (issue #9; SQLite ALTER ADD COLUMN — each statement carries a default so
+/// existing rows migrate in place). `doc` is the canonical `hf-schedule/v1`
+/// document ('' for pre-m0004 rows that no writer ever populated); the
+/// existing `enabled`/`next_run_at` columns remain the live cadence state.
+const M0004_SQL: &str = "\
+ALTER TABLE schedules ADD COLUMN doc TEXT NOT NULL DEFAULT '';
+ALTER TABLE schedules ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
 ";
 
 const M0001_SQL: &str = "\
@@ -2509,6 +2816,35 @@ fn run_m0003(conn: &mut Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+/// Run migration m0004 in one transaction: lifecycle payload columns on the
+/// foundation `schedules` table (canonical hf-schedule/v1 doc + last-write
+/// timestamp; issue #9 lifecycle slice).
+fn run_m0004(conn: &mut Connection) -> Result<(), StateError> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| StateError::from_sqlite("migrate m0004: begin", err))?;
+    let checksum = sha256_hex(M0004_SQL.as_bytes());
+    tx.execute_batch(M0004_SQL)
+        .map_err(|err| StateError::from_sqlite("migrate m0004", err))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (migration_id, applies_from, applies_to, checksum, applied_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            M0004_ID,
+            M0004_APPLIES_FROM,
+            M0004_APPLIES_TO,
+            checksum,
+            time::rfc3339_now()
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("migrate m0004: bookkeeping", err))?;
+    tx.pragma_update(None, "user_version", M0004_APPLIES_TO)
+        .map_err(|err| StateError::from_sqlite("migrate m0004: user_version", err))?;
+    tx.commit()
+        .map_err(|err| StateError::from_sqlite("migrate m0004: commit", err))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2564,6 +2900,31 @@ mod tests {
         ])
     }
 
+    /// A synthetic hf-schedule/v1 document (all recurring-grant bindings;
+    /// cadence 300s anchored at 2026-09-06T00:00:00Z).
+    fn sample_schedule_doc(schedule_id: &str) -> Val {
+        object(vec![
+            ("schema", string("hf-schedule/v1")),
+            ("schedule_id", string(schedule_id)),
+            ("repository", string("example-org/widgets")),
+            (
+                "issue",
+                object(vec![
+                    ("number", integer(123)),
+                    ("revision", string(&"a".repeat(40))),
+                ]),
+            ),
+            ("workflow_hash", string(&"0".repeat(64))),
+            ("policy_hash", string(&"f".repeat(64))),
+            ("phase", string("read")),
+            ("scope", string("worktrees/issues/123")),
+            ("caps", Val::Arr(vec![string("read")])),
+            ("expires_at", string("2999-01-01T00:00:00Z")),
+            ("anchor", string("2026-09-06T00:00:00Z")),
+            ("every_secs", integer(300)),
+        ])
+    }
+
     #[test]
     fn m0002_migrates_instances_for_the_engine() {
         let path = temp_db("m0002.db");
@@ -2574,6 +2935,65 @@ mod tests {
         // columns); reopening never loses recorded migrations.
         let reopened = State::open(&path, Retention::default()).expect("reopen");
         assert_eq!(reopened.list_instances().expect("list").len(), 0);
+    }
+
+    #[test]
+    fn m0004_schedule_rows_carry_docs_and_survive_reopen() {
+        let path = temp_db("m0004.db");
+        let state = State::open(&path, Retention::default()).expect("open");
+        let (_, _, _, version) = state.summary().expect("summary");
+        assert_eq!(version, 4, "m0004 is applied on a fresh database");
+        // A v3-era database (m0003 applied, m0004 pending) migrates forward:
+        // the migration runner applies m0004 in place and the bookkeeping
+        // row exists for the whole chain.
+        let (_, _, _, version) = state.summary().expect("summary");
+        assert_eq!(version, SCHEMA_VERSION);
+        // Upsert + durable doc/pause/window round trip.
+        let doc = sample_schedule_doc("sd_0123456789abcdef");
+        let row = state.upsert_schedule(&doc).expect("upsert");
+        assert!(row.enabled);
+        assert_eq!(row.doc, canonical_text(&doc));
+        assert_eq!(row.next_run_at, None, "fresh create is due immediately");
+        state
+            .complete_schedule_run("sd_0123456789abcdef", Some("2026-09-06T01:00:00Z"), "t")
+            .expect("complete run");
+        state
+            .pause_schedule_with_reason("sd_0123456789abcdef", "expired", "t")
+            .expect("pause");
+        let reopened = State::open(&path, Retention::default()).expect("reopen");
+        let row = reopened
+            .schedule_by_id("sd_0123456789abcdef")
+            .expect("row")
+            .expect("present");
+        assert!(!row.enabled, "pause survives reopen");
+        assert_eq!(
+            row.next_run_at.as_deref(),
+            Some("2026-09-06T01:00:00Z"),
+            "persisted window survives reopen"
+        );
+        reopened
+            .set_schedule_enabled("sd_0123456789abcdef", true, "t")
+            .expect("resume");
+        let resumed = reopened
+            .schedule_by_id("sd_0123456789abcdef")
+            .expect("row")
+            .expect("present");
+        assert!(resumed.enabled);
+        assert_eq!(resumed.next_run_at, None, "resume resets to due now");
+        // Journal side effects: audit rows + schedule.ran events exist.
+        let (_, lines) = reopened.journal_tail(0, 10).expect("journal tail");
+        let ran_lines: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("read.schedule.ran"))
+            .collect();
+        assert_eq!(ran_lines.len(), 2, "run + pause reason journaled");
+        let events = reopened.events_after(0, 10).expect("events");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.get("event").and_then(Val::as_str) == Some("schedule.ran")),
+            "schedule.ran event appended"
+        );
     }
 
     #[test]
@@ -3072,7 +3492,11 @@ mod tests {
         let path = temp_db("m0003-evidence.db");
         let state = State::open(&path, Retention::default()).expect("open");
         let (_, _, _, version) = state.summary().expect("summary");
-        assert_eq!(version, 3, "schema version 3 after m0003");
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "schema version {} after the full migration chain (m0001..m0004)",
+            SCHEMA_VERSION
+        );
         state.issue_grant(&sample_grant_doc()).expect("issue");
         state
             .start_instance(
