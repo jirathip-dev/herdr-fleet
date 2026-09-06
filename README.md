@@ -174,10 +174,13 @@ Commands: `config init|validate|show [--config PATH] [--json]`,
 
 The umbrella issue
 [herdr-fleet#1](https://github.com/jirathip-dev/herdr-fleet/issues/1) tracks
-the approved target architecture and delivery graph. The #3 contract corpus
-(`docs/contracts/`) and the #4 read-only core (this repository's current
-state) are implemented; the remaining children are **unrouted** and will each
-require their own route grant.
+the approved target architecture and delivery graph. Roadmap slices #3
+(contract corpus + fixtures), #4 (read-only CLI core), #5 (daemon
+foundation: SQLite state, socket RPC, audit/journal, services), and #6
+(workflow engine + bundled Doctrine default) are implemented on `staging`;
+children #7–#10 are **unrouted** and will each require their own route
+grant. No adapters, live workflow execution, migrations, or releases exist
+yet.
 
 ## License
 

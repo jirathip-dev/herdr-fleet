@@ -1,7 +1,7 @@
 ---
 name: herdr-fleet
 description: "Use when working with or on the herdr-fleet repository or CLI. Read-only core: config, doctor, status, plan; no mutations."
-version: 1.1.0
+version: 1.2.0
 author: herdr-fleet contributors
 license: Apache-2.0 OR MIT
 platforms: [macos, linux]
@@ -13,11 +13,13 @@ metadata:
 # herdr-fleet
 
 herdr-fleet is a public companion CLI for operating Herdr coding-agent
-fleets. **The current slice (issue #4) is a read-only core**: it configures,
-diagnoses prerequisites, observes repositories, and renders deterministic
-read-only plans. It never starts/stops Herdr, never mutates repositories or
-fleet state, and never stores credentials. No daemon, workflow execution,
-mutation, migration, or release behavior exists yet.
+fleets. Roadmap slices #3–#6 are merged: a read-only CLI core (#4), a
+daemon foundation with SQLite state and a local socket RPC (#5), and the
+deterministic workflow engine with the bundled Doctrine default workflow
+(#6). The daemon never starts/stops Herdr, never mutates external
+repositories, and never stores credentials. No adapters, live workflow
+execution, migration, or release behavior exists yet (children #7–#10
+unrouted).
 
 ## When to use
 
@@ -59,6 +61,23 @@ Exit codes: 0 ok · 1 operational error · 2 usage · 3 partial · 4 refusal ·
 5 config error. In `--json` mode stdout carries exactly one `hf-output/v1`
 envelope; diagnostics go to stderr. Adapter reads (git/gh/herdr) run through
 a bounded env-isolated runner and one redaction pass at the boundary.
+
+## Bundled Doctrine default workflow (issue #6, link not duplicate)
+
+The Doctrine default workflow (fake/no-effect step kinds only) has one
+canonical source in this repository; this skill links to it and never
+duplicates it:
+
+- Canonical source (versioned + hash-pinned):
+  `schemas/fixtures/workflow/workflow.doctrine.json` (`workflow_id`
+  `fleet-doctrine-1`, `hf-workflow/v1`).
+- Normative spec and engine rules: `docs/contracts/spec-workflow.md`
+  ("Engine semantics" and "Bundled Doctrine default", issue #6).
+- Rust embedding + pinned digest: `src/engine.rs`
+  (`engine::doctrine_default`, `engine::DOCTRINE_DIGEST`).
+- The public skill uses this workflow's model-agnostic default roles
+  (orchestrator/implementer/reviewer); workflow content can never carry
+  policy, capabilities, target, or approval authority.
 
 ## Current limitation (read-only core)
 
