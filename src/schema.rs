@@ -23,7 +23,7 @@ use crate::canonical::canonical_bytes;
 use crate::formats::{
     is_action_code, is_actor, is_error_code, is_grant_id, is_hex40, is_hex64, is_idempotency_key,
     is_migration_id, is_plan_id, is_repository_identity, is_request_id, is_rfc3339_seconds_z,
-    is_slug,
+    is_schedule_id, is_slug,
 };
 use crate::value::Val;
 
@@ -62,6 +62,9 @@ pub enum Family {
     Outcome,
     /// `hf-workflow/v1` — closed typed workflow DAG (engine slice #6).
     Workflow,
+    /// `hf-schedule/v1` — recurring non-destructive schedule document
+    /// (lifecycle slice #9; bounded read-only cadence + exact bindings).
+    Schedule,
 }
 
 impl Family {
@@ -84,6 +87,7 @@ impl Family {
             Family::Grant => "hf-grant",
             Family::Outcome => "hf-outcome",
             Family::Workflow => "hf-workflow",
+            Family::Schedule => "hf-schedule",
         }
     }
 
@@ -106,6 +110,7 @@ impl Family {
             Family::Grant => "hf-grant/v1",
             Family::Outcome => "hf-outcome/v1",
             Family::Workflow => "hf-workflow/v1",
+            Family::Schedule => "hf-schedule/v1",
         }
     }
 
@@ -280,6 +285,7 @@ pub fn validate_doc(family: Family, doc: &Val) -> Verdict {
         Family::Grant => validate_grant(doc),
         Family::Outcome => validate_outcome(doc),
         Family::Workflow => validate_workflow(doc),
+        Family::Schedule => validate_schedule(doc),
     }
 }
 
@@ -1069,7 +1075,7 @@ fn validate_capability(obj: &Val) -> Verdict {
 }
 
 /// Registry of the families this module validates (used by drift tests).
-pub const SUPPORTED_FAMILIES: [Family; 16] = [
+pub const SUPPORTED_FAMILIES: [Family; 17] = [
     Family::Config,
     Family::Policy,
     Family::Output,
@@ -1086,6 +1092,7 @@ pub const SUPPORTED_FAMILIES: [Family; 16] = [
     Family::Grant,
     Family::Outcome,
     Family::Workflow,
+    Family::Schedule,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1093,7 +1100,10 @@ pub const SUPPORTED_FAMILIES: [Family; 16] = [
 // ---------------------------------------------------------------------------
 
 /// Closed RPC method set (spec-daemon.md; mirrored by the fixture probe).
-pub const RPC_METHODS: [&str; 13] = [
+/// The five `schedules.*` lifecycle methods beyond `schedules.list` are
+/// added by issue #9 (recurring non-destructive schedules: create/pause/
+/// resume/delete + one fresh coalesced evaluation per tick).
+pub const RPC_METHODS: [&str; 18] = [
     "capabilities",
     "doctor",
     "status",
@@ -1102,6 +1112,11 @@ pub const RPC_METHODS: [&str; 13] = [
     "grants.list",
     "grants.revoke",
     "schedules.list",
+    "schedules.create",
+    "schedules.pause",
+    "schedules.resume",
+    "schedules.delete",
+    "schedules.evaluate",
     "state.epoch",
     "backup.create",
     "restore.begin",
@@ -1145,6 +1160,17 @@ pub const GRANT_CAPS: [&str; 9] = [
     "cleanup",
     "release",
 ];
+
+/// Closed hf-schedule/v1 phase (issue #9): schedules may only carry the
+/// read phase — production/destructive work can never be scheduled
+/// (risk-model.md operational rule 4; refusal.policy.scheduled).
+pub const SCHEDULE_PHASE: &str = "read";
+
+/// Closed hf-schedule/v1 capability set (issue #9): bounded non-destructive
+/// recurring grants carry exactly the read capability (every read-class
+/// plan step — checkout, collect_outcome, hosted_check, post_merge_verify —
+/// requires it). A schedule document naming any other capability is refused.
+pub const SCHEDULE_CAPS: [&str; 1] = ["read"];
 
 fn validate_rpc_request(obj: &Val) -> Verdict {
     if let Err(verdict) = check_schema(obj, Family::RpcRequest) {
@@ -1573,6 +1599,115 @@ fn validate_grant(obj: &Val) -> Verdict {
     }
     if let Err(verdict) = expect_timestamp(obj, "created_at", "grant") {
         return verdict;
+    }
+    Verdict::accept()
+}
+
+/// Validate an `hf-schedule/v1` document (issue #9 lifecycle slice): the
+/// recurring non-destructive cadence record. Every field mirrors the
+/// recurring-grant bindings (repository/issue, workflow + policy hashes,
+/// exact scope, read-only caps, expiry) plus the cadence (`anchor`,
+/// `every_secs`). A schedule may only carry the read phase and read
+/// capability — production/destructive work can never be scheduled and a
+/// document naming any other capability/phase is refused (risk-model.md
+/// operational rule 4; non-downgrade rule).
+fn validate_schedule(obj: &Val) -> Verdict {
+    if let Err(verdict) = check_schema(obj, Family::Schedule) {
+        return verdict;
+    }
+    const KEYS: [&str; 12] = [
+        "schema",
+        "schedule_id",
+        "repository",
+        "issue",
+        "workflow_hash",
+        "policy_hash",
+        "phase",
+        "scope",
+        "caps",
+        "expires_at",
+        "anchor",
+        "every_secs",
+    ];
+    if let Err(verdict) = require_keys(obj, &KEYS, &KEYS, "schedule") {
+        return verdict;
+    }
+    match obj.get("schedule_id") {
+        Some(Val::Str(text)) if is_schedule_id(text) => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "schedule.schedule_id invalid");
+        }
+    }
+    match obj.get("repository") {
+        Some(Val::Str(text)) if is_repository_identity(text) => {}
+        _ => {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "schedule.repository must be owner/name",
+            );
+        }
+    }
+    if let Some(issue) = obj.get("issue")
+        && let Err(verdict) = issue_shaped(issue)
+    {
+        return verdict;
+    }
+    for key in ["workflow_hash", "policy_hash"] {
+        match obj.get(key) {
+            Some(Val::Str(text)) if is_hex64(text) => {}
+            _ => {
+                return Verdict::refuse(
+                    Refusal::Malformed,
+                    format!("schedule.{key} must be 64-hex"),
+                );
+            }
+        }
+    }
+    match obj.get("phase") {
+        Some(Val::Str(text)) if text == SCHEDULE_PHASE => {}
+        _ => {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "schedule.phase must be exactly 'read' (production/destructive work is never schedulable)",
+            );
+        }
+    }
+    match obj.get("scope") {
+        Some(Val::Str(text)) if !text.is_empty() && text.len() <= 256 => {}
+        _ => {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "schedule.scope must be a non-empty string <= 256 chars",
+            );
+        }
+    }
+    let caps = obj.get("caps");
+    let caps_ok = match caps {
+        Some(Val::Arr(items)) if !items.is_empty() => items
+            .iter()
+            .all(|item| matches!(item, Val::Str(text) if SCHEDULE_CAPS.contains(&text.as_str()))),
+        _ => false,
+    };
+    if !caps_ok {
+        return Verdict::refuse(
+            Refusal::Malformed,
+            "schedule.caps must be a non-empty subset of the closed read-only set ([\"read\"])",
+        );
+    }
+    if let Err(verdict) = expect_timestamp(obj, "expires_at", "schedule") {
+        return verdict;
+    }
+    if let Err(verdict) = expect_timestamp(obj, "anchor", "schedule") {
+        return verdict;
+    }
+    match obj.get("every_secs") {
+        Some(Val::Int(seconds)) if *seconds > 0 => {}
+        _ => {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "schedule.every_secs must be a positive integer",
+            );
+        }
     }
     Verdict::accept()
 }

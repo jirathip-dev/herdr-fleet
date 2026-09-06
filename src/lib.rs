@@ -17,6 +17,7 @@ pub mod daemon;
 pub mod dirs;
 pub mod engine;
 pub mod formats;
+pub mod lifecycle;
 pub mod lock;
 pub mod mutation;
 pub mod observe;

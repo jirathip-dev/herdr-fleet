@@ -135,6 +135,14 @@ pub fn is_grant_id(text: &str) -> bool {
         && is_lower_hex(&text[PREFIX.len()..], 16)
 }
 
+/// Schedule id: `sd_` + 16 lowercase hex (lifecycle slice, issue #9).
+pub fn is_schedule_id(text: &str) -> bool {
+    const PREFIX: &str = "sd_";
+    text.len() == PREFIX.len() + 16
+        && text.starts_with(PREFIX)
+        && is_lower_hex(&text[PREFIX.len()..], 16)
+}
+
 /// Migration id: `mNNNN_<snake>` (`^m[0-9]{4}_[a-z0-9_]+$`).
 pub fn is_migration_id(text: &str) -> bool {
     let body = text.strip_prefix('m').unwrap_or_default();
