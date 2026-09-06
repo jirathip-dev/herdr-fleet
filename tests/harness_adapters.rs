@@ -37,8 +37,15 @@ struct FakeBins {
 impl FakeBins {
     fn new() -> FakeBins {
         let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("hf-adapters-contract-{}-{}", std::process::id(), n));
+        // Prefer the per-test-binary tmp dir cargo provides (target/tmp, on
+        // the build filesystem) over the shared OS temp dir: fake
+        // executables must be spawned while other tests write theirs, and a
+        // quota-tracked shared temp filesystem can transiently refuse
+        // script execs (observed ETXTBSY on this host).
+        let base = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = base.join(format!("hf-adapters-contract-{}-{}", std::process::id(), n));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("create fake bin dir");
         FakeBins { path }
@@ -49,6 +56,11 @@ impl FakeBins {
     fn bin(&self, name: &str, body: &str) -> PathBuf {
         let path = self.path.join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake executable");
+        // btrfs copy-on-write can transiently refuse exec of a just-written
+        // file ("Text file busy") when writeback races the first spawn;
+        // fsync before returning keeps the execs deterministic.
+        let file = fs::File::open(&path).expect("open fake executable");
+        file.sync_all().expect("fsync fake executable");
         set_executable(&path);
         path
     }
@@ -75,6 +87,80 @@ fn set_executable(path: &std::path::Path) {
     let mut permissions = fs::metadata(path).expect("metadata").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).expect("chmod");
+}
+
+/// Whether a failure is a transient spawn/exec error of the host filesystem
+/// (observed on this host: exec of a just-written script transiently fails
+/// with `Text file busy` under concurrent test spawns on a degraded btrfs
+/// mount; `Resource temporarily unavailable` is fork contention). The
+/// adapter classification is correct either way (`refusal.unavailable`); the
+/// tests assert the *classification*, so they retry transient spawn errors
+/// a bounded number of times instead of flaking on the environment.
+fn is_transient_spawn_failure(result: &herdr_fleet::adapters::OpResult) -> bool {
+    if result.code != Some(CODE_UNAVAILABLE) {
+        return false;
+    }
+    let text = format!(
+        "{:?} {:?}",
+        result.detail.as_deref().unwrap_or(""),
+        result.message.as_deref().unwrap_or("")
+    );
+    text.contains("Text file busy") || text.contains("Resource temporarily unavailable")
+}
+
+/// `execute_op` with a bounded retry on transient spawn failures.
+fn run_op_retry(
+    profile: &Profile,
+    request: &OpRequest<'_>,
+    env: &BTreeMap<String, String>,
+) -> herdr_fleet::adapters::OpResult {
+    let mut result = execute_op(profile, request, env);
+    let mut attempts = 0;
+    while is_transient_spawn_failure(&result) && attempts < 4 {
+        std::thread::sleep(Duration::from_millis(25));
+        result = execute_op(profile, request, env);
+        attempts += 1;
+    }
+    result
+}
+
+/// `execute_named` with a bounded retry on transient spawn failures.
+fn run_named_retry(
+    profile: &Profile,
+    op_name: &str,
+    session: &herdr_fleet::adapters::SessionHandle,
+    payload: Option<&str>,
+    timeout: Duration,
+    env: &BTreeMap<String, String>,
+) -> herdr_fleet::adapters::OpResult {
+    let mut result = execute_named(profile, op_name, session, payload, timeout, env);
+    let mut attempts = 0;
+    while is_transient_spawn_failure(&result) && attempts < 4 {
+        std::thread::sleep(Duration::from_millis(25));
+        result = execute_named(profile, op_name, session, payload, timeout, env);
+        attempts += 1;
+    }
+    result
+}
+
+/// `probe_profile` with a bounded retry on transient spawn failures.
+fn probe_retry(
+    profile: &Profile,
+    env: &BTreeMap<String, String>,
+) -> herdr_fleet::adapters::ProbeResult {
+    let mut probe = probe_profile(profile, env);
+    let mut attempts = 0;
+    while probe.code == Some(CODE_UNAVAILABLE)
+        && probe.detail.as_deref().is_some_and(|d| {
+            d.contains("Text file busy") || d.contains("Resource temporarily unavailable")
+        })
+        && attempts < 4
+    {
+        std::thread::sleep(Duration::from_millis(25));
+        probe = probe_profile(profile, env);
+        attempts += 1;
+    }
+    probe
 }
 
 /// The official kinds under test.
@@ -205,16 +291,28 @@ fn official_exact_version_probes_accept_declared_current_and_refuse_below_minimu
         let profile = Profile::official(kind, kind.name()).expect("profile");
         let env = bins.env();
 
-        let probe = probe_profile(&profile, &env);
-        assert!(probe.present, "{}", kind.name());
-        assert_eq!(probe.version.as_deref(), Some(current));
-        assert_eq!(probe.compatible, Some(true));
+        let probe = probe_retry(&profile, &env);
+        assert!(probe.present, "{} detail: {:?}", kind.name(), probe.detail);
+        assert_eq!(
+            probe.version.as_deref(),
+            Some(current),
+            "{} detail: {:?}",
+            kind.name(),
+            probe.detail
+        );
+        assert_eq!(
+            probe.compatible,
+            Some(true),
+            "{} detail: {:?}",
+            kind.name(),
+            probe.detail
+        );
 
         // Below the declared minimum: typed refusal signal in the probe.
         let bins_low = FakeBins::new();
         bins_low.bin(executable_name(kind), &harness_body(kind, "echo", "0.0.1"));
         let env_low = bins_low.env();
-        let probe = probe_profile(&profile, &env_low);
+        let probe = probe_retry(&profile, &env_low);
         assert!(probe.present);
         assert_eq!(probe.compatible, Some(false));
     }
@@ -226,7 +324,7 @@ fn probe_of_a_missing_executable_is_a_typed_unavailable_result() {
         let bins = FakeBins::new();
         let profile = Profile::official(kind, kind.name()).expect("profile");
         let env = bins.env();
-        let probe = probe_profile(&profile, &env);
+        let probe = probe_retry(&profile, &env);
         assert!(!probe.present);
         assert_eq!(probe.code, Some(CODE_UNAVAILABLE));
     }
@@ -247,7 +345,7 @@ fn success_prompt_delivers_the_payload_as_data_and_returns_the_transcript() {
         bins.bin("herdr", &workspace_body(matching_show_json()));
         let profile = Profile::official(kind, kind.name()).expect("profile");
         let payload = "implement the typed adapter contract for issue 7";
-        let result = execute_op(
+        let result = run_op_retry(
             &profile,
             &prompt_request(payload, ADAPTER_TIMEOUT),
             &bins.env(),
@@ -278,13 +376,13 @@ fn missing_executable_is_a_typed_unavailable_refusal_and_independent_ops_survive
         let profile = Profile::official(kind, kind.name()).expect("profile");
         let env = bins.env();
 
-        let result = execute_op(&profile, &prompt_request("hello", ADAPTER_TIMEOUT), &env);
+        let result = run_op_retry(&profile, &prompt_request("hello", ADAPTER_TIMEOUT), &env);
         assert_eq!(result.status, "refused", "{}", kind.name());
         assert_eq!(result.code, Some(CODE_UNAVAILABLE));
 
         // Independent read-only workspace ops still succeed: the harness
         // absence never breaks other adapter operations.
-        let observe = execute_op(&profile, &workspace_request(Op::Observe), &env);
+        let observe = run_op_retry(&profile, &workspace_request(Op::Observe), &env);
         assert_eq!(observe.status, "succeeded");
         assert_eq!(
             observe
@@ -306,7 +404,7 @@ fn auth_failure_is_a_typed_credentials_refusal() {
             &harness_body(kind, "auth", declared_current(kind)),
         );
         let profile = Profile::official(kind, kind.name()).expect("profile");
-        let result = execute_op(
+        let result = run_op_retry(
             &profile,
             &prompt_request("do the thing", ADAPTER_TIMEOUT),
             &bins.env(),
@@ -326,7 +424,7 @@ fn unsupported_capability_is_a_typed_refusal_at_the_named_boundary() {
             &harness_body(kind, "echo", declared_current(kind)),
         );
         let profile = Profile::official(kind, kind.name()).expect("profile");
-        let result = execute_named(
+        let result = run_named_retry(
             &profile,
             "teleport",
             session_ref(),
@@ -349,7 +447,7 @@ fn hanging_prompt_is_deadline_cancelled_and_ambiguous() {
         );
         let profile = Profile::official(kind, kind.name()).expect("profile");
         let started = std::time::Instant::now();
-        let result = execute_op(
+        let result = run_op_retry(
             &profile,
             &prompt_request("please hang forever", Duration::from_millis(200)),
             &bins.env(),
@@ -377,7 +475,7 @@ fn interrupt_operation_is_accepted_and_terminal_state_is_observable() {
         let profile = Profile::official(kind, kind.name()).expect("profile");
         let env = bins.env();
 
-        let interrupt = execute_op(&profile, &workspace_request(Op::Interrupt), &env);
+        let interrupt = run_op_retry(&profile, &workspace_request(Op::Interrupt), &env);
         assert_eq!(interrupt.status, "succeeded", "{}", kind.name());
         assert_eq!(
             interrupt
@@ -387,7 +485,7 @@ fn interrupt_operation_is_accepted_and_terminal_state_is_observable() {
             Some(&Val::Bool(true))
         );
         // The session observed after cancellation reports the exited state.
-        let observe = execute_op(&profile, &workspace_request(Op::Observe), &env);
+        let observe = run_op_retry(&profile, &workspace_request(Op::Observe), &env);
         assert_eq!(observe.status, "succeeded");
     }
 }
@@ -405,12 +503,13 @@ fn malformed_workspace_output_is_a_typed_malformed_refusal() {
             r#"echo 'this is definitely not json {{{' ; exit 0"#,
         );
         let profile = Profile::official(kind, kind.name()).expect("profile");
-        let result = execute_op(&profile, &workspace_request(Op::Observe), &bins.env());
+        let result = run_op_retry(&profile, &workspace_request(Op::Observe), &bins.env());
         assert_eq!(
             result.code,
             Some(CODE_MALFORMED),
-            "detail: {:?}",
-            result.detail
+            "detail: {:?} message: {:?}",
+            result.detail,
+            result.message
         );
     }
 }
@@ -424,7 +523,7 @@ fn process_death_is_a_typed_ambiguous_outcome() {
             &harness_body(kind, "die", declared_current(kind)),
         );
         let profile = Profile::official(kind, kind.name()).expect("profile");
-        let result = execute_op(
+        let result = run_op_retry(
             &profile,
             &prompt_request("do not survive this", ADAPTER_TIMEOUT),
             &bins.env(),
@@ -443,13 +542,28 @@ fn plain_nonzero_exit_is_a_typed_failed_outcome() {
             &harness_body(kind, "exit-3", declared_current(kind)),
         );
         let profile = Profile::official(kind, kind.name()).expect("profile");
-        let result = execute_op(
+        let result = run_op_retry(
             &profile,
             &prompt_request("make it fail", ADAPTER_TIMEOUT),
             &bins.env(),
         );
-        assert_eq!(result.status, "failed", "{}", kind.name());
-        assert_eq!(result.code, Some(CODE_EXIT));
+        assert_eq!(
+            result.status,
+            "failed",
+            "{} code={:?} message={:?} detail={:?}",
+            kind.name(),
+            result.code,
+            result.message,
+            result.detail
+        );
+        assert_eq!(
+            result.code,
+            Some(CODE_EXIT),
+            "{} message={:?} detail={:?}",
+            kind.name(),
+            result.message,
+            result.detail
+        );
     }
 }
 
@@ -470,7 +584,7 @@ fn identity_read_back_matches_the_bound_triple_and_stale_read_backs_are_refused(
         let env = bins.env();
 
         // Fresh identity read-back: all three parts match.
-        let identity = execute_op(&profile, &workspace_request(Op::Identity), &env);
+        let identity = run_op_retry(&profile, &workspace_request(Op::Identity), &env);
         assert_eq!(identity.status, "succeeded", "{}", kind.name());
         let payload = identity.payload.expect("identity payload");
         assert_eq!(
@@ -490,7 +604,7 @@ fn identity_read_back_matches_the_bound_triple_and_stale_read_backs_are_refused(
             "herdr",
             &workspace_body(r#"{"session_id":"ws-7","generation":4,"terminal_session":"tty-7","state":"running"}"#),
         );
-        let result = execute_op(
+        let result = run_op_retry(
             &profile,
             &workspace_request(Op::Identity),
             &bins_stale.env(),
@@ -509,7 +623,7 @@ fn identity_read_back_matches_the_bound_triple_and_stale_read_backs_are_refused(
             "herdr",
             &workspace_body(r#"{"session_id":"ws-7","generation":3,"terminal_session":"tty-OTHER","state":"running"}"#),
         );
-        let result = execute_op(&profile, &workspace_request(Op::Identity), &bins_swap.env());
+        let result = run_op_retry(&profile, &workspace_request(Op::Identity), &bins_swap.env());
         assert_eq!(result.code, Some(CODE_STALE_IDENTITY));
     }
 }
@@ -636,7 +750,7 @@ fn run_scenario(
         } else {
             ADAPTER_TIMEOUT
         };
-        let result = execute_named(profile, op_name, handle, payload.as_deref(), timeout, env);
+        let result = run_named_retry(profile, op_name, handle, payload.as_deref(), timeout, env);
         let step_id = format!("p{step_index}");
         let doc = result.to_outcome_doc(
             "hf_plan_0123456789abcdef",
@@ -674,7 +788,7 @@ exit 9
     );
     let profile = Profile::official(HarnessKind::ClaudeCode, "claude-code").expect("profile");
     let hostile = "a; rm -rf /tmp/x; $(touch /tmp/pwned); `echo injected`; \"quoted\"; && || | > < & newline\nhere; s/ed/";
-    let result = execute_op(
+    let result = run_op_retry(
         &profile,
         &prompt_request(hostile, ADAPTER_TIMEOUT),
         &bins.env(),
@@ -746,8 +860,8 @@ fn unknown_harness_kind_fails_typed_and_independent_probes_keep_working() {
         env_allow: vec!["PATH".to_string()],
     };
     let profile = Profile::from_config(&known).expect("known kind parses");
-    let probe = probe_profile(&profile, &bins.env());
+    let probe = probe_retry(&profile, &bins.env());
     assert!(probe.present);
-    let observe = execute_op(&profile, &workspace_request(Op::Observe), &bins.env());
+    let observe = run_op_retry(&profile, &workspace_request(Op::Observe), &bins.env());
     assert_eq!(observe.status, "succeeded");
 }
