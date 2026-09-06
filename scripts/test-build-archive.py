@@ -157,15 +157,17 @@ def checks():
         sbom_names = {p["name"]: p.get("versionInfo")
                       for p in sbom_data["packages"]}
         assert "herdr-fleet" in sbom_names and sbom_names["herdr-fleet"] == "0.1.0"
-        # Every dependency in Cargo.lock appears once with its version (the
-        # root package covers Cargo.lock's own root entry when present).
+        # Every dependency in Cargo.lock appears once with its version; the
+        # SBOM's root package entry corresponds to Cargo.lock's own
+        # herdr-fleet entry (same name/version), so counts are equal.
         for name, version in packages.items():
             assert sbom_names.get(name) == version, (
                 f"SBOM must mirror Cargo.lock for {name}@{version}")
-        assert len(sbom_names) == len(packages) + 1, (
-            "SBOM package count must equal Cargo.lock packages + root")
+        assert len(sbom_names) == len(packages), (
+            "SBOM package count must equal Cargo.lock packages "
+            "(root entry covers Cargo.lock's own herdr-fleet row)")
         print(f"PASS: SBOM mirrors Cargo.lock offline ({len(packages)} "
-              "dependencies + root package)")
+              "packages incl. root)")
 
         # --- deterministic metadata + archive framing ---------------------------
         second_out = os.path.join(tmp, "out2")
