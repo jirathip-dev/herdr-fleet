@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""test-build-archive.py — self-tests for scripts/build-archive.py.
+
+Proves the issue #10 release-archive chain end-to-end on the current host:
+builder failure modes BITE (wrong source ref, dirty tree, version mismatch,
+unknown platform) and a real archive maps back to source + binary-reported
+schema facts + checksums + SBOM digest, deterministically (two builds with
+the same inputs produce byte-identical metadata and archive).
+
+Stdlib only. Run from the repository root:
+    python3 scripts/test-build-archive.py
+Requirements: git, a release binary (builds one with
+`cargo build --release --locked` if absent), and a clean tracked worktree at
+a fixed HEAD. Never touches the network.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BUILDER = os.path.join(REPO, "scripts", "build-archive.py")
+
+
+def run(argv, cwd=None, check=True):
+    proc = subprocess.run(argv, cwd=cwd, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, check=False)
+    if check and proc.returncode != 0:
+        raise AssertionError(
+            f"command failed (exit {proc.returncode}): {' '.join(argv)}\n"
+            + proc.stdout.decode("utf-8", "replace") + "\n"
+            + proc.stderr.decode("utf-8", "replace"))
+    return proc
+
+
+def ensure_release_binary():
+    binary = os.path.join(REPO, "target", "release", "herdr-fleet")
+    if not os.path.isfile(binary):
+        proc = run(["cargo", "build", "--release", "--locked"], cwd=REPO)
+        if proc.returncode != 0:
+            raise AssertionError("could not build the release binary")
+    return binary
+
+
+def clean_worktree_check():
+    proc = run(["git", "status", "--porcelain"], cwd=REPO)
+    dirty = [line for line in proc.stdout.decode().splitlines()
+             if not line.startswith("??")]
+    if dirty:
+        raise AssertionError(
+            "test-build-archive.py requires a clean tracked worktree "
+            f"(the builder enforces this); dirty lines:\n{chr(10).join(dirty)}")
+
+
+def head_of(repo):
+    return run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.decode().strip()
+
+
+def checks():
+    binary = ensure_release_binary()
+    clean_worktree_check()
+    source_ref = head_of(REPO)
+
+    with tempfile.TemporaryDirectory(prefix="hf-test-archive-") as tmp:
+        out_dir = os.path.join(tmp, "out")
+        os.makedirs(out_dir)
+
+        # --- failure modes bite -------------------------------------------------
+        wrong_ref = "0" * 40
+        proc = run([sys.executable, BUILDER, "build", "--repo", REPO,
+                    "--source-ref", wrong_ref, "--version", "0.1.0",
+                    "--binary", binary, "--platform", "linux-x86_64",
+                    "--out-dir", out_dir], check=False)
+        assert proc.returncode != 0, "wrong source ref must fail"
+        assert b"HEAD" in proc.stderr, "wrong-ref failure must name the mismatch"
+
+        proc = run([sys.executable, BUILDER, "build", "--repo", REPO,
+                    "--source-ref", source_ref, "--version", "9.9.9",
+                    "--binary", binary, "--platform", "linux-x86_64",
+                    "--out-dir", out_dir], check=False)
+        assert proc.returncode != 0, "version mismatch with the binary must fail"
+        assert b"binary reports version" in proc.stderr
+
+        proc = run([sys.executable, BUILDER, "build", "--repo", REPO,
+                    "--source-ref", source_ref, "--version", "0.1.0",
+                    "--binary", binary, "--platform", "windows-x86_64",
+                    "--out-dir", out_dir], check=False)
+        assert proc.returncode != 0, "unknown platform must fail"
+        print(f"PASS: builder failure modes bite ({len(os.listdir(out_dir))} "
+              "artifacts produced before failure)")
+
+        # --- real end-to-end build + verify -------------------------------------
+        build_args = [sys.executable, BUILDER, "build", "--repo", REPO,
+                      "--source-ref", source_ref, "--version", "0.1.0",
+                      "--binary", binary, "--platform", "linux-x86_64",
+                      "--out-dir", out_dir]
+        first = run(build_args)
+        assert first.returncode == 0, first.stderr.decode()
+        archive = os.path.join(out_dir, "herdr-fleet-0.1.0-linux-x86_64.tar.gz")
+        assert os.path.isfile(archive)
+        assert os.path.isfile(archive + ".sha256")
+
+        verify = run([sys.executable, BUILDER, "verify", "--archive", archive])
+        assert verify.returncode == 0, verify.stderr.decode()
+        out_text = verify.stdout.decode()
+        assert out_text.count("OK:") == 6, out_text
+        assert "6 checks passed" in out_text, out_text
+        print("PASS: archive verifies against its provenance record "
+              "(6 checks)")
+
+        # --- provenance maps to source + schema facts ---------------------------
+        import tarfile
+        import hashlib
+        with tarfile.open(archive, "r:gz") as tar:
+            provenance_data = None
+            for member in tar.getmembers():
+                if member.name.endswith("provenance.json"):
+                    provenance_data = json.loads(tar.extractfile(member).read())
+            assert provenance_data is not None, "provenance.json missing"
+        assert provenance_data["record"] == "release-provenance/v1"
+        assert provenance_data["source"]["ref"] == source_ref
+        assert provenance_data["version"] == "0.1.0"
+        assert provenance_data["platform"] == "linux-x86_64"
+        schema_facts = provenance_data["schema_facts"]
+        assert schema_facts["state_schema_version"] == 4
+        assert schema_facts["migration_chain"][0] == "m0001_initial_state_v1"
+        assert schema_facts["migration_chain"][-1] == "m0004_schedules_lifecycle_v4"
+        assert "hf-config/v1" in schema_facts["document_schema_families"]
+        assert "hf-schedule/v1" in schema_facts["document_schema_families"]
+        assert len(schema_facts["document_schema_families"]) == 17
+        print("PASS: provenance binds source ref, state schema v4, migration "
+              "chain m0001..m0004, and all 17 document schema families")
+
+        # --- SBOM mirrors Cargo.lock (offline) ----------------------------------
+        with tarfile.open(archive, "r:gz") as tar:
+            sbom_data = None
+            for member in tar.getmembers():
+                if member.name.endswith("SBOM.spdx.json"):
+                    sbom_data = json.loads(tar.extractfile(member).read())
+        assert sbom_data is not None, "SBOM missing"
+        assert sbom_data["spdxVersion"] == "SPDX-2.3"
+        lock_text = open(os.path.join(REPO, "Cargo.lock"), encoding="utf-8").read()
+        packages = {}
+        current = {}
+        for raw in lock_text.splitlines():
+            line = raw.rstrip()
+            if line.startswith("[[package]]"):
+                current = {}
+            elif "=" in line and not line.startswith("["):
+                key, _, value = line.partition("=")
+                current[key.strip()] = value.strip().strip('"')
+            elif line.startswith("[") and current:
+                if current.get("name"):
+                    packages[current["name"]] = current["version"]
+                current = {}
+        sbom_names = {p["name"]: p.get("versionInfo") for p in sbom_data["packages"]}
+        assert "herdr-fleet" in sbom_names and sbom_names["herdr-fleet"] == "0.1.0"
+        # Every dependency in Cargo.lock appears once with its version.
+        for name, version in packages.items():
+            assert sbom_names.get(name) == version, (
+                f"SBOM must mirror Cargo.lock for {name}@{version}")
+        assert len(sbom_names) == len(packages) + 1, (
+            "SBOM package count must equal Cargo.lock packages + root")
+        print(f"PASS: SBOM mirrors Cargo.lock offline ({len(packages)} "
+              "dependencies + root package)")
+
+        # --- deterministic metadata + archive framing ---------------------------
+        second_out = os.path.join(tmp, "out2")
+        os.makedirs(second_out)
+        second = run(build_args + ["--out-dir", second_out])
+        assert second.returncode == 0, second.stderr.decode()
+        archive2 = os.path.join(second_out, "herdr-fleet-0.1.0-linux-x86_64.tar.gz")
+
+        def file_sha(path):
+            digest = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        assert file_sha(archive) == file_sha(archive2), (
+            "two builds from identical inputs must produce byte-identical "
+            "archives (fixed mtimes + gzip framing)")
+        print("PASS: two builds with identical inputs produce byte-identical "
+              "archives")
+
+        # --- verification instructions are executable ---------------------------
+        verify2 = run([sys.executable, BUILDER, "verify",
+                       "--archive", archive2])
+        assert verify2.returncode == 0
+        print("PASS: verification of the second build also passes")
+
+    print("test-build-archive.py: all checks passed")
+
+
+if __name__ == "__main__":
+    try:
+        checks()
+    except AssertionError as exc:
+        sys.stderr.write(f"FAIL: {exc}\n")
+        sys.exit(1)
