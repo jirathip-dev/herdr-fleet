@@ -76,7 +76,7 @@ herdr-fleet-<version>-<platform>.tar.gz.sha256   (adjacent archive checksum)
 ```
 
 Archive layout (deterministic; documented by
-[`scripts/build-archive.py`](../../scripts/build-archive.py)):
+[`scripts/build-archive.py`](../scripts/build-archive.py)):
 
 ```text
 herdr-fleet-<version>/
