@@ -295,9 +295,19 @@ pub enum RemoteOutcome {
     },
     /// Transport completed with a typed refusal (reply mismatch, non-zero
     /// remote exit, malformed reply).
-    Failed { code: &'static str, message: String },
+    Failed {
+        /// Stable dotted refusal code (`refusal.remote.*` / `adapter.*`).
+        code: &'static str,
+        /// Human message.
+        message: String,
+    },
     /// Transport did not produce a terminal outcome; never retry locally.
-    Ambiguous { code: &'static str, message: String },
+    Ambiguous {
+        /// Stable dotted code (`refusal.remote.transport`).
+        code: &'static str,
+        /// Human message.
+        message: String,
+    },
 }
 
 /// Invoke the remote CLI/daemon through system ssh with the allowlisted

@@ -1395,7 +1395,7 @@ fn dirty_cleanup_archive_preserves_exact_bytes_and_manifest_and_never_deletes() 
         payload.as_bytes(),
         "archived bytes must equal the original"
     );
-    let expected_sha = herdr_fleet::canonical::sha256_hex(&payload.as_bytes());
+    let expected_sha = herdr_fleet::canonical::sha256_hex(payload.as_bytes());
     assert_eq!(
         entry_sha, expected_sha,
         "manifest sha256 must match the bytes"

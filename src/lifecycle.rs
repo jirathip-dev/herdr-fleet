@@ -1121,7 +1121,7 @@ mod tests {
                 "lane",
                 "worktrees/issues/123/sub-worktree",
             ),
-            &[overlapping.clone()],
+            std::slice::from_ref(&overlapping),
             &ConcurrencyCaps::default(),
             proof,
             now,

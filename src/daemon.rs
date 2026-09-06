@@ -982,20 +982,16 @@ fn apply_params(request: &Request) -> Result<ApplyParams, (String, String)> {
         None | Some(Val::Null) => None,
         Some(Val::Obj(_)) => {
             let admission = flags.and_then(|f| f.get("admission")).expect("checked");
-            let caps = admission.get("caps").and_then(|c| {
-                if matches!(c, Val::Obj(_)) {
-                    Some(c)
-                } else {
-                    None
-                }
-            });
+            let caps = admission
+                .get("caps")
+                .filter(|caps| matches!(caps, Val::Obj(_)));
             let int_field =
                 |key: &str| -> Option<i64> { caps.and_then(|c| non_negative(c.get(key))) };
             let host_proof_at = admission
                 .get("host_proof")
                 .and_then(|proof| proof.get("measured_at"))
                 .and_then(Val::as_str)
-                .and_then(|text| crate::time::unix_from_rfc3339(text));
+                .and_then(crate::time::unix_from_rfc3339);
             Some(AdmissionParams {
                 global_cap: int_field("global"),
                 repository_cap: int_field("repository"),
