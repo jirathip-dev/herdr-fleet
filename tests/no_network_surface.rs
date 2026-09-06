@@ -40,6 +40,13 @@ fn no_network_listener_telemetry_or_update_surface_is_introduced() {
         ("auto_update", "no auto-update"),
         ("autoupdate", "no auto-update"),
         ("notification provider", "no notification provider"),
+        // Issue #9 AC10 (lifecycle slice): schedules/lifecycle/remote add
+        // no messaging, agent-plugin, or webhook surface either - the
+        // recurring-work path stays on the same Unix socket and local
+        // process spawns.
+        ("webhook", "no webhook surface"),
+        ("websocket", "no websocket surface"),
+        ("mcp", "no MCP/plugin-agent surface"),
     ];
 
     let mut violations: Vec<String> = Vec::new();
@@ -81,4 +88,35 @@ fn daemon_listener_is_unix_domain_only() {
             "daemon.rs must not reference {banned}"
         );
     }
+}
+
+#[test]
+fn audit_deletion_is_append_side_retention_only() {
+    // Issue #9 AC8: deleting audit records is itself an explicit,
+    // bounded, append-side retention operation - no API can purge audit
+    // rows on demand. The single `DELETE FROM audit` in the whole state
+    // layer lives inside prune_audit_locked (bounded retention keeps the
+    // chain genesis); there is no purge/truncate surface anywhere.
+    let state_source = crate_sources()
+        .into_iter()
+        .find(|path| path.ends_with("state.rs"))
+        .expect("state.rs");
+    let content = std::fs::read_to_string(&state_source).expect("read state.rs");
+    assert_eq!(
+        content.matches("DELETE FROM audit").count(),
+        1,
+        "audit rows are deleted exactly once, inside the retention prune"
+    );
+    let prune_index = content.find("DELETE FROM audit").expect("prune sql");
+    let before = &content[..prune_index];
+    let prune_fn = before.rfind("fn prune_audit_locked");
+    let append_fn = before.rfind("fn append_audit_locked");
+    assert!(
+        prune_fn.is_some() && append_fn.is_none(),
+        "the only audit DELETE must live in prune_audit_locked, not in the append path"
+    );
+    assert!(
+        !content.contains("purge_audit") && !content.contains("TRUNCATE"),
+        "no on-demand audit purge surface may exist"
+    );
 }

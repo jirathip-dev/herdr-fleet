@@ -2007,30 +2007,36 @@ fn method_schedule_create(shared: &Arc<Shared>, request: &Request) -> String {
     let target = format!("schedule:{schedule_id}");
     match journal_mutation(shared, request, "mutate.schedule.create", &target) {
         Intent::Claimed { key } => {
-            let state = match shared.lock_state() {
-                Ok(state) => state,
-                Err(message) => {
-                    return err_response(&request.id, "state.unavailable", message);
+            let outcome = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                match state.upsert_schedule(&doc) {
+                    Ok(row) => Ok(object(vec![("schedule", crate::state::schedule_val(&row))])),
+                    Err(err) => Err((err.code, err.message)),
                 }
             };
-            match state.upsert_schedule(&doc) {
-                Ok(row) => finish_mutation(
+            match outcome {
+                Ok(result) => finish_mutation(
                     shared,
                     request,
                     &key,
                     "schedule.create",
                     true,
-                    object(vec![("schedule", crate::state::schedule_val(&row))]),
+                    result,
                     None,
                 ),
-                Err(err) => finish_mutation(
+                Err((code, message)) => finish_mutation(
                     shared,
                     request,
                     &key,
                     "schedule.create",
                     false,
                     null(),
-                    Some((err.code, err.message)),
+                    Some((code, message)),
                 ),
             }
         }
@@ -2076,14 +2082,20 @@ fn method_schedule_set_enabled(shared: &Arc<Shared>, request: &Request, enabled:
     let target = format!("schedule:{schedule_id}");
     match journal_mutation(shared, request, action, &target) {
         Intent::Claimed { key } => {
-            let state = match shared.lock_state() {
-                Ok(state) => state,
-                Err(message) => {
-                    return err_response(&request.id, "state.unavailable", message);
+            let outcome = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                match state.set_schedule_enabled(&schedule_id, enabled, &time::rfc3339_now()) {
+                    Ok(row) => Ok(object(vec![("schedule", crate::state::schedule_val(&row))])),
+                    Err(err) => Err((err.code, err.message)),
                 }
             };
-            match state.set_schedule_enabled(&schedule_id, enabled, &time::rfc3339_now()) {
-                Ok(row) => finish_mutation(
+            match outcome {
+                Ok(result) => finish_mutation(
                     shared,
                     request,
                     &key,
@@ -2093,10 +2105,10 @@ fn method_schedule_set_enabled(shared: &Arc<Shared>, request: &Request, enabled:
                         "schedule.pause"
                     },
                     true,
-                    object(vec![("schedule", crate::state::schedule_val(&row))]),
+                    result,
                     None,
                 ),
-                Err(err) => finish_mutation(
+                Err((code, message)) => finish_mutation(
                     shared,
                     request,
                     &key,
@@ -2107,7 +2119,7 @@ fn method_schedule_set_enabled(shared: &Arc<Shared>, request: &Request, enabled:
                     },
                     false,
                     null(),
-                    Some((err.code, err.message)),
+                    Some((code, message)),
                 ),
             }
         }
@@ -2138,33 +2150,39 @@ fn method_schedule_delete(shared: &Arc<Shared>, request: &Request) -> String {
     let target = format!("schedule:{schedule_id}");
     match journal_mutation(shared, request, "mutate.schedule.delete", &target) {
         Intent::Claimed { key } => {
-            let state = match shared.lock_state() {
-                Ok(state) => state,
-                Err(message) => {
-                    return err_response(&request.id, "state.unavailable", message);
+            let outcome = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                match state.delete_schedule(&schedule_id) {
+                    Ok(()) => Ok(object(vec![
+                        ("schedule_id", string(&schedule_id)),
+                        ("deleted", bool_(true)),
+                    ])),
+                    Err(err) => Err((err.code, err.message)),
                 }
             };
-            match state.delete_schedule(&schedule_id) {
-                Ok(()) => finish_mutation(
+            match outcome {
+                Ok(result) => finish_mutation(
                     shared,
                     request,
                     &key,
                     "schedule.delete",
                     true,
-                    object(vec![
-                        ("schedule_id", string(&schedule_id)),
-                        ("deleted", bool_(true)),
-                    ]),
+                    result,
                     None,
                 ),
-                Err(err) => finish_mutation(
+                Err((code, message)) => finish_mutation(
                     shared,
                     request,
                     &key,
                     "schedule.delete",
                     false,
                     null(),
-                    Some((err.code, err.message)),
+                    Some((code, message)),
                 ),
             }
         }
