@@ -156,8 +156,9 @@ Commands: `config init|validate|show [--config PATH] [--json]`,
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — prerequisites, canonical gate
   list, toolchain process, troubleshooting.
 - [docs/WORKFLOW.md](docs/WORKFLOW.md) — contributor + maintainer workflow.
-- [docs/RELEASING.md](docs/RELEASING.md) — future release contract (not yet
-  active).
+- [docs/RELEASING.md](docs/RELEASING.md) — release readiness: archive
+  builder + verification machinery, version/schema policy, clean-host
+  verification rows (execution human-gated).
 - Architecture decisions:
   - [ADR-0001: public core vs private overlays](docs/decisions/0001-public-core-private-overlays.md)
   - [ADR-0002: staging integration, main release](docs/decisions/0002-staging-integration-main-release.md)
@@ -194,11 +195,15 @@ with host-resource proofs + monorepo-overlap refusal, cleanup
 archive/salvage with byte-verified manifests, a verified system-SSH
 remote transport contract, and retention-bounded backup pruning) is
 implemented on this staging line too (its PR is opened by the
-orchestrator after independent exact-head review). Child #10 is
-**unrouted** and will require its own route grant. No live workflow
-execution or releases exist yet, and no harness session runs from public
-CI or fork PRs (real harness parity is a human-gated clean-host smoke,
-issue #7 AC6).
+orchestrator after independent exact-head review). Child #10 (release
+readiness: deterministic platform archives with checksums + offline SBOM +
+provenance, clean-host verification scripts, compatibility probe mapping,
+measured baselines, and the active in-repo release/version policy — with
+release EXECUTION human-gated) is implemented on this staging line (its PR
+is opened by the orchestrator after independent exact-head review). No
+live workflow execution or releases exist yet, and no harness session runs
+from public CI or fork PRs (real harness parity is a human-gated clean-host
+smoke, issue #7 AC6).
 
 ## License
 

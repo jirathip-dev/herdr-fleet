@@ -1,0 +1,10 @@
+# platform,linux-x86_64
+# toolchain,"{""cargo"": ""cargo 1.97.1 (c980f4866 2026-06-30)"", ""python"": ""3.14.2"", ""rustc"": ""rustc 1.97.1 (8bab26f4f 2026-07-14)""}"
+# budgets,"budget = max(p95 x 2.0, 25.0ms); same-host-class check only"
+scenario,samples,warmup,p50_ms,p95_ms,mean_ms,min_ms,max_ms,peak_rss_kb,nonzero_exits,budget_ms
+help,30,2,0.64,0.77,0.64,0.54,0.81,19116,no,25.0
+version,30,2,0.68,0.73,0.67,0.54,0.77,19260,no,25.0
+capabilities,30,2,0.69,0.78,0.66,0.55,0.81,19260,no,25.0
+config-validate,30,2,0.76,0.85,0.74,0.61,0.88,19260,no,25.0
+config-show,30,2,0.76,0.87,0.74,0.62,0.96,19260,no,25.0
+service-install-plan,30,2,0.65,0.92,0.72,0.62,1.0,19260,no,25.0

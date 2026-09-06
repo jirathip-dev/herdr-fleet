@@ -62,7 +62,7 @@ USAGE:
 
 GLOBAL OPTIONS:
     -h, --help       Print help (add --help to any command for its usage).
-    -V, --version    Print the package name, version, and description.
+    -V, --version    Print the package name, version, description, and schema facts.
 
 COMMANDS:
     config init      Print an annotated hf-config/v1 template to stdout.

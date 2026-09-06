@@ -52,6 +52,21 @@ fn version_exits_zero_and_prints_package_identity() {
             stdout.contains(env!("CARGO_PKG_VERSION")),
             "{flag} stdout should contain the package version"
         );
+        // Issue #10: the release provenance chain reads schema facts from
+        // `--version`; the printed state schema version must equal the
+        // library constant of the same binary.
+        assert!(
+            stdout.contains(&format!(
+                "state schema version: {}",
+                herdr_fleet::state::SCHEMA_VERSION
+            )),
+            "{flag} stdout should contain the state schema version fact"
+        );
+        assert!(
+            stdout.contains("document schema families: hf-config/v1")
+                && stdout.contains("hf-schedule/v1"),
+            "{flag} stdout should list the document schema families"
+        );
         assert!(out.stderr.is_empty(), "{flag} stderr should be empty");
     }
 }

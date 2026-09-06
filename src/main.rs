@@ -10,7 +10,7 @@
 use std::process::ExitCode;
 
 use herdr_fleet::commands::{ParseError, USAGE, execute, parse_invocation, render_envelope};
-use herdr_fleet::{PACKAGE_NAME, PACKAGE_VERSION, about};
+use herdr_fleet::{PACKAGE_NAME, PACKAGE_VERSION, about, release_facts};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -25,6 +25,7 @@ fn main() -> ExitCode {
             "--version" | "-V" => {
                 println!("{PACKAGE_NAME} {PACKAGE_VERSION}");
                 println!("{}", about());
+                print!("{}", release_facts());
                 return ExitCode::SUCCESS;
             }
             _ => {}

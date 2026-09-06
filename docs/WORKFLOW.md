@@ -74,8 +74,11 @@ it does not itself authorize anything.
 ### Releases
 
 Releases happen from `main` only, on demand, per
-[RELEASING.md](RELEASING.md) — which is **not yet active** in this
-bootstrap. No release workflow, tag, or publishing command exists yet.
+[RELEASING.md](RELEASING.md). The release-*readiness* machinery
+(deterministic archives + checksums/SBOM/provenance, verification and
+clean-host scripts, version/schema policy) is active in-repo; every actual
+release execution (promotion, tag, upload, attestation, soak) is a
+separate human decision and never runs from CI or agent lanes.
 
 ### Required checks and metadata
 
@@ -111,5 +114,5 @@ need to commit something private, you need a different (private) repository.
 
 - [CONTRIBUTING.md](../CONTRIBUTING.md) — contribution rules and DCO note
 - [DEVELOPMENT.md](DEVELOPMENT.md) — canonical gates
-- [RELEASING.md](RELEASING.md) — future release contract
+- [RELEASING.md](RELEASING.md) — release readiness; execution human-gated
 - ADR-0002: [staging integration, main release](decisions/0002-staging-integration-main-release.md)
