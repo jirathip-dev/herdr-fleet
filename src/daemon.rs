@@ -43,6 +43,11 @@ use crate::value::{Val, bool_, integer, null, object, string};
 
 /// Maximum accepted request line length (bounded memory per connection).
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// Upper bound for one replay window read. The default event retention
+/// (2000 rows) is smaller, so a replay can never be truncated by this cap;
+/// the bound exists to keep one hub-locked read finite.
+pub const REPLAY_MAX_LINES: i64 = 8192;
 /// Per-subscriber bounded event queue; a subscriber that does not drain it
 /// is disconnected (bounded backpressure, AC7).
 pub const SUBSCRIBER_QUEUE_CAP: usize = 64;
@@ -404,10 +409,14 @@ fn handle_request(shared: &Arc<Shared>, line: &str) -> HandleOutcome {
     };
     let verdict = validate_doc(Family::RpcRequest, &doc);
     if !verdict.is_accepted() {
-        let id = doc
-            .get("id")
-            .and_then(Val::as_str)
-            .unwrap_or(FALLBACK_REQUEST_ID);
+        // The id on an invalid doc is attacker-controlled (bounded only by
+        // the request line cap): echo a capped version, never raw bytes.
+        let id = bounded(
+            doc.get("id")
+                .and_then(Val::as_str)
+                .unwrap_or(FALLBACK_REQUEST_ID),
+            64,
+        );
         let class = verdict
             .refusal()
             .map(|refusal| refusal_code(refusal).to_string())
@@ -417,7 +426,7 @@ fn handle_request(shared: &Arc<Shared>, line: &str) -> HandleOutcome {
             "request.refused",
             &format!("{class}: {}", verdict.message()),
         );
-        return HandleOutcome::Response(response_line(id, false, None, &class, verdict.message()));
+        return HandleOutcome::Response(response_line(&id, false, None, &class, verdict.message()));
     }
     let id = doc
         .get("id")
@@ -725,6 +734,30 @@ enum Intent {
 }
 
 fn journal_mutation(shared: &Arc<Shared>, request: &Request, action: &str, target: &str) -> Intent {
+    let state = match shared.lock_state() {
+        Ok(state) => state,
+        Err(message) => {
+            return Intent::Refused {
+                code: "state.unavailable",
+                message,
+            };
+        }
+    };
+    let intent = journal_mutation_on(&state, request, action, target);
+    drop(state);
+    if matches!(intent, Intent::Claimed { .. }) {
+        // Publish the intent event only after the state guard is dropped
+        // (hub locking rule: never publish while holding the state mutex).
+        publish_after_state_change(shared, None);
+    }
+    intent
+}
+
+/// Journal an intent on an ALREADY-LOCKED state handle. No locking and no
+/// publishing: the restore path holds the state mutex across the whole
+/// rename/reopen/swap sequence (review-5-daemon-r2 blocker) and publishes
+/// once after dropping the guard.
+fn journal_mutation_on(state: &State, request: &Request, action: &str, target: &str) -> Intent {
     let key = match request
         .params
         .as_ref()
@@ -739,29 +772,17 @@ fn journal_mutation(shared: &Arc<Shared>, request: &Request, action: &str, targe
             };
         }
     };
-    let outcome = match shared.lock_state() {
-        Ok(state) => state.journal_intent(
-            action,
-            target,
-            &key,
-            &request.id,
-            &request.method,
-            None,
-            None,
-            &request.line,
-        ),
-        Err(message) => {
-            return Intent::Refused {
-                code: "state.unavailable",
-                message,
-            };
-        }
-    };
-    match outcome {
-        Ok((ClaimAttempt::Claimed, audit)) => {
-            publish_after_state_change(shared, audit);
-            Intent::Claimed { key }
-        }
+    match state.journal_intent(
+        action,
+        target,
+        &key,
+        &request.id,
+        &request.method,
+        None,
+        None,
+        &request.line,
+    ) {
+        Ok((ClaimAttempt::Claimed, _)) => Intent::Claimed { key },
         Ok((ClaimAttempt::Replay { response }, _)) => Intent::Replay { response },
         Ok((ClaimAttempt::Reused { owner_request_id }, _)) => Intent::Refused {
             code: "refusal.idempotency",
@@ -801,15 +822,16 @@ fn method_grants_revoke(shared: &Arc<Shared>, request: &Request) -> String {
     match journal_mutation(shared, request, "mutate.grant.revoke", grant_id) {
         Intent::Claimed { key } => {
             crash_point("grants.after-intent");
-            let state = match shared.lock_state() {
-                Ok(state) => state,
+            let guard = match shared.lock_state() {
+                Ok(guard) => guard,
                 Err(message) => {
                     return err_response(&request.id, "state.unavailable", message);
                 }
             };
-            match state.revoke_grant(grant_id, &time::rfc3339_now()) {
-                Ok(()) => finish_mutation(
-                    shared,
+            let response = match guard.revoke_grant(grant_id, &time::rfc3339_now()) {
+                Ok(()) => resolve_mutation_on(
+                    &guard,
+                    &shared.log,
                     request,
                     &key,
                     "grants.revoke",
@@ -820,8 +842,9 @@ fn method_grants_revoke(shared: &Arc<Shared>, request: &Request) -> String {
                     ]),
                     None,
                 ),
-                Err(err) => finish_mutation(
-                    shared,
+                Err(err) => resolve_mutation_on(
+                    &guard,
+                    &shared.log,
                     request,
                     &key,
                     "grants.revoke",
@@ -829,7 +852,10 @@ fn method_grants_revoke(shared: &Arc<Shared>, request: &Request) -> String {
                     null(),
                     Some((err.code, err.message)),
                 ),
-            }
+            };
+            drop(guard);
+            publish_after_state_change(shared, None);
+            response
         }
         Intent::Replay { response } => replay(shared, &response),
         Intent::Refused { code, message } => err_response(&request.id, code, message),
@@ -938,22 +964,6 @@ fn summary_tuple(shared: &Arc<Shared>) -> Result<(i64, i64), StateError> {
 }
 
 fn method_restore_begin(shared: &Arc<Shared>, request: &Request) -> String {
-    // A restore touches the whole database; refuse while interrupted claims
-    // are pending (they must reconcile through a restart first, AC4/AC6).
-    match shared.lock_state() {
-        Ok(state) => match state.claims_in_flight() {
-            Ok(claims) if claims.is_empty() => {}
-            Ok(_) => {
-                return err_response(
-                    &request.id,
-                    "refusal.restore.pending_claims",
-                    "restore refused while interrupted claims are pending; restart the daemon to reconcile them first",
-                );
-            }
-            Err(err) => return err_response(&request.id, err.code, err.message),
-        },
-        Err(message) => return err_response(&request.id, "state.unavailable", message),
-    }
     let target = request
         .params
         .as_ref()
@@ -983,128 +993,221 @@ fn method_restore_begin(shared: &Arc<Shared>, request: &Request) -> String {
     if let Err(err) = backup::verify_backup(&snapshot_path, &manifest) {
         return err_response(&request.id, err.code, err.message);
     }
-    match journal_mutation(
-        shared,
+
+    // EXCLUSIVE restore window (review-5-daemon-r2 blocker): the state
+    // mutex is held across intent -> rename -> reopen -> rotate/void ->
+    // swap -> re-journal -> resolve. No other handler can journal into the
+    // unlinked old file or observe a half-swapped state, because every
+    // state access (all mutation methods) takes this same mutex. Events
+    // are published only after the guard is dropped (hub locking rule).
+    let mut guard = match shared.lock_state() {
+        Ok(guard) => guard,
+        Err(message) => return err_response(&request.id, "state.unavailable", message),
+    };
+    // A restore touches the whole database; refuse while interrupted claims
+    // are pending (they must reconcile through a restart first, AC4/AC6).
+    match guard.claims_in_flight() {
+        Ok(claims) if claims.is_empty() => {}
+        Ok(_) => {
+            return err_response(
+                &request.id,
+                "refusal.restore.pending_claims",
+                "restore refused while interrupted claims are pending; restart the daemon to reconcile them first",
+            );
+        }
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    }
+    // Journal the durable intent on the CURRENT state handle (still under
+    // the exclusive guard, so no other writer can interleave).
+    let key = match request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("idempotency_key"))
+        .and_then(Val::as_str)
+    {
+        Some(key) if crate::formats::is_idempotency_key(key) => key.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "restore.begin requires params.idempotency_key (ik_ format)",
+            );
+        }
+    };
+    match guard.journal_intent(
+        "mutate.restore.begin",
+        &format!("restore:{}", manifest.snapshot_name),
+        &key,
+        &request.id,
+        &request.method,
+        None,
+        None,
+        &request.line,
+    ) {
+        Ok((ClaimAttempt::Claimed, _)) => {}
+        Ok((ClaimAttempt::Replay { response }, _)) => return replay(shared, &response),
+        Ok((ClaimAttempt::Reused { owner_request_id }, _)) => {
+            return err_response(
+                &request.id,
+                "refusal.idempotency",
+                format!("idempotency key {key:?} already belongs to request {owner_request_id}"),
+            );
+        }
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    }
+    crash_point("restore.after-intent");
+    if let Err(err) = backup::restore_snapshot(&snapshot_path, &shared.paths.db_path) {
+        // The live file was NOT replaced: resolve the failure on the current
+        // state and publish after the guard drops.
+        let response = resolve_mutation_on(
+            &guard,
+            &shared.log,
+            request,
+            &key,
+            "restore.begin",
+            false,
+            null(),
+            Some((err.code, err.message)),
+        );
+        drop(guard);
+        publish_after_state_change(shared, None);
+        return response;
+    }
+    crash_point("restore.after-rename");
+    // The DB file was replaced under the old connection. Reopen the
+    // restored database and swap the handle while the exclusive guard is
+    // still held, so nothing can journal into the unlinked old file.
+    let reopened = match State::open(&shared.paths.db_path, crate::state::Retention::default()) {
+        Ok(state) => state,
+        Err(err) => {
+            shared.log.write(
+                "error",
+                "outcome.journal_failed",
+                &format!("restore reopen failed: {}: {}", err.code, err.message),
+            );
+            drop(guard);
+            publish_after_state_change(shared, None);
+            return err_response(
+                &request.id,
+                err.code,
+                format!(
+                    "restore renamed the database but reopening it failed; restart the daemon: {}",
+                    err.message
+                ),
+            );
+        }
+    };
+    let rotated_epoch = reopened
+        .rotate_epoch("restore")
+        .and_then(|epoch| reopened.invalidate_grants_below_current().map(|_| epoch))
+        .and_then(|epoch| {
+            // The snapshot predates the resolutions of any claims that were
+            // in flight when it was taken; void them so a resurrected claim
+            // can never dispatch or replay.
+            reopened.void_in_flight_claims("restore").map(|_| epoch)
+        });
+    // Swap unconditionally: the live file is the restored one now, so every
+    // later state access (including the re-journal below) must target it.
+    *guard = reopened;
+    // The pre-effect claim was journaled into the *old* DB, which the rename
+    // replaced. Journal the intent again in the restored DB so the outcome
+    // resolves durably here (a crash between the rename and this re-journal
+    // simply re-executes the same restore on retry — idempotent).
+    let response = match journal_mutation_on(
+        &guard,
         request,
         "mutate.restore.begin",
         &format!("restore:{}", manifest.snapshot_name),
     ) {
-        Intent::Claimed { key } => {
-            crash_point("restore.after-intent");
-            if let Err(err) = backup::restore_snapshot(&snapshot_path, &shared.paths.db_path) {
-                return finish_mutation(
-                    shared,
+        Intent::Claimed { key } => match rotated_epoch {
+            Ok(epoch) => {
+                let outcome = object(vec![
+                    ("restored_epoch", integer(epoch)),
+                    ("snapshot", string(&manifest.snapshot_name)),
+                    ("prior_epoch", integer(epoch - 1)),
+                ]);
+                resolve_mutation_on(
+                    &guard,
+                    &shared.log,
                     request,
                     &key,
                     "restore.begin",
-                    false,
-                    null(),
-                    Some((err.code, err.message)),
-                );
+                    true,
+                    outcome,
+                    None,
+                )
             }
-            crash_point("restore.after-rename");
-            // The live DB file was replaced under the old connection: reopen
-            // the restored database and swap the state handle so no writer
-            // can journal into the unlinked old file. While the outer state
-            // mutex is held, no other handler can touch the old handle.
-            let reopened =
-                match State::open(&shared.paths.db_path, crate::state::Retention::default()) {
-                    Ok(state) => state,
-                    Err(err) => {
-                        return finish_mutation(
-                            shared,
-                            request,
-                            &key,
-                            "restore.begin",
-                            false,
-                            null(),
-                            Some((err.code, err.message)),
-                        );
-                    }
-                };
-            let rotated_epoch = reopened
-                .rotate_epoch("restore")
-                .and_then(|epoch| reopened.invalidate_grants_below_current().map(|_| epoch))
-                .and_then(|epoch| {
-                    // The snapshot predates the resolutions of any claims
-                    // that were in flight when it was taken; void them so a
-                    // resurrected claim can never dispatch or replay.
-                    reopened.void_in_flight_claims("restore").map(|_| epoch)
-                });
-            match rotated_epoch {
-                Ok(epoch) => {
-                    // Swap: after this point every handler uses the restored
-                    // database (the handle above validated it and rotated the
-                    // epoch on it). While the outer state mutex is held here
-                    // no other handler can journal into the unlinked old file.
-                    let mut guard = match shared.state.lock() {
-                        Ok(guard) => guard,
-                        Err(message) => {
-                            return finish_mutation(
-                                shared,
-                                request,
-                                &key,
-                                "restore.begin",
-                                false,
-                                null(),
-                                Some(("state.unavailable", message.to_string())),
-                            );
-                        }
-                    };
-                    *guard = reopened;
-                    drop(guard);
-                    // The pre-effect claim was journaled into the *old* DB,
-                    // which the rename replaced. Journal the intent again in
-                    // the restored DB so the outcome resolves durably here
-                    // (a crash between the rename and this re-journal simply
-                    // re-executes the same restore on retry — idempotent).
-                    let outcome = object(vec![
-                        ("restored_epoch", integer(epoch)),
-                        ("snapshot", string(&manifest.snapshot_name)),
-                        ("prior_epoch", integer(epoch - 1)),
-                    ]);
-                    match journal_mutation(
-                        shared,
-                        request,
-                        "mutate.restore.begin",
-                        &format!("restore:{}", manifest.snapshot_name),
-                    ) {
-                        Intent::Claimed { key } => finish_mutation(
-                            shared,
-                            request,
-                            &key,
-                            "restore.begin",
-                            true,
-                            outcome,
-                            None,
-                        ),
-                        Intent::Replay { response } => replay(shared, &response),
-                        Intent::Refused { code, message } => {
-                            err_response(&request.id, code, message)
-                        }
-                    }
-                }
-                Err(err) => finish_mutation(
-                    shared,
-                    request,
-                    &key,
-                    "restore.begin",
-                    false,
-                    null(),
-                    Some((err.code, err.message)),
-                ),
-            }
-        }
+            Err(err) => resolve_mutation_on(
+                &guard,
+                &shared.log,
+                request,
+                &key,
+                "restore.begin",
+                false,
+                null(),
+                Some((err.code, err.message)),
+            ),
+        },
         Intent::Replay { response } => replay(shared, &response),
         Intent::Refused { code, message } => err_response(&request.id, code, message),
-    }
+    };
+    drop(guard);
+    publish_after_state_change(shared, None);
+    response
 }
 
-/// Finish a journaled mutation: resolve the claim with a typed outcome and
-/// the recorded response in one transaction, publish the outcome event, and
-/// refresh the bounded event mirror. Returns the response line.
+/// Finish a journaled mutation: lock the state, resolve the claim with a
+/// typed outcome and the recorded response in one transaction, drop the
+/// guard, then publish the outcome event and refresh the bounded event
+/// mirror. Returns the response line.
 fn finish_mutation(
     shared: &Arc<Shared>,
+    request: &Request,
+    key: &str,
+    method: &str,
+    success: bool,
+    result: Val,
+    error: Option<(&'static str, String)>,
+) -> String {
+    let response = match shared.lock_state() {
+        Ok(state) => resolve_mutation_on(
+            &state,
+            &shared.log,
+            request,
+            key,
+            method,
+            success,
+            result,
+            error,
+        ),
+        Err(message) => {
+            shared.log.write(
+                "error",
+                "outcome.journal_failed",
+                &format!("state lock lost: {message}"),
+            );
+            return err_response(
+                &request.id,
+                "state.unavailable",
+                format!(
+                    "the mutation effect completed but its outcome could not be journaled \
+                     (fail closed): {message}"
+                ),
+            );
+        }
+    };
+    publish_after_state_change(shared, None);
+    response
+}
+
+/// Resolve a claim on an ALREADY-LOCKED state handle (no locking, no
+/// publishing). Used by the restore path, which holds the state mutex
+/// across the rename/reopen/swap sequence and publishes only after the
+/// guard is dropped.
+#[allow(clippy::too_many_arguments)]
+fn resolve_mutation_on(
+    state: &State,
+    log: &DaemonLog,
     request: &Request,
     key: &str,
     method: &str,
@@ -1128,37 +1231,16 @@ fn finish_mutation(
             daemon_outcome(key, "failed", error_val(code, &message)),
         )
     };
-    let audit = match shared.lock_state() {
-        Ok(state) => state.resolve_claim(
-            key,
-            method,
-            status,
-            &canonical_text(&outcome),
-            Some(&response),
-        ),
-        Err(message) => {
-            shared.log.write(
-                "error",
-                "outcome.journal_failed",
-                &format!("state lock lost: {message}"),
-            );
-            return err_response(
-                &request.id,
-                "state.unavailable",
-                format!(
-                    "the mutation effect completed but its outcome could not be journaled \
-                     (fail closed): {message}"
-                ),
-            );
-        }
-    };
-    match audit {
-        Ok(audit) => {
-            publish_after_state_change(shared, Some(audit));
-            response
-        }
+    match state.resolve_claim(
+        key,
+        method,
+        status,
+        &canonical_text(&outcome),
+        Some(&response),
+    ) {
+        Ok(_audit) => response,
         Err(err) => {
-            shared.log.write(
+            log.write(
                 "error",
                 "outcome.journal_failed",
                 &format!("{}: {}", err.code, err.message),
@@ -1224,7 +1306,7 @@ fn publish_events(shared: &Arc<Shared>) {
         Ok(state) => state,
         Err(_) => return,
     };
-    let events = match state.events_after(hub.last_published, 8192) {
+    let events = match state.events_after(hub.last_published, REPLAY_MAX_LINES) {
         Ok(events) => events,
         Err(_) => return,
     };
@@ -1335,7 +1417,7 @@ fn compute_replay(
         snapshot.push(canonical_text(&doc));
     } else if let Some(n) = cursor {
         let events = state
-            .events_after(n, 8192)
+            .events_after(n, REPLAY_MAX_LINES)
             .map_err(|err| format!("{}: {}", err.code, err.message))?;
         for event in events {
             replay.push(canonical_text(&event));

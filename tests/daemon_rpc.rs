@@ -328,6 +328,190 @@ fn daemons_with_distinct_state_dirs_coexist() {
     wait_exit(daemon_b, "daemon b");
 }
 
+/// r2 blocker regression: a restore.begin must hold the state mutex across
+/// the DB-file rename/reopen/swap so no handler can journal into the
+/// unlinked old file or observe a half-swapped state. The reviewer's live
+/// probe witnesses were: (1) plain mutations refused with state.readonly
+/// mid-window, (2) duplicate restored_epoch across successful restores,
+/// (3) ok:true mutations absent from the final journal. This test asserts
+/// (1) every racing mutation is acknowledged (never a state.* write
+/// failure), (2) restored epochs are strictly increasing (never repeated),
+/// and (3) mutations acknowledged after a restore response survive every
+/// later restore in the final journal. (A mutation acknowledged BEFORE a
+/// restore acquires the state lock is legitimately rolled back by that
+/// restore — epoch rotation is the visible rollback signal; the race
+/// window itself must never lose an ack.)
+#[test]
+fn restore_racing_acknowledged_mutations_never_loses_acked_intents() {
+    let fixture = Fixture::new("ac1-restore-race");
+    let daemon = fixture.spawn(None);
+    wait_ready(&fixture);
+
+    let mut restored_epochs: Vec<i64> = Vec::new();
+    let mut surviving_keys: Vec<String> = Vec::new();
+
+    for round in 0..6u32 {
+        // A verified snapshot to restore from.
+        let snapshot_key = format!("ik_race-snap-{round:08}");
+        let snapshot_doc = rpc_ok(
+            &fixture.socket,
+            &fresh_id(800 + round),
+            "backup.create",
+            Some(backup_params(&snapshot_key)),
+        );
+        let snapshot_name = snapshot_doc
+            .get("backup")
+            .and_then(|backup| backup.get("snapshot"))
+            .and_then(Val::as_str)
+            .expect("snapshot")
+            .to_string();
+
+        // Fire restore.begin and an acknowledged backup.create mutation at
+        // the same time (own connections, two threads).
+        let socket_for_restore = fixture.socket.clone();
+        let restore_id = fresh_id(900 + round * 2);
+        let restore_key = format!("ik_race-restore-{round:08}");
+        let restore_params = object(vec![
+            ("idempotency_key", string(&restore_key)),
+            ("backup", string(&snapshot_name)),
+        ]);
+        let restore_thread = std::thread::spawn(move || {
+            rpc(
+                &socket_for_restore,
+                &restore_id,
+                "restore.begin",
+                Some(restore_params),
+            )
+        });
+
+        let ack_key = format!("ik_race-ack-{round:08}");
+        let ack_doc = rpc(
+            &fixture.socket,
+            &fresh_id(901 + round * 2),
+            "backup.create",
+            Some(backup_params(&ack_key)),
+        );
+        // Witness (1): the racing mutation must be acknowledged — never a
+        // state.readonly/busy/write failure that only existed inside the
+        // unlinked-file window (the reviewer saw 8 of those in 100 rounds).
+        assert_eq!(
+            ack_doc.get("ok").and_then(Val::as_bool),
+            Some(true),
+            "racing mutation must be acknowledged, got: {}",
+            herdr_fleet::canonical::canonical_text(&ack_doc)
+        );
+        // A mutation acknowledged while the restore is in flight must not be
+        // lost by THIS restore: it either journaled before the rename (and
+        // is rolled back — epoch rotation visible) or after it (survives).
+        // Keys acked after the restore response are unconditionally durable
+        // across all later rounds; assert them at the end.
+        let post_restore_key = format!("ik_race-after-{round:08}");
+        let mut restore_doc = restore_thread.join().expect("restore thread joined");
+        let mut attempt = 0u32;
+        while restore_doc.get("ok").and_then(Val::as_bool) != Some(true) && attempt < 5 {
+            attempt += 1;
+            std::thread::sleep(Duration::from_millis(25));
+            restore_doc = rpc(
+                &fixture.socket,
+                &fresh_id(920 + round * 2),
+                "restore.begin",
+                Some(object(vec![
+                    ("idempotency_key", string(&restore_key)),
+                    ("backup", string(&snapshot_name)),
+                ])),
+            );
+        }
+        if restore_doc.get("ok").and_then(Val::as_bool) == Some(true) {
+            // Witness (2): each successful restore rotates to a NEW epoch.
+            let epoch = restore_doc
+                .get("result")
+                .and_then(|result| result.get("restored_epoch"))
+                .and_then(Val::as_int)
+                .expect("restored_epoch");
+            if let Some(previous) = restored_epochs.last() {
+                assert!(
+                    epoch > *previous,
+                    "restored epochs must be strictly increasing: {epoch} after {previous}"
+                );
+            }
+            restored_epochs.push(epoch);
+            // Ack a mutation AFTER the restore completed; it must survive
+            // every later restore (it precedes the next snapshot).
+            rpc_ok(
+                &fixture.socket,
+                &fresh_id(950 + round * 2),
+                "backup.create",
+                Some(backup_params(&post_restore_key)),
+            );
+            surviving_keys.push(post_restore_key);
+        }
+    }
+
+    // Witness (3): mutations acknowledged after a restore response are in
+    // the FINAL journal (no later restore may lose them).
+    assert!(
+        !surviving_keys.is_empty(),
+        "at least one post-restore acknowledgement must exist"
+    );
+    let tail = rpc_ok(
+        &fixture.socket,
+        &fresh_id(998),
+        "journal.tail",
+        Some(object(vec![
+            ("after_seq", integer(0)),
+            ("limit", integer(5000)),
+        ])),
+    );
+    let serialized = herdr_fleet::canonical::canonical_text(&tail);
+    for key in &surviving_keys {
+        assert!(
+            serialized.contains(key),
+            "post-restore acknowledged intent {key} must survive in the final journal (lost-commit regression)"
+        );
+    }
+    assert!(
+        !restored_epochs.is_empty(),
+        "at least one racing restore must succeed"
+    );
+
+    // Clean-shutdown ordering (r2 verdict residual caveat): terminate the
+    // daemon with SIGTERM (not SIGKILL), restart it, and confirm the same
+    // post-restore acknowledgements are still journaled in the database the
+    // restarted daemon opens — i.e. nothing acked after a restore response
+    // is lost at the shutdown boundary, and startup reconcile keeps the
+    // daemon serving.
+    let daemon = daemon;
+    let term = Command::new("kill")
+        .args(["-TERM", &daemon.id().to_string()])
+        .status()
+        .expect("kill -TERM");
+    assert!(term.success(), "kill -TERM must succeed");
+    wait_exit(daemon, "terminated daemon");
+
+    let restarted = fixture.spawn(None);
+    wait_ready(&fixture);
+    let tail_after_restart = rpc_ok(
+        &fixture.socket,
+        &fresh_id(997),
+        "journal.tail",
+        Some(object(vec![
+            ("after_seq", integer(0)),
+            ("limit", integer(5000)),
+        ])),
+    );
+    let serialized_after_restart = herdr_fleet::canonical::canonical_text(&tail_after_restart);
+    for key in &surviving_keys {
+        assert!(
+            serialized_after_restart.contains(key),
+            "post-restore acknowledged intent {key} must survive a clean shutdown/restart"
+        );
+    }
+
+    let mut restarted = restarted;
+    let _ = restarted.kill();
+    wait_exit(restarted, "restarted daemon");
+}
+
 #[test]
 fn stale_socket_is_reclaimed_and_status_recovers() {
     let fixture = Fixture::new("ac1-stale");

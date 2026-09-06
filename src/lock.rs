@@ -1,7 +1,9 @@
 //! Single-writer daemon lock + per-user socket containment (issue #5, AC1).
 //!
 //! One daemon per host/user is enforced with an advisory exclusive file
-//! lock (`flock`) on a lock file that always sits next to the daemon socket.
+//! lock (`flock`) on a lock file inside the STATE directory (beside the
+//! SQLite database): one writer per state dir no matter which socket path a
+//! daemon was started with.
 //! The OS releases the lock automatically when the owning process dies —
 //! including SIGKILL and power loss — which is the stale-process recovery
 //! mechanism; the lock file's recorded owner is diagnostic only and never
@@ -232,6 +234,23 @@ pub fn bind_listener(socket_path: &Path) -> Result<std::os::unix::net::UnixListe
         }
     }
     if let Some(parent) = socket_path.parent() {
+        // A pre-existing SHARED directory (world/group-writable, e.g. /tmp)
+        // must never be retightened or trusted as a socket home: refuse.
+        // Directories the daemon prepares are per-user 0700 already and pass
+        // this check (defense in depth for callers that bypass prepare()).
+        use std::os::unix::fs::PermissionsExt;
+        let shared = std::fs::metadata(parent)
+            .map(|meta| meta.permissions().mode() & 0o022 != 0)
+            .unwrap_or(true);
+        if shared {
+            return Err(error(
+                "lock.unsafe_dir",
+                format!(
+                    "socket parent {} is a shared/world-writable directory; use a private path",
+                    parent.display()
+                ),
+            ));
+        }
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
     let listener = std::os::unix::net::UnixListener::bind(socket_path)

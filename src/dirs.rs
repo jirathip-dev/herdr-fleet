@@ -9,7 +9,6 @@
 //! service configuration.
 
 use std::env;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 /// An error deriving or preparing a per-user path.
@@ -192,6 +191,7 @@ impl DaemonPaths {
 /// the leaf is refused (path containment), never followed.
 fn create_private_dir(dir: &std::path::Path) -> Result<(), PathError> {
     use std::fs::symlink_metadata;
+    use std::os::unix::fs::PermissionsExt;
     match symlink_metadata(dir) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -206,9 +206,21 @@ fn create_private_dir(dir: &std::path::Path) -> Result<(), PathError> {
                     format!("{} exists and is not a directory", dir.display()),
                 ));
             }
+            // A pre-existing SHARED directory (world/group-writable, e.g. a
+            // shared socket home) must never be retightened or trusted:
+            // refuse instead (issue #5 r2, non-blocking (b)).
+            let mode = meta.permissions().mode();
+            if mode & 0o022 != 0 {
+                return Err(error(
+                    "dirs.not_private",
+                    format!("refusing shared/world-writable directory {}", dir.display()),
+                ));
+            }
         }
-        Err(_) => std::fs::create_dir_all(dir)
-            .map_err(|err| error("dirs.create", format!("create {}: {err}", dir.display())))?,
+        Err(_) => {
+            std::fs::create_dir_all(dir)
+                .map_err(|err| error("dirs.create", format!("create {}: {err}", dir.display())))?;
+        }
     }
     // Ensure the permission is per-user even when the directory pre-existed
     // from an earlier run under a stricter umask.
