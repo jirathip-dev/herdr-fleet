@@ -98,6 +98,18 @@ fail with rustup/cargo's own actionable errors.
 - `scripts/test-check-public-tree.py` — self-tests for the privacy scanner;
   each test builds a temporary git repo proving a rule bites (or that a
   clean fixture passes).
+- Release-readiness scripts (issue #10; self-tests below, all stdlib-only):
+  - `scripts/test-build-archive.py` — archive builder + verifier
+    end-to-end (deterministic layout, checksums, offline SBOM vs
+    `Cargo.lock`, provenance binding source ref + binary schema facts,
+    byte-identical rebuilds). Requires a clean tracked worktree at a fixed
+    HEAD and a release binary.
+  - `scripts/test-measure-baseline.py` — baseline measure/check machinery
+    (budget violations and non-zero runs fail loudly).
+  - `scripts/test-clean-host-probe.py` — clean-host verify/probe machinery
+    against the local binary in disposable temp dirs (daemon boot, RPC,
+    backup/restore round trip, schedule lifecycle, fail-closed apply
+    refusal, event snapshot) plus verify.sh guard failures.
 
 ## CI parity
 
@@ -113,6 +125,28 @@ Hosted CI mirrors the local gates exactly (see `.github/workflows/ci.yml`):
 
 Formatting runs **first** in `rust-ubuntu` — before any crate download or
 compile.
+
+## Release-readiness tooling (issue #10)
+
+The release-readiness scripts live under `scripts/` and are documented with
+their exact command rows in [RELEASING.md](RELEASING.md) (builder +
+verifier), [benchmarks.md](contracts/benchmarks.md) (baseline
+measure/check), and [compatibility.md](contracts/compatibility.md)
+(capability-probe mapping). They are **not** part of `just ci`: archive
+building requires a release build, and baseline wall-clock checks would
+flake on shared runners (see the baseline host-class caveats in
+[benchmarks.md](contracts/benchmarks.md)). Run their self-tests as
+documented when changing them:
+
+```console
+$ python3 scripts/test-build-archive.py
+$ python3 scripts/test-measure-baseline.py
+$ python3 scripts/test-clean-host-probe.py
+```
+
+All three require the release binary (`cargo build --release --locked`);
+the archive-builder self-test additionally requires a clean tracked
+worktree (the builder enforces the same).
 
 ## Coverage — Phase 1 decision
 

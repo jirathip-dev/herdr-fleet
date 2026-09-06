@@ -76,3 +76,27 @@ so the policy is enforced structurally on public CI without any harness
 credentials. Behavioral compatibility against real harness versions remains
 [awaiting-evidence] until the clean-host smokes documented in
 `.report-7.md` run on maintainer hosts.
+
+## Capability-probe mapping (release readiness, issue #10 AC4)
+
+Each row of the table above is tied to an in-tree probe that enforces or
+pins it, so a release can state exactly which code asserts the declared
+range (the mapping below is updated whenever a row or its probe moves —
+updating it is a compatibility change, not a chore):
+
+| Row | Enforcing/pinning probe |
+| --- | --- |
+| Herdr CLI minimum 0.8.2 | `src/observe.rs` `HERDR_MINIMUM = (0, 8, 2)` + `probe_version` compatibility gate (`doctor` refuses below the floor); behavior pinned by `tests/cli_readonly.rs` doctor rows with fake `herdr` executables |
+| `gh` CLI 2.x floor | `src/observe.rs` `GH_MINIMUM = (2, 0, 0)` + the same `probe_version` gate; fork-PR read-back behavior is [awaiting-evidence] (clean-host fork-PR tests) |
+| Hermes / Claude Code / Codex minimum + current | `src/adapters.rs` `official_specs()` `VersionRange { minimum, current }` per adapter; the `hf-capability/v1` negotiation refuses below `minimum`; exact argv rows and gate behavior pinned by fake executables in `tests/harness_adapters.rs` |
+| Negotiation envelope versioning | `hf-capability/v1` family fixtures + oracle (`scripts/check-contract-fixtures.py`) and `src/schema.rs` `SUPPORTED_FAMILIES` |
+| Release-to-table binding | every release archive's `provenance.json` records the binary's schema facts (`herdr-fleet --version`: state schema version, migration chain, document families) and its exact source ref — the compatibility table's declared ranges live in that same binary and are exercised by the probes above (`scripts/build-archive.py`, `docs/RELEASING.md`) |
+
+The release-readiness slice (issue #10) measured **no new live version
+facts**: the declared-current rows above remain those observed from public
+release metadata on 2026-09-06, and the minimum-version floors for the
+three harness adapters stay provisional exact-version floors
+([awaiting-evidence]) until the human-gated clean-host matrix (issue #7
+AC6, `docs/RELEASING.md` clean-host command rows) runs on maintainer
+hosts. Removing an [awaiting-evidence] marker therefore requires a real
+measurement with its evidence trail — nothing in this slice removes one.

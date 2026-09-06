@@ -1,7 +1,7 @@
 ---
 name: herdr-fleet
-description: "Use when working with or on the herdr-fleet repository or CLI. Read-only CLI core, daemon-mediated mutations, and lifecycle (schedules/admission/recovery); no live harness runs."
-version: 1.5.0
+description: "Use when working with or on the herdr-fleet repository or CLI. Read-only CLI core, daemon-mediated mutations, lifecycle (schedules/admission/recovery), and release-readiness machinery (archives/provenance/baselines); no live harness runs."
+version: 1.6.0
 author: herdr-fleet contributors
 license: Apache-2.0 OR MIT
 platforms: [macos, linux]
@@ -13,7 +13,7 @@ metadata:
 # herdr-fleet
 
 herdr-fleet is a public companion CLI for operating Herdr coding-agent
-fleets. Roadmap slices #3–#9 are merged: a read-only CLI core (#4), a
+fleets. Roadmap slices #3–#10 are merged: a read-only CLI core (#4), a
 daemon foundation with SQLite state and a local socket RPC (#5), the
 deterministic workflow engine with the bundled Doctrine default workflow
 (#6), the capability-negotiated harness adapters (#7: Hermes, Claude
@@ -22,16 +22,21 @@ fake-executable contract tests that need no credentials), the
 control-plane mutation layer (#8: the daemon mediates plan `apply` — one
 typed, digest-bound, capability-gated plan step per request — with durable
 review-evidence rows, recorded first-real-write approvals, and
-worktree-confined harness execution), and the lifecycle layer (#9:
+worktree-confined harness execution), the lifecycle layer (#9:
 durable recurring non-destructive `hf-schedule/v1` schedules with
 single-flight/coalesced evaluation and cold-boot recovery, fan-out
 admission with host-resource proofs and monorepo-overlap refusal, cleanup
 archive/salvage with byte-verified manifests, a verified system-SSH
-remote transport contract, and retention-bounded backup pruning). The
-daemon never starts/stops Herdr, never mutates external repositories, and
-never stores credentials. No live workflow execution or release behavior
-exists yet, and no real harness session runs from public CI (child #10
-unrouted).
+remote transport contract, and retention-bounded backup pruning), and the
+release-readiness layer (#10: deterministic platform archives with
+SHA-256 checksums, an offline Cargo.lock-derived SPDX SBOM and a
+release-provenance/v1 record; clean-host verification scripts; a measured
+baseline + regression-budget machinery; and the active in-repo
+release/version policy). The daemon never starts/stops Herdr, never
+mutates external repositories, and never stores credentials. No live
+workflow execution or release execution exists yet, and no real harness
+session runs from public CI (release execution and the clean-host matrix
+are human-gated).
 
 ## When to use
 
@@ -121,6 +126,30 @@ to it and never duplicates it:
   rows + invalidation semantics in `src/state.rs`.
 - Acceptance tests: `tests/mutation_engine.rs` (socket-level flows over
   disposable local repositories) — public CI needs no credentials.
+
+## Release readiness (issue #10, link not duplicate)
+
+The release-readiness machinery has one canonical home; this skill links to
+it and never duplicates it:
+
+- Normative contract + version/schema policy + documented command rows:
+  `docs/RELEASING.md` (in-repo machinery active; release EXECUTION
+  human-gated: no promotion/tag/upload/attestation/soak from CI or lanes).
+- Deterministic archive builder + verifier (`scripts/build-archive.py`,
+  `scripts/test-build-archive.py`): platform archives with SHA-256
+  checksums, offline SPDX SBOM from `Cargo.lock`, and the
+  `release-provenance/v1` record binding source ref + binary-reported
+  schema facts (`herdr-fleet --version`).
+- Clean-host verification (`scripts/clean-host-verify.sh`,
+  `scripts/clean-host-probe.py`, `scripts/test-clean-host-probe.py`): the
+  AC2 command rows humans run on fresh macOS/Linux hosts; fixture-level
+  self-tests run the same checks in disposable temp dirs.
+- Baseline machinery + committed table (`scripts/measure-baseline.py`,
+  `docs/contracts/baseline-linux-x86_64.csv`,
+  `docs/contracts/benchmarks.md`): pure-core latency/RSS budgets, opt-in
+  same-host-class checks, never a CI gate.
+- Compatibility probe mapping: `docs/contracts/compatibility.md`
+  ("Capability-probe mapping", issue #10 AC4).
 
 ## Current limitation (CLI read-only; daemon-mediated effects only)
 
