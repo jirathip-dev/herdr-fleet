@@ -1,7 +1,7 @@
 ---
 name: herdr-fleet
-description: "Use when working with or on the herdr-fleet repository or CLI. Read-only core plus shipped adapter-contract library; no live harness runs or mutations."
-version: 1.3.0
+description: "Use when working with or on the herdr-fleet repository or CLI. Read-only CLI core plus daemon-mediated plan/apply mutations; no live harness runs."
+version: 1.4.0
 author: herdr-fleet contributors
 license: Apache-2.0 OR MIT
 platforms: [macos, linux]
@@ -13,16 +13,19 @@ metadata:
 # herdr-fleet
 
 herdr-fleet is a public companion CLI for operating Herdr coding-agent
-fleets. Roadmap slices #3–#7 are merged: a read-only CLI core (#4), a
+fleets. Roadmap slices #3–#8 are merged: a read-only CLI core (#4), a
 daemon foundation with SQLite state and a local socket RPC (#5), the
 deterministic workflow engine with the bundled Doctrine default workflow
-(#6), and the capability-negotiated harness adapters (#7: Hermes, Claude
+(#6), the capability-negotiated harness adapters (#7: Hermes, Claude
 Code, Codex + a declarative generic argv adapter, verified with
-fake-executable contract tests that need no credentials). The daemon never
-starts/stops Herdr, never mutates external repositories, and never stores
-credentials. No live workflow execution, migration, or release behavior
-exists yet, and no real harness session runs from public CI (children #8–#10
-unrouted).
+fake-executable contract tests that need no credentials), and the
+control-plane mutation layer (#8: the daemon mediates plan `apply` — one
+typed, digest-bound, capability-gated plan step per request — with durable
+review-evidence rows, recorded first-real-write approvals, and
+worktree-confined harness execution). The daemon never starts/stops Herdr,
+never mutates external repositories, and never stores credentials. No live
+workflow execution or release behavior exists yet, and no real harness
+session runs from public CI (children #9–#10 unrouted).
 
 ## When to use
 
@@ -99,21 +102,40 @@ this skill links to it and never duplicates it:
   human-gated clean-host smoke documented in `.report-7.md`, never run from
   this repository's CI (AC6/AC7).
 
-## Current limitation (read-only core)
+## Control-plane mutations (issue #8, link not duplicate)
 
-The CLI performs **no fleet mutations**: no spawn, rearm, apply, review,
-plugin, or release effects exist. Do not present the locked-target
-architecture (under `docs/architecture/`) as current behavior — it is the
-approved *target* model from the roadmap umbrella.
+The daemon-mediated mutation layer has one canonical home; this skill links
+to it and never duplicates it:
 
-## Safety direction (future plan/apply)
+- Normative contract: `docs/contracts/spec-plans.md` ("Apply semantics",
+  issue #8) and `docs/contracts/spec-review-evidence.md` (durable evidence
+  rows, m0003/schema v3).
+- Rust implementation: `src/mutation.rs` (`herdr_fleet::mutation` engine +
+  effect registry), `src/daemon.rs` (`plan`/`apply` RPC handlers), durable
+  rows + invalidation semantics in `src/state.rs`.
+- Acceptance tests: `tests/mutation_engine.rs` (socket-level flows over
+  disposable local repositories) — public CI needs no credentials.
 
-The approved target is plan-first: mutations are typed, digest-bound,
-journaled before effect, and exactly read back; production/destructive
-actions require fresh interactive TTY confirmation and can never be
-scheduled. Until that machinery exists, treat any proposal to add mutation
-behavior as out-of-scope for the current read-only core and route it through
-the roadmap.
+## Current limitation (CLI read-only; daemon-mediated effects only)
+
+The CLI performs **no fleet mutations**: no spawn, rearm, review, plugin,
+or release effects exist outside the daemon's `plan`/`apply` RPC, and apply
+executes one capability-gated plan step per request against an authorized
+grant + instance — never unplanned work. The daemon never mutates external
+repositories in this repository's tests (disposable local repositories and
+fakes only). Do not present the locked-target architecture (under
+`docs/architecture/`) as current behavior — it is the approved *target*
+model from the roadmap umbrella.
+
+## Safety direction (plan/apply gates)
+
+Mutations are typed, digest-bound, journaled before effect, exactly read
+back, and revalidated against live grant/instance/epoch state immediately
+before the effect; production/destructive actions require fresh interactive
+TTY confirmation (and recorded first-write approval for real-external
+scopes) and can never be scheduled. Any proposal to add mutation behavior
+outside this machinery is out-of-scope for the read-only core and routes
+through the roadmap.
 
 ## Adapter-example note
 

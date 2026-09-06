@@ -655,7 +655,9 @@ fn closed_method_surface_and_typed_refusals() {
     let (code, _) = rpc_err(&fixture.socket, &fresh_id(2), "apply", None);
     assert!(code.starts_with("refusal."), "apply w/o key: {code}");
 
-    // An apply with a key reaches the handler and is refused (no engine).
+    // An apply with a key reaches the handler; without the full typed
+    // params (plan/grant/instance/observed/topology) it is refused with a
+    // parse-time refusal and never journals a claim (issue #8 apply).
     let (code, _) = rpc_err(
         &fixture.socket,
         &fresh_id(3),
@@ -665,7 +667,7 @@ fn closed_method_surface_and_typed_refusals() {
             string("ik_apply-it-00000001"),
         )])),
     );
-    assert_eq!(code, "refusal.effect.unregistered");
+    assert_eq!(code, "refusal.malformed");
 
     // Unknown methods are never guessed.
     let (code, message) = rpc_err(&fixture.socket, &fresh_id(4), "no.such.method", None);

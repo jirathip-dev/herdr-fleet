@@ -290,6 +290,21 @@ fn extract_config(path: &Path, doc: &Val) -> Result<Config, LoadError> {
             return Err(fail("config.harness must be a table".to_string()));
         };
         for (key, entry) in map {
+            let executable = entry
+                .get("executable")
+                .and_then(Val::as_str)
+                .expect("validated")
+                .to_string();
+            // C1 (issue #8): a bare-name parse guard. Config harness
+            // executables are always bare names resolved through the
+            // allowlisted PATH (the verified absolute identity is spawned);
+            // an absolute path in config is refused so no config can bypass
+            // the resolution witness or name an unverifiable executable.
+            if executable.is_empty() || executable.contains('/') || executable.contains('\\') {
+                return Err(fail(format!(
+                    "config.harness.{key}.executable must be a bare executable name (no path separators); it is resolved through the allowlisted PATH"
+                )));
+            }
             harnesses.push(Harness {
                 key: key.clone(),
                 kind: entry
@@ -297,11 +312,7 @@ fn extract_config(path: &Path, doc: &Val) -> Result<Config, LoadError> {
                     .and_then(Val::as_str)
                     .expect("validated")
                     .to_string(),
-                executable: entry
-                    .get("executable")
-                    .and_then(Val::as_str)
-                    .expect("validated")
-                    .to_string(),
+                executable,
                 env_allow: match entry.get("env_allow") {
                     Some(Val::Arr(items)) => items
                         .iter()

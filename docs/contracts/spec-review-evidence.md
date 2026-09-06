@@ -49,6 +49,15 @@ Normative rules:
 - Evidence records are durable (journaled) so the merge decision is
   auditable after the fact; a merge without a valid, current evidence
   record is refused.
+- Storage (issue #8): the daemon keeps durable evidence rows and recorded
+  first-real-write approval rows in its SQLite state (migration m0003,
+  schema v3). A `review_evidence` apply writes the row under the state
+  lock before the idempotency claim resolves; the merge gate then
+  revalidates every binding (feature head, integration base, workflow
+  hash, policy hash, verdict, named checks) against the live refs — any
+  moved binding refuses with `refusal.evidence.stale`. The row is
+  invalidated when the plan's workflow/policy hash set changes; latest
+  per instance, append-only history is retained.
 
 ## Fixture map
 
