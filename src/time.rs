@@ -52,11 +52,15 @@ pub fn unix_from_rfc3339(text: &str) -> Option<i64> {
 
 /// Current UTC time in RFC3339 seconds-`Z` form.
 pub fn rfc3339_now() -> String {
-    let seconds = SystemTime::now()
+    rfc3339_from_unix(unix_now())
+}
+
+/// Current Unix time in seconds since the epoch.
+pub fn unix_now() -> i64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    rfc3339_from_unix(seconds)
+        .unwrap_or(0)
 }
 
 /// Convert days since 1970-01-01 to a (year, month, day) civil date using

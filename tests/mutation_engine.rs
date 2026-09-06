@@ -700,6 +700,32 @@ impl Scenario {
             ("digest_confirmed", herdr_fleet::value::bool_(true)),
             ("scheduled", herdr_fleet::value::bool_(scheduled)),
             ("production_confirmation", string("tty")),
+            // Issue #9 AC1: fan-out steps (harness_start/prompt) require a
+            // fresh host-resource proof + declared concurrency caps. These
+            // scenarios declare generous caps and a fresh measurement so the
+            // admission gate is satisfied (its refusals are probed in
+            // tests/daemon_lifecycle.rs).
+            (
+                "admission",
+                object(vec![
+                    (
+                        "caps",
+                        object(vec![
+                            ("global", herdr_fleet::value::integer(16)),
+                            ("repository", herdr_fleet::value::integer(8)),
+                            ("harness", herdr_fleet::value::integer(8)),
+                        ]),
+                    ),
+                    ("harness_lanes", herdr_fleet::value::integer(0)),
+                    (
+                        "host_proof",
+                        object(vec![(
+                            "measured_at",
+                            string(&herdr_fleet::time::rfc3339_now()),
+                        )]),
+                    ),
+                ]),
+            ),
         ];
         if let Some(scope) = target_scope {
             flags.push(("target_scope", string(scope)));
