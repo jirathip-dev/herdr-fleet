@@ -1,0 +1,46 @@
+name: Bug report
+description: Report a bug in herdr-fleet. Public repository — never include credentials, tokens, host paths, or private configuration.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. This repository is public: do NOT paste secrets,
+        private host paths, private repository names, or provider/model
+        policy. Security vulnerabilities must go through the private advisory
+        flow in SECURITY.md, not this form.
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Output of `herdr-fleet --version`, or the commit SHA you tested.
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you run, and what did you observe? Public-safe reproduction steps only.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Public-safe logs, screenshots, or notes (no credentials or private paths).

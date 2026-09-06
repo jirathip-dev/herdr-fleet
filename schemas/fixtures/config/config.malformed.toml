@@ -1,0 +1,8 @@
+schema = "hf-config/v1"
+
+[daemon]
+enabled = true
+
+# Unknown top-level table: the v1 document is a closed surface.
+[schedules]
+daily = "09:00"

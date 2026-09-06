@@ -1,0 +1,15 @@
+{
+  "completeness": "partial",
+  "freshness": "stale",
+  "observed_at": "2026-09-06T00:00:00Z",
+  "payload": {
+    "refs": {
+      "staging": "0123456789abcdef0123456789abcdef01234567"
+    }
+  },
+  "schema": "hf-observation/v2",
+  "subject": {
+    "id": "example-org/widgets",
+    "type": "repository"
+  }
+}

@@ -1,0 +1,12 @@
+# CODEOWNERS — herdr-fleet bootstrap
+#
+# This repository intentionally has NO formal code owners during the
+# bootstrap. Trusted fleet PRs are reviewed by an independent exact-head
+# agent whose verdict is recorded as evidence (zero formal GitHub
+# approvals); external contributor PRs additionally require one human
+# maintainer approval. These are documented in docs/WORKFLOW.md.
+#
+# Do not invent usernames/teams here. When the project gains a named
+# maintainer group, replace this comment with real ownership entries.
+
+# Default: no owners (comment-only file).

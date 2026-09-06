@@ -1,0 +1,1 @@
+{"command":"status","data":{"expected_repositories":2,"freshness":"stale","observed_repositories":1,"repository":"example-org/widgets"},"exit_code":3,"kind":"partial","schema":"hf-output/v1"}

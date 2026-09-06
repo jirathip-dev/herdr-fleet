@@ -1,0 +1,2 @@
+{"action":"mutate.merge","at":"2026-09-06T00:00:00Z","epoch":3,"grant_id":"gr_0123456789abcdef","idempotency_key":"ik_apply-20260906-0001","plan_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","recorded_before_mutation":true,"schema":"hf-audit/v1","seq":41,"target":"example-org/widgets:staging<-issues/123"}
+{"action":"read.status","at":"2026-09-06T00:00:00Z","epoch":3,"grant_id":null,"idempotency_key":"ik_read-20260906-0003","plan_hash":null,"recorded_before_mutation":false,"schema":"hf-audit/v1","seq":42,"target":"example-org/widgets"}
