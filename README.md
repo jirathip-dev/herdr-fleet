@@ -183,8 +183,9 @@ fake-executable contract tests on public CI) are implemented on `staging`;
 child #8 (control-plane mutations: daemon-mediated plan `apply`, durable
 review evidence + recorded first-write approvals, granular step kinds,
 grant/instance invalidation on material edits and epoch rotation, and
-worktree-confined harness execution) is implemented on `staging` by PR
-#8. Children #9–#10 are **unrouted** and will each require their own route
+worktree-confined harness execution) is implemented on `staging` (its PR
+is opened by the orchestrator after independent exact-head review).
+Children #9–#10 are **unrouted** and will each require their own route
 grant. No live workflow execution or releases exist yet, and no harness
 session runs from public CI or fork PRs (real harness parity is a
 human-gated clean-host smoke, issue #7 AC6).
