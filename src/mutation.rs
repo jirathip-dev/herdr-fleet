@@ -965,17 +965,20 @@ pub fn check_reviewer_distinct(reviewer: &str, implementer: &str) -> Result<(), 
 }
 
 /// Issue-closure gate (AC7): an issue may close only after the integration
-/// merge and post-merge verification (the instance must have recorded
-/// `post_merge_verify` as its last node and carry passing evidence).
+/// merge and post-merge verification (the instance must have recorded the
+/// plan's `post_merge_verify` step as its last node — `verify_step_id` is
+/// that plan-local step id — and carry passing evidence). One enforcement
+/// point: the daemon apply path calls this same gate.
 pub fn check_issue_closure(
     evidence: Option<&EvidenceView>,
     current_node: &str,
+    verify_step_id: &str,
 ) -> Result<(), MutationError> {
-    if current_node != "post_merge_verify" {
+    if current_node != verify_step_id {
         return Err(MutationError::new(
             code::CLOSURE_PREMATURE,
             format!(
-                "issue closure requires post-merge verification first (instance is at {current_node:?})"
+                "issue closure requires post-merge verification first (instance is at {current_node:?}; verify step is {verify_step_id:?})"
             ),
         ));
     }
@@ -2293,6 +2296,21 @@ mod tests {
     }
 
     #[test]
+    fn revoked_and_invalidated_grants_refuse_with_grant_inactive() {
+        // F2: drive the enforcement branch (grant.status != active) directly.
+        let instance = instance_snapshot();
+        let plan = plan(1);
+        let observed = observed("2026-09-06T00:00:00Z");
+        for status in ["revoked", "invalidated"] {
+            let mut grant = grant_snapshot("2999-01-01T00:00:00Z");
+            grant.status = status.to_string();
+            let err = revalidate_effect(&plan, "merge", &grant, &instance, &observed)
+                .expect_err("non-active grant must refuse");
+            assert_eq!(err.code, code::GRANT_INACTIVE);
+        }
+    }
+
+    #[test]
     fn stale_issue_revision_and_wrong_epoch_refuse() {
         let grant = grant_snapshot("2999-01-01T00:00:00Z");
         let instance = instance_snapshot();
@@ -2521,16 +2539,25 @@ mod tests {
             checks: r#"[{"name":"hosted-ci","status":"passed"}]"#.to_string(),
             created_at: "2026-09-06T00:00:00Z".to_string(),
         };
-        assert!(check_issue_closure(Some(&evidence), "post_merge_verify").is_ok());
+        // Verify-step ids are plan-local (the wire plan names it "v1");
+        // the gate compares the instance node against that exact id.
+        assert!(check_issue_closure(Some(&evidence), "v1", "v1").is_ok());
         assert_eq!(
-            check_issue_closure(Some(&evidence), "merge")
+            check_issue_closure(Some(&evidence), "merge", "v1")
                 .expect_err("premature")
                 .code,
             code::CLOSURE_PREMATURE
         );
         assert_eq!(
-            check_issue_closure(None, "post_merge_verify")
+            check_issue_closure(None, "v1", "v1")
                 .expect_err("no evidence")
+                .code,
+            code::CLOSURE_PREMATURE
+        );
+        // A plan without any post_merge_verify step can never pass.
+        assert_eq!(
+            check_issue_closure(Some(&evidence), "", "v1")
+                .expect_err("no verify reached")
                 .code,
             code::CLOSURE_PREMATURE
         );

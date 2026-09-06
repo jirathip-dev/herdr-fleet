@@ -1137,3 +1137,117 @@ fn dirty_and_unmerged_cleanup_refuses_and_no_direct_push_path_exists() {
     // stays pushable so assert the *local* feature head is intact.
     ck.run(&["rev-parse", "--verify", "issue-123"]);
 }
+
+// ---------------------------------------------------------------------------
+// F1 (AC7): premature issue closure refuses on the LIVE daemon path through
+// the same unit-tested gate (mutation::check_issue_closure) the daemon calls
+// ---------------------------------------------------------------------------
+
+#[test]
+fn premature_issue_close_refuses_closure_premature_over_the_wire() {
+    let scenario = Scenario::new("premature-close", "2999-01-01T00:00:00Z", flow_steps());
+    // The instance has NOT executed the plan's post_merge_verify step
+    // ("v1"); closing immediately must refuse with the typed code.
+    let (code, message) = scenario.apply_err(80, "i1", None, None);
+    assert_eq!(code, "refusal.closure.premature", "{message}");
+    // The lane-flow happy path (close AFTER v1) stays green; this asserts
+    // the same daemon gate also passes once the verify node is achieved.
+    let base = scenario.integration_base();
+    scenario.apply_ok(81, "w1", None, None);
+    scenario.apply_ok(82, "h1", None, None);
+    scenario.apply_ok(83, "p1", None, None);
+    let collected = scenario.apply_ok(84, "o1", None, None);
+    let feature = collected
+        .get("head")
+        .and_then(Val::as_str)
+        .expect("lane head")
+        .to_string();
+    scenario.apply_ok(85, "r1", Some(&feature), Some(&base));
+    scenario.apply_ok(86, "m1", Some(&feature), Some(&base));
+    scenario.apply_ok(87, "v1", Some(&feature), Some(&base));
+    let closed = scenario.apply_ok(88, "i1", Some(&feature), Some(&base));
+    assert_eq!(
+        closed.get("action").and_then(Val::as_str),
+        Some("close"),
+        "issue close must succeed after post-merge verification"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F2 (AC2/C3): a REVOKED grant refuses apply with refusal.grant.inactive on
+// the live daemon path (the enforcement branch revalidate_effect drives)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn revoked_grant_refuses_apply_with_grant_inactive_over_the_wire() {
+    let scenario = Scenario::new("revoked-grant", "2999-01-01T00:00:00Z", flow_steps());
+    // Revoke the seeded route grant through the daemon RPC.
+    let revoked = rpc_ok(
+        &scenario.fixture.socket,
+        &fresh_id(90),
+        "grants.revoke",
+        Some(object(vec![
+            ("grant_id", string(GRANT_ID)),
+            ("idempotency_key", string(&format!("ik_revoke-{:08x}", 90))),
+        ])),
+    );
+    assert_eq!(
+        revoked.get("revoked").and_then(Val::as_bool),
+        Some(true),
+        "grants.revoke must report the revocation"
+    );
+    // Any apply on the revoked grant now refuses at revalidation — before
+    // any effect (an expired grant would say refusal.grant.expired; a
+    // revoked one must say refusal.grant.inactive).
+    let (code, message) = scenario.apply_err(91, "w1", None, None);
+    assert_eq!(code, "refusal.grant.inactive", "{message}");
+    // A subsequent apply of a later step is refused the same way (the
+    // instance cannot advance under a dead grant).
+    let (code2, _) = scenario.apply_err(92, "m1", None, None);
+    assert_eq!(code2, "refusal.grant.inactive");
+}
+
+// ---------------------------------------------------------------------------
+// F3 (AC5): fork/external-contributor PR updates refuse over the wire BEFORE
+// any forge spawn; a trusted same-repo head passes and reaches the forge
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fork_pr_update_requires_maintainer_approval_over_the_wire_and_trusted_head_passes() {
+    let fork = step(
+        "u1",
+        "pr_update",
+        Some(object(vec![
+            ("action", string("create")),
+            ("repo", string("example-org/widgets")),
+            ("head", string("issue-123")),
+            ("base", string("staging")),
+            ("head_repo", string("fork-org/widgets")),
+            ("title", string("fork contribution (synthetic)")),
+        ])),
+    );
+    let trusted = step(
+        "u2",
+        "pr_update",
+        Some(object(vec![
+            ("action", string("create")),
+            ("repo", string("example-org/widgets")),
+            ("head", string("issue-123")),
+            ("base", string("staging")),
+            ("title", string("fleet lane PR (synthetic)")),
+        ])),
+    );
+    let scenario = Scenario::new("fork-pr", "2999-01-01T00:00:00Z", vec![fork, trusted]);
+    // Fork head without maintainer_approval: mechanically refused with the
+    // typed EXTERNAL_APPROVAL code, before the forge adapter can spawn.
+    let (code, message) = scenario.apply_err(95, "u1", None, None);
+    assert_eq!(code, "refusal.policy.external_contributor", "{message}");
+    // The trusted same-repo lane keeps the ordinary path and reaches the
+    // forge (fake gh answers with the deterministic PR number).
+    let created = scenario.apply_ok(96, "u2", None, None);
+    assert_eq!(
+        created.get("number").and_then(Val::as_int),
+        Some(1001),
+        "trusted same-repo PR update must reach the forge adapter"
+    );
+}

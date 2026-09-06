@@ -1189,7 +1189,10 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
                 if closing {
                     // The closure gate keys on the post-merge-verify STEP of
                     // THIS plan (step ids are plan-local slugs; the engine
-                    // persists the achieved step id as current_node).
+                    // persists the achieved step id as current_node). The
+                    // refusal decision itself is the single unit-tested
+                    // gate in mutation.rs (check_issue_closure) — the daemon
+                    // calls it here and nowhere else.
                     let verify_step = plan
                         .doc
                         .get("steps")
@@ -1209,25 +1212,12 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
                                 .to_string(),
                         ));
                     }
-                    if instance_snapshot.current_node != verify_step {
-                        return Err((
-                            "refusal.closure.premature".to_string(),
-                            format!(
-                                "issue closure requires post-merge verification first (instance is at {:?})",
-                                instance_snapshot.current_node
-                            ),
-                        ));
-                    }
-                    match evidence.as_ref() {
-                        Some(view) if view.verdict == "pass" => {}
-                        _ => {
-                            return Err((
-                                "refusal.closure.premature".to_string(),
-                                "issue closure requires passing review evidence after the integration merge"
-                                    .to_string(),
-                            ));
-                        }
-                    }
+                    crate::mutation::check_issue_closure(
+                        evidence.as_ref(),
+                        &instance_snapshot.current_node,
+                        &verify_step,
+                    )
+                    .map_err(|err| (err.code.to_string(), err.message))?;
                 }
             }
             _ => {}
@@ -1462,8 +1452,8 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
             );
         }
     };
-    if effect_status == "succeeded" {
-        let _ = state.advance_instance(
+    if effect_status == "succeeded"
+        && let Err(err) = state.advance_instance(
             &parsed.instance_id,
             &parsed.step,
             0,
@@ -1471,6 +1461,19 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
             false,
             0,
             &time::rfc3339_now(),
+        )
+    {
+        // The effect already landed; a failed node advance must never
+        // silently succeed — journal the drift so the outcome stays
+        // auditable (kind-gates re-derive most drift, but the record
+        // must exist).
+        shared.log.write(
+            "error",
+            "outcome.advance_failed",
+            &format!(
+                "instance {} did not advance to {} after a succeeded {}: {}",
+                parsed.instance_id, parsed.step, action, err.message
+            ),
         );
     }
     let response = resolve_apply_effect(
