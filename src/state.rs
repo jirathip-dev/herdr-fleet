@@ -2543,6 +2543,15 @@ const MIGRATIONS: [(&str, i64, i64); 4] = [
     (M0004_ID, M0004_APPLIES_FROM, M0004_APPLIES_TO),
 ];
 
+/// Ordered migration-chain identifiers (`m0001`..`m0004`), exposed for the
+/// release provenance chain (issue #10): `herdr-fleet --version` prints
+/// them so a release archive's provenance record can bind the exact
+/// state-schema migration chain of the binary it ships.
+pub fn migration_chain_ids() -> &'static [&'static str] {
+    const IDS: [&'static str; MIGRATIONS.len()] = [M0001_ID, M0002_ID, M0003_ID, M0004_ID];
+    &IDS
+}
+
 /// Engine-state columns added to `instances` by m0002 (SQLite ALTER ADD
 /// COLUMN; each statement must carry a default for existing rows).
 const M0002_SQL: &str = "\
