@@ -144,23 +144,21 @@ def checks():
                     sbom_data = json.loads(tar.extractfile(member).read())
         assert sbom_data is not None, "SBOM missing"
         assert sbom_data["spdxVersion"] == "SPDX-2.3"
-        lock_text = open(os.path.join(REPO, "Cargo.lock"), encoding="utf-8").read()
-        packages = {}
-        current = {}
-        for raw in lock_text.splitlines():
-            line = raw.rstrip()
-            if line.startswith("[[package]]"):
-                current = {}
-            elif "=" in line and not line.startswith("["):
-                key, _, value = line.partition("=")
-                current[key.strip()] = value.strip().strip('"')
-            elif line.startswith("[") and current:
-                if current.get("name"):
-                    packages[current["name"]] = current["version"]
-                current = {}
-        sbom_names = {p["name"]: p.get("versionInfo") for p in sbom_data["packages"]}
+        # Reuse the builder's own Cargo.lock parser (single source of truth).
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "hf_build_archive", BUILDER)
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+        lock_text = open(os.path.join(REPO, "Cargo.lock"),
+                         encoding="utf-8").read()
+        packages = {p["name"]: p.get("version", "")
+                    for p in builder.parse_lockfile_packages(lock_text)}
+        sbom_names = {p["name"]: p.get("versionInfo")
+                      for p in sbom_data["packages"]}
         assert "herdr-fleet" in sbom_names and sbom_names["herdr-fleet"] == "0.1.0"
-        # Every dependency in Cargo.lock appears once with its version.
+        # Every dependency in Cargo.lock appears once with its version (the
+        # root package covers Cargo.lock's own root entry when present).
         for name, version in packages.items():
             assert sbom_names.get(name) == version, (
                 f"SBOM must mirror Cargo.lock for {name}@{version}")
