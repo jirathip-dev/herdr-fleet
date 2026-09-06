@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -919,10 +919,15 @@ fn spawned_identity_is_the_resolved_absolute_path_witness() {
         PathBuf::from(transcript).is_absolute(),
         "spawned identity must be absolute: {transcript}"
     );
+    // Compare canonical forms on BOTH sides: on macOS the temp dir is
+    // reached through a symlink (/var/folders -> /private/var/folders),
+    // so the spawned argv[0] literal and the canonicalized expectation
+    // must not be compared byte-wise across that boundary.
     let canonical_fake = fs::canonicalize(&fake).expect("canonical fake");
+    let spawned =
+        fs::canonicalize(Path::new(transcript)).unwrap_or_else(|_| PathBuf::from(transcript));
     assert_eq!(
-        transcript,
-        canonical_fake.to_string_lossy(),
+        spawned, canonical_fake,
         "the spawned $0 must equal the resolved absolute executable"
     );
 }
@@ -956,6 +961,14 @@ fn harness_prompt_runs_confined_to_the_assigned_worktree() {
     let worktree = base.join(format!("hf-adapters-wt-{}", std::process::id()));
     let _ = fs::remove_dir_all(&worktree);
     fs::create_dir_all(&worktree).expect("worktree dir");
+    // Capture the canonical expectation WHILE the directory exists: on
+    // macOS the temp dir is reached through a symlink (/var/folders ->
+    // /private/var/folders) and a child's getcwd/pwd reports the canonical
+    // form, while the assigned (spawn) path may be the non-canonical one.
+    // The directory is removed below before the transcript is compared, so
+    // canonicalization after the run would fall back to the raw literal and
+    // byte-compare two different spellings of the same directory.
+    let expected_cwd = fs::canonicalize(&worktree).unwrap_or_else(|_| worktree.clone());
 
     let result = herdr_fleet::adapters::execute_op_in_worktree(
         &profile,
@@ -977,10 +990,8 @@ fn harness_prompt_runs_confined_to_the_assigned_worktree() {
         .and_then(Val::as_str)
         .expect("transcript");
     assert_eq!(
-        transcript.trim(),
-        fs::canonicalize(&worktree)
-            .unwrap_or_else(|_| worktree.clone())
-            .to_string_lossy(),
+        PathBuf::from(transcript.trim()),
+        expected_cwd,
         "harness child must run inside the assigned worktree"
     );
 }
