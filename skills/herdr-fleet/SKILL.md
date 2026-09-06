@@ -1,7 +1,7 @@
 ---
 name: herdr-fleet
-description: "Use when working with or on the herdr-fleet repository or CLI. Read-only core: config, doctor, status, plan; no mutations."
-version: 1.2.0
+description: "Use when working with or on the herdr-fleet repository or CLI. Read-only core plus shipped adapter-contract library; no live harness runs or mutations."
+version: 1.3.0
 author: herdr-fleet contributors
 license: Apache-2.0 OR MIT
 platforms: [macos, linux]
@@ -13,12 +13,15 @@ metadata:
 # herdr-fleet
 
 herdr-fleet is a public companion CLI for operating Herdr coding-agent
-fleets. Roadmap slices #3–#6 are merged: a read-only CLI core (#4), a
-daemon foundation with SQLite state and a local socket RPC (#5), and the
+fleets. Roadmap slices #3–#7 are merged: a read-only CLI core (#4), a
+daemon foundation with SQLite state and a local socket RPC (#5), the
 deterministic workflow engine with the bundled Doctrine default workflow
-(#6). The daemon never starts/stops Herdr, never mutates external
-repositories, and never stores credentials. No adapters, live workflow
-execution, migration, or release behavior exists yet (children #7–#10
+(#6), and the capability-negotiated harness adapters (#7: Hermes, Claude
+Code, Codex + a declarative generic argv adapter, verified with
+fake-executable contract tests that need no credentials). The daemon never
+starts/stops Herdr, never mutates external repositories, and never stores
+credentials. No live workflow execution, migration, or release behavior
+exists yet, and no real harness session runs from public CI (children #8–#10
 unrouted).
 
 ## When to use
@@ -78,6 +81,23 @@ duplicates it:
 - The public skill uses this workflow's model-agnostic default roles
   (orchestrator/implementer/reviewer); workflow content can never carry
   policy, capabilities, target, or approval authority.
+
+## Harness adapters (issue #7, link not duplicate)
+
+The harness adapter contract has one canonical home in this repository;
+this skill links to it and never duplicates it:
+
+- Normative contract: `docs/contracts/spec-capabilities.md` ("Adapter
+  contract", issue #7) — closed operation set, typed refusal codes,
+  identity-triple rule, fake-adapter doctrine.
+- Declared version ranges and measured version facts:
+  `docs/contracts/compatibility.md` (Hermes Agent / Claude Code / Codex
+  rows, 2026-09-06).
+- Rust implementation: `src/adapters.rs` (`herdr_fleet::adapters`); contract
+  tests with fake executables: `tests/harness_adapters.rs` — public CI and
+  fork PRs need no harness credentials. Real harness parity is a
+  human-gated clean-host smoke documented in `.report-7.md`, never run from
+  this repository's CI (AC6/AC7).
 
 ## Current limitation (read-only core)
 
