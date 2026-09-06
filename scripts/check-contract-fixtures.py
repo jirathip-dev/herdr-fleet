@@ -89,7 +89,7 @@ WORKFLOW_NODE_KINDS = frozenset(
 RPC_METHODS = frozenset(
     {"capabilities", "doctor", "status", "plan", "apply", "grants.list",
      "grants.revoke", "schedules.list", "state.epoch", "backup.create",
-     "restore.begin", "journal.tail"}
+     "restore.begin", "journal.tail", "events.subscribe"}
 )
 EVENT_KINDS = frozenset(
     {"state.snapshot", "agent.updated", "plan.updated", "grant.updated",

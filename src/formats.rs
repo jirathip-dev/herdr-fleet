@@ -109,6 +109,51 @@ pub fn is_plan_id(text: &str) -> bool {
         && is_lower_hex(&text[PREFIX.len()..], 16)
 }
 
+/// Daemon request id: 8-64 lowercase hex (`^[a-f0-9]{8,64}$`).
+pub fn is_request_id(text: &str) -> bool {
+    (8..=64).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Idempotency key: `ik_` + 8-64 `[a-z0-9-]`.
+pub fn is_idempotency_key(text: &str) -> bool {
+    const PREFIX: &str = "ik_";
+    let body = text.strip_prefix(PREFIX).unwrap_or_default();
+    (8..=64).contains(&body.len())
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Grant id: `gr_` + 16 lowercase hex.
+pub fn is_grant_id(text: &str) -> bool {
+    const PREFIX: &str = "gr_";
+    text.len() == PREFIX.len() + 16
+        && text.starts_with(PREFIX)
+        && is_lower_hex(&text[PREFIX.len()..], 16)
+}
+
+/// Migration id: `mNNNN_<snake>` (`^m[0-9]{4}_[a-z0-9_]+$`).
+pub fn is_migration_id(text: &str) -> bool {
+    let body = text.strip_prefix('m').unwrap_or_default();
+    let Some((digits, snake)) = body.split_once('_') else {
+        return false;
+    };
+    digits.len() == 4
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && !snake.is_empty()
+        && snake
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Audit action code: `^[a-z][a-z0-9_.-]*$` (same grammar as error codes).
+pub fn is_action_code(text: &str) -> bool {
+    is_error_code(text)
+}
+
 /// Parse a semantic version `major.minor.patch` (numeric fields only).
 pub fn parse_semver(text: &str) -> Option<(u64, u64, u64)> {
     let mut parts = text.split('.');
@@ -175,6 +220,48 @@ mod tests {
         assert!(is_error_code("config.invalid"));
         assert!(is_error_code("refusal.stale_state"));
         assert!(!is_error_code("Config.invalid"));
+    }
+
+    #[test]
+    fn daemon_wire_format_rules() {
+        assert!(is_request_id("0".repeat(8).as_str()));
+        assert!(is_request_id("abcdef".repeat(8).as_str()));
+        assert!(!is_request_id("0".repeat(7).as_str()), "min 8 hex");
+        assert!(!is_request_id("0".repeat(65).as_str()), "max 64 hex");
+        assert!(
+            !is_request_id("ABCDEF0123456789".to_string().as_str()),
+            "lowercase hex only"
+        );
+        assert!(!is_request_id("not-hex-0123456789"));
+
+        assert!(is_idempotency_key("ik_apply-20260906-0001"));
+        assert!(is_idempotency_key(&format!("ik_{}", "a".repeat(8))));
+        assert!(!is_idempotency_key("ik_short"));
+        assert!(
+            !is_idempotency_key("apply-20260906-0001"),
+            "ik_ prefix required"
+        );
+        assert!(
+            !is_idempotency_key("ik_APPLY-20260906-0001"),
+            "lowercase only"
+        );
+
+        assert!(is_grant_id("gr_0123456789abcdef"));
+        assert!(!is_grant_id("gr_0123456789abcde"), "15 hex");
+        assert!(!is_grant_id("gr_0123456789ABCDEF"), "lowercase only");
+        assert!(!is_grant_id("0123456789abcdef"));
+
+        assert!(is_migration_id("m0001_create_state_v1"));
+        assert!(is_migration_id("m0042_a_b_c"));
+        assert!(!is_migration_id("m001_create_state_v1"), "4 digits");
+        assert!(!is_migration_id("m0001-odd"), "snake body only");
+        assert!(!is_migration_id("x0001_create_state_v1"));
+
+        assert!(is_action_code("mutate.merge"));
+        assert!(is_action_code("read.status"));
+        assert!(is_action_code("a1_b-c.d"));
+        assert!(!is_action_code("Mutate.merge"));
+        assert!(!is_action_code(""));
     }
 
     #[test]

@@ -84,6 +84,17 @@ fail with rustup/cargo's own actionable errors.
   raw-text hash), untrusted input (hostile config paths, issue text with
   secret-shaped tokens) never breaking argv or JSON framing, and exit codes
   matching envelope `exit_code` fields.
+- `tests/daemon_rpc.rs` (issue #5) — spawns the real daemon binary over a
+  fixture Unix socket: single-writer refusal, stale-socket recovery, socket
+  perms + symlink containment, RPC status/capabilities, crash-boundary
+  restart/reconcile (AC4), fail-closed readonly state dir (AC5), restore
+  epoch rotation + spent-claim semantics (AC6), event subscribe
+  snapshot/replay/resnapshot/backpressure (AC7).
+- `tests/service_plans.rs` (issue #5) — `service doctor|install-plan|
+  status-plan|uninstall-plan` on fixture XDG homes; asserts plans never
+  activate the host service manager.
+- `tests/no_network_surface.rs` (issue #5) — static scan proving the daemon
+  slice adds no TCP/UDP/telemetry/auto-update surface.
 - `scripts/test-check-public-tree.py` — self-tests for the privacy scanner;
   each test builds a temporary git repo proving a rule bites (or that a
   clean fixture passes).

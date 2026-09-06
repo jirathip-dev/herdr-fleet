@@ -68,7 +68,31 @@ impl Val {
     /// Borrow this value as a string, if it is one.
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Val::Str(s) => Some(s),
+            Val::Str(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// This value as a bool (only the boolean variant).
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Val::Bool(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// This value as an i64 (only the integer variant).
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Val::Int(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// This value as an array (only the array variant).
+    pub fn as_array(&self) -> Option<&Vec<Val>> {
+        match self {
+            Val::Arr(items) => Some(items),
             _ => None,
         }
     }
@@ -119,6 +143,11 @@ pub fn integer(value: i64) -> Val {
 /// Build a null value.
 pub fn null() -> Val {
     Val::Null
+}
+
+/// An empty object value (for ok results that carry no data).
+pub fn object_empty() -> Val {
+    object(vec![])
 }
 
 struct Parser<'a> {
