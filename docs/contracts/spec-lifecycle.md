@@ -1,7 +1,8 @@
 # Spec: lifecycle semantics — schedules, admission, cleanup archive, remote transport, cold-boot recovery
 
 Refs #9 (lifecycle slice). Family: `hf-schedule/v1` (fixtures under
-[`schedule/`](../../schemas/fixtures/schedule/)). Rust: `src/lifecycle.rs`,
+[`schedule/schedule.valid.json`](../../schemas/fixtures/schedule/schedule.valid.json)).
+Rust: `src/lifecycle.rs`,
 `src/remote.rs`, state migration `m0004_schedules_lifecycle_v4`.
 Wire probes: `tests/daemon_lifecycle.rs`, cleanup probes in
 `tests/mutation_engine.rs`; pure probes in `src/lifecycle.rs` and
