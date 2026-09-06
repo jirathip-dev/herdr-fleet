@@ -24,6 +24,7 @@ pub mod observe;
 pub mod plan;
 pub mod process;
 pub mod redact;
+pub mod remote;
 pub mod schema;
 pub mod service;
 pub mod state;

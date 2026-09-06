@@ -23,7 +23,13 @@ pub fn unix_from_rfc3339(text: &str) -> Option<i64> {
         return None;
     }
     let bytes = text.as_bytes();
-    for (index, expected) in [(4usize, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')] {
+    for (index, expected) in [
+        (4usize, b'-'),
+        (7, b'-'),
+        (10, b'T'),
+        (13, b':'),
+        (16, b':'),
+    ] {
         if bytes.get(index) != Some(&expected) {
             return None;
         }

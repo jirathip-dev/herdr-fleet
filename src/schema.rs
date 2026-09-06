@@ -1641,10 +1641,7 @@ fn validate_schedule(obj: &Val) -> Verdict {
     match obj.get("repository") {
         Some(Val::Str(text)) if is_repository_identity(text) => {}
         _ => {
-            return Verdict::refuse(
-                Refusal::Malformed,
-                "schedule.repository must be owner/name",
-            );
+            return Verdict::refuse(Refusal::Malformed, "schedule.repository must be owner/name");
         }
     }
     if let Some(issue) = obj.get("issue")

@@ -26,8 +26,12 @@
 //!   parks the schedule in an explicit terminal paused state with a
 //!   journaled reason — no retry storm. Resume is an explicit human RPC.
 
+use std::path::{Path, PathBuf};
+
+use crate::canonical::{canonical_bytes, sha256_hex};
 use crate::state::{ScheduleRow, State, StateError};
 use crate::time;
+use crate::value::{Val, integer, object, string};
 
 /// Freshness bound for host-resource proof (seconds). Older measurements
 /// are stale and refuse new fan-out (AC1: stale measurements refuse work).
@@ -168,7 +172,11 @@ pub fn decide_schedule(
     }
     let doc = match parse_doc_val(&row.doc) {
         Some(doc) => doc,
-        None => return EvalVerdict::Paused { reason: "doc_invalid" },
+        None => {
+            return EvalVerdict::Paused {
+                reason: "doc_invalid",
+            };
+        }
     };
     let get = |key: &str| -> Option<&str> { doc.get(key).and_then(crate::value::Val::as_str) };
     // Expiry: an expired schedule parks itself (explicit terminal state).
@@ -200,10 +208,7 @@ pub fn decide_schedule(
             };
         }
     }
-    let window = row
-        .next_run_at
-        .as_deref()
-        .and_then(time::unix_from_rfc3339);
+    let window = row.next_run_at.as_deref().and_then(time::unix_from_rfc3339);
     if !window_due(window, now_unix) {
         return EvalVerdict::Idle;
     }
@@ -269,11 +274,14 @@ pub fn reconcile_schedules(
 ) -> Result<ScheduleSummary, StateError> {
     let rows = state.list_schedule_rows()?;
     let mut summary = ScheduleSummary::default();
-    let now_text = time::rfc3339_from_unix(now_unix);
     for row in rows {
         match decide_schedule(&row, now_unix, attest) {
             EvalVerdict::Ran { next } => {
-                match state.complete_schedule_run(&row.schedule_id, Some(&next), &now_text) {
+                match state.complete_schedule_run(
+                    &row.schedule_id,
+                    Some(&next),
+                    &time::rfc3339_now(),
+                ) {
                     Ok(_) => summary.ran.push(row.schedule_id),
                     Err(err) => summary
                         .failed
@@ -281,7 +289,11 @@ pub fn reconcile_schedules(
                 }
             }
             EvalVerdict::Paused { reason } => {
-                match state.pause_schedule_with_reason(&row.schedule_id, reason, &now_text) {
+                match state.pause_schedule_with_reason(
+                    &row.schedule_id,
+                    reason,
+                    &time::rfc3339_now(),
+                ) {
                     Ok(_) => summary.paused.push((row.schedule_id, reason.to_string())),
                     Err(err) => summary
                         .failed
@@ -292,6 +304,32 @@ pub fn reconcile_schedules(
         }
     }
     Ok(summary)
+}
+
+/// Evaluate ONE schedule at `now_unix` (the `schedules.evaluate` RPC with a
+/// schedule_id filter). Mirrors [`reconcile_schedules`] for a single row.
+pub fn reconcile_schedule(
+    state: &State,
+    schedule_id: &str,
+    now_unix: i64,
+    attest: Option<&ScheduleAttest<'_>>,
+) -> Result<Option<ScheduleSummary>, StateError> {
+    let Some(row) = state.schedule_by_id(schedule_id)? else {
+        return Ok(None);
+    };
+    let mut summary = ScheduleSummary::default();
+    match decide_schedule(&row, now_unix, attest) {
+        EvalVerdict::Ran { next } => {
+            state.complete_schedule_run(&row.schedule_id, Some(&next), &time::rfc3339_now())?;
+            summary.ran.push(row.schedule_id);
+        }
+        EvalVerdict::Paused { reason } => {
+            state.pause_schedule_with_reason(&row.schedule_id, reason, &time::rfc3339_now())?;
+            summary.paused.push((row.schedule_id, reason.to_string()));
+        }
+        EvalVerdict::Idle => summary.idle.push(row.schedule_id),
+    }
+    Ok(Some(summary))
 }
 
 // ---------------------------------------------------------------------------
@@ -420,9 +458,7 @@ pub fn check_fanout_admission(
     // overlap declared scope paths. The proposed lane is not counted
     // against itself (the caller excludes its own footprint).
     for lane in running {
-        if lane.repository == proposed.repository
-            && paths_overlap(&proposed.scope, &lane.scope)
-        {
+        if lane.repository == proposed.repository && paths_overlap(&proposed.scope, &lane.scope) {
             return Err(LifecycleError::new(
                 code::MONOREPO_OVERLAP,
                 format!(
@@ -431,6 +467,186 @@ pub fn check_fanout_admission(
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem safety: canonical target classification + archive/salvage
+// ---------------------------------------------------------------------------
+
+/// One archived file entry (relative path + sha256 + byte size).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveEntry {
+    /// Path relative to the archived root (forward-slash joined).
+    pub path: String,
+    /// sha256 hex of the file bytes.
+    pub sha256: String,
+    /// File size in bytes.
+    pub bytes: u64,
+}
+
+/// The result of archiving one tree (issue #9 AC7): every archived file is
+/// checksummed, the manifest itself is canonical JSON, and
+/// `manifest_sha256` pins the manifest bytes so archived content can be
+/// verified byte-for-byte later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveManifest {
+    /// Absolute destination directory holding the archived tree + manifest.
+    pub archive_dir: String,
+    /// Files archived (sorted by relative path).
+    pub entries: Vec<ArchiveEntry>,
+    /// Total bytes archived.
+    pub total_bytes: u64,
+    /// sha256 over the canonical manifest document.
+    pub manifest_sha256: String,
+}
+
+/// A filesystem-safety refusal/error (issue #9 AC7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveError {
+    /// Stable code (`refusal.cleanup.symlink`, `effect.archive.failed`).
+    pub code: &'static str,
+    /// Human message.
+    pub message: String,
+}
+
+/// Archive error codes (stable, typed).
+pub mod archive_code {
+    /// A symlink was found where real content is required; symlinks are
+    /// never followed or removed (canonical target classification).
+    pub const SYMLINK: &str = "refusal.cleanup.symlink";
+    /// The archive operation failed (I/O, path escape).
+    pub const FAILED: &str = "effect.archive.failed";
+}
+
+/// Copy `src` into a NEW directory `dest` (created here), excluding the
+/// git internals (`.git`), refusing every symlink, and checksumming every
+/// file. `dest` must not exist yet. Returns the manifest; on any symlink or
+/// I/O failure the partially written destination is removed and an error
+/// returned (no half-archives survive).
+pub fn archive_tree(src: &Path, dest: &Path) -> Result<ArchiveManifest, ArchiveError> {
+    if dest.exists() {
+        return Err(ArchiveError {
+            code: archive_code::FAILED,
+            message: format!("archive destination {} already exists", dest.display()),
+        });
+    }
+    std::fs::create_dir_all(dest).map_err(|err| ArchiveError {
+        code: archive_code::FAILED,
+        message: format!("create {}: {err}", dest.display()),
+    })?;
+    let mut entries = Vec::new();
+    let mut total_bytes: u64 = 0;
+    let walk_result = archive_walk(src, dest, &mut entries, &mut total_bytes);
+    if let Err(err) = walk_result {
+        let _ = std::fs::remove_dir_all(dest);
+        return Err(err);
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let entries_val: Vec<Val> = entries
+        .iter()
+        .map(|entry| {
+            object(vec![
+                ("path", string(&entry.path)),
+                ("sha256", string(&entry.sha256)),
+                ("bytes", integer(entry.bytes as i64)),
+            ])
+        })
+        .collect();
+    let manifest_doc = object(vec![
+        ("schema", string("hf-archive/v1")),
+        ("source_entries", integer(entries.len() as i64)),
+        ("total_bytes", integer(total_bytes as i64)),
+        ("entries", Val::Arr(entries_val)),
+    ]);
+    let manifest_bytes = canonical_bytes(&manifest_doc);
+    let manifest_sha256 = sha256_hex(&manifest_bytes);
+    let manifest_path = dest.join("manifest.json");
+    std::fs::write(&manifest_path, &manifest_bytes).map_err(|err| ArchiveError {
+        code: archive_code::FAILED,
+        message: format!("write manifest: {err}"),
+    })?;
+    Ok(ArchiveManifest {
+        archive_dir: dest.to_string_lossy().into_owned(),
+        entries,
+        total_bytes,
+        manifest_sha256,
+    })
+}
+
+/// Recursive walk copying files (git internals excluded, symlinks refused).
+fn archive_walk(
+    src: &Path,
+    dest: &Path,
+    entries: &mut Vec<ArchiveEntry>,
+    total_bytes: &mut u64,
+) -> Result<(), ArchiveError> {
+    let mut stack: Vec<(PathBuf, String)> = vec![(src.to_path_buf(), String::new())];
+    while let Some((dir, rel)) = stack.pop() {
+        let read = std::fs::read_dir(&dir).map_err(|err| ArchiveError {
+            code: archive_code::FAILED,
+            message: format!("read {}: {err}", dir.display()),
+        })?;
+        let mut children: Vec<(PathBuf, String)> = Vec::new();
+        for entry in read {
+            let entry = entry.map_err(|err| ArchiveError {
+                code: archive_code::FAILED,
+                message: format!("read dir entry: {err}"),
+            })?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == ".git" {
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(&path).map_err(|err| ArchiveError {
+                code: archive_code::FAILED,
+                message: format!("metadata {}: {err}", path.display()),
+            })?;
+            if meta.file_type().is_symlink() {
+                return Err(ArchiveError {
+                    code: archive_code::SYMLINK,
+                    message: format!(
+                        "archive refuses symlink {} (canonical target classification)",
+                        path.display()
+                    ),
+                });
+            }
+            let child_rel = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            if meta.is_dir() {
+                children.push((path, child_rel));
+            } else {
+                let dest_file = dest.join(&child_rel);
+                if let Some(parent) = dest_file.parent() {
+                    std::fs::create_dir_all(parent).map_err(|err| ArchiveError {
+                        code: archive_code::FAILED,
+                        message: format!("create {}: {err}", parent.display()),
+                    })?;
+                }
+                let bytes = std::fs::read(&path).map_err(|err| ArchiveError {
+                    code: archive_code::FAILED,
+                    message: format!("read {}: {err}", path.display()),
+                })?;
+                std::fs::write(&dest_file, &bytes).map_err(|err| ArchiveError {
+                    code: archive_code::FAILED,
+                    message: format!("write {}: {err}", dest_file.display()),
+                })?;
+                entries.push(ArchiveEntry {
+                    sha256: sha256_hex(&bytes),
+                    path: child_rel.clone(),
+                    bytes: bytes.len() as u64,
+                });
+                *total_bytes += bytes.len() as u64;
+            }
+        }
+        // Re-push directories in deterministic (reversed-name) order so the
+        // walk order is stable; entries are sorted afterwards anyway.
+        children.sort_by(|a, b| b.0.cmp(&a.0));
+        stack.extend(children);
     }
     Ok(())
 }
@@ -503,7 +719,10 @@ mod tests {
         // Exactly on the first window: fires, next = anchor + 300.
         assert_eq!(next_window_unix(anchor, 300, anchor), Some(anchor + 300));
         // Mid-window: next boundary is the one after now.
-        assert_eq!(next_window_unix(anchor, 300, anchor + 10), Some(anchor + 300));
+        assert_eq!(
+            next_window_unix(anchor, 300, anchor + 10),
+            Some(anchor + 300)
+        );
         // Sleep: many windows passed (06:00), next = boundary after now.
         let late = anchor + 6 * 3600 + 42;
         assert_eq!(
@@ -721,7 +940,10 @@ mod tests {
         assert_eq!(summary.ran.len(), 0);
         assert_eq!(summary.paused.len(), 0);
         let after = state.schedule_by_id(id).expect("row").expect("present");
-        assert!(!after.enabled, "reconcile must never enable a paused schedule");
+        assert!(
+            !after.enabled,
+            "reconcile must never enable a paused schedule"
+        );
         let _ = std::fs::remove_file(&db);
     }
 
@@ -747,10 +969,12 @@ mod tests {
         // A first reconcile fires the live schedule once.
         let first = reconcile_schedules(&state, anchor_secs() + 3600, None).expect("reconcile");
         assert_eq!(first.ran, vec![live_id.to_string()]);
-        assert!(first
-            .paused
-            .iter()
-            .any(|(id, reason)| id == dead_id && reason == "expired"));
+        assert!(
+            first
+                .paused
+                .iter()
+                .any(|(id, reason)| id == dead_id && reason == "expired")
+        );
         // A second reconcile in the same tick is a no-op (single-flight).
         let second = reconcile_schedules(&state, anchor_secs() + 3600, None).expect("reconcile");
         assert!(second.ran.is_empty());
@@ -778,10 +1002,19 @@ mod tests {
 
     #[test]
     fn scope_overlap_is_component_wise() {
-        assert!(paths_overlap("worktrees/issues/123", "worktrees/issues/123"));
-        assert!(paths_overlap("worktrees/issues/123", "worktrees/issues/123/extra"));
+        assert!(paths_overlap(
+            "worktrees/issues/123",
+            "worktrees/issues/123"
+        ));
+        assert!(paths_overlap(
+            "worktrees/issues/123",
+            "worktrees/issues/123/extra"
+        ));
         assert!(!paths_overlap("worktrees/issues/1", "worktrees/issues/123"));
-        assert!(!paths_overlap("worktrees/issues/123", "worktrees/issues/456"));
+        assert!(!paths_overlap(
+            "worktrees/issues/123",
+            "worktrees/issues/456"
+        ));
     }
 
     #[test]
@@ -837,7 +1070,11 @@ mod tests {
         assert_eq!(
             check_fanout_admission(
                 &proposed,
-                &[lane("example-org/widgets", "other-harness", "worktrees/issues/1")],
+                &[lane(
+                    "example-org/widgets",
+                    "other-harness",
+                    "worktrees/issues/1"
+                )],
                 &caps,
                 Some(HostProof {
                     measured_at_unix: now
@@ -909,5 +1146,68 @@ mod tests {
             now,
         )
         .expect("cross-repository scopes admitted");
+    }
+
+    // -----------------------------------------------------------------
+    // Archive / salvage (filesystem safety, AC7)
+    // -----------------------------------------------------------------
+
+    fn sandbox_dir(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("hf-lc-archive-{}", std::process::id()));
+        let dir = base.join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("sandbox");
+        dir
+    }
+
+    #[test]
+    fn archived_bytes_and_manifest_match_the_source() {
+        let dir = sandbox_dir("bytes");
+        let src = dir.join("lane");
+        std::fs::create_dir_all(src.join("sub")).expect("dirs");
+        std::fs::write(src.join("a.txt"), "alpha content\n").expect("a");
+        std::fs::write(src.join("sub/b.bin"), [0u8, 1, 2, 250, 251, 252]).expect("b");
+        std::fs::create_dir_all(src.join(".git")).expect("git dir");
+        std::fs::write(src.join(".git/config"), "git internals never archived").expect("git file");
+        let dest = dir.join("archive-out");
+
+        let manifest = archive_tree(&src, &dest).expect("archive");
+        // Byte-for-byte: every archived file matches the source and the
+        // manifest's own sha256, and the git internals were excluded.
+        assert_eq!(manifest.entries.len(), 2);
+        assert_eq!(manifest.total_bytes, 14 + 6);
+        for entry in &manifest.entries {
+            let source_bytes = std::fs::read(src.join(&entry.path)).expect("read source");
+            let dest_bytes = std::fs::read(dest.join(&entry.path)).expect("read dest");
+            assert_eq!(source_bytes, dest_bytes, "{} bytes match", entry.path);
+            assert_eq!(crate::canonical::sha256_hex(&source_bytes), entry.sha256);
+        }
+        assert!(!dest.join(".git").exists(), "git internals excluded");
+        // The manifest file exists and its digest pins the manifest bytes.
+        let manifest_bytes = std::fs::read(dest.join("manifest.json")).expect("manifest file");
+        assert_eq!(
+            crate::canonical::sha256_hex(&manifest_bytes),
+            manifest.manifest_sha256
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_refuses_symlinks_and_fails_closed() {
+        let dir = sandbox_dir("symlink");
+        let src = dir.join("lane");
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::write(src.join("real.txt"), "real").expect("real");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("outside.txt"), src.join("link.txt"))
+                .expect("symlink");
+        }
+        let dest = dir.join("archive-out");
+        let err = archive_tree(&src, &dest).expect_err("symlink must refuse");
+        assert_eq!(err.code, archive_code::SYMLINK);
+        // Fail closed: no half-archive survives.
+        assert!(!dest.exists(), "partial archive removed on failure");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

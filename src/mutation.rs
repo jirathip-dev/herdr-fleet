@@ -112,6 +112,11 @@ pub mod code {
     pub const CLEANUP_UNMERGED: &str = "refusal.cleanup.unmerged";
     /// Cleanup refused an unknown/absent target.
     pub const CLEANUP_UNKNOWN: &str = "refusal.cleanup.unknown";
+    /// Cleanup refused a symlink target (issue #9 AC7: canonical target
+    /// classification — symlinks are never followed or removed).
+    pub const CLEANUP_SYMLINK: &str = "refusal.cleanup.symlink";
+    /// An archive/salvage operation failed (issue #9 AC7).
+    pub const ARCHIVE_FAILED: &str = "effect.archive.failed";
     /// The integration merge is not fast-forwardable (base moved).
     pub const MERGE_NOT_FF: &str = "effect.merge.not_fast_forward";
     /// The integration merge failed (git-level).
@@ -1069,6 +1074,9 @@ pub struct EffectContext<'a> {
     pub observed_integration_base: Option<&'a str>,
     /// Allowlisted environment for children.
     pub env: &'a BTreeMap<String, String>,
+    /// Daemon-owned archive/salvage root (issue #9 AC7; archive cleanup
+    /// steps require it).
+    pub archive_root: Option<&'a Path>,
 }
 
 /// Outcome for a refused effect (preconditions are checked by the daemon
@@ -1960,6 +1968,23 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(path) => path,
         Err(err) => return refusal(err.code, err.message),
     };
+    // Issue #9 AC7 canonical target classification: a symlinked cleanup
+    // target is refused before anything else (symlinks are never followed,
+    // and git worktree removal of a symlinked path would touch the wrong
+    // directory). The raw join is checked because contained_path
+    // canonicalizes symlinks away.
+    let raw_target = ctx.worktrees_root.join(relative);
+    if let Ok(meta) = std::fs::symlink_metadata(&raw_target)
+        && meta.file_type().is_symlink()
+    {
+        return refusal(
+            code::CLEANUP_SYMLINK,
+            format!(
+                "cleanup target {} is a symlink; symlinked targets are refused",
+                raw_target.display()
+            ),
+        );
+    }
     let branch = match param_str(ctx.params, "branch") {
         Ok(value) if is_slug(value) => value.to_string(),
         _ => return refusal(code::BAD_PARAMS, "cleanup requires a slug branch"),
@@ -1976,6 +2001,49 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
         Err(outcome) => return outcome,
     };
     if !status.trim().is_empty() {
+        // Dirty work can never be deleted (AC7). With `archive: true` the
+        // effect instead PRESERVES the exact bytes into the daemon-owned
+        // archive root with a checksummed manifest and reports them — the
+        // target itself is left in place (removed stays false).
+        if param_bool(ctx.params, "archive") {
+            let Some(root) = ctx.archive_root else {
+                return refusal(
+                    code::BAD_PARAMS,
+                    "cleanup archive requires topology.archive_root (daemon-owned)",
+                );
+            };
+            let dest = root.join(format!("lane-{branch}-{}", crate::time::unix_now()));
+            let manifest = match crate::lifecycle::archive_tree(&worktree, &dest) {
+                Ok(manifest) => manifest,
+                Err(err) => return failed(err.code, err.message),
+            };
+            let entries: Vec<Val> = manifest
+                .entries
+                .iter()
+                .map(|entry| {
+                    object(vec![
+                        ("path", string(&entry.path)),
+                        ("sha256", string(&entry.sha256)),
+                        ("bytes", integer(entry.bytes as i64)),
+                    ])
+                })
+                .collect();
+            return ok(object(vec![
+                ("worktree", string(&worktree.to_string_lossy())),
+                ("branch", string(&branch)),
+                ("removed", bool_(false)),
+                (
+                    "archived",
+                    object(vec![
+                        ("archive_dir", string(&manifest.archive_dir)),
+                        ("entries", integer(manifest.entries.len() as i64)),
+                        ("total_bytes", integer(manifest.total_bytes as i64)),
+                        ("manifest_sha256", string(&manifest.manifest_sha256)),
+                        ("files", Val::Arr(entries)),
+                    ]),
+                ),
+            ]));
+        }
         return refusal(
             code::CLEANUP_DIRTY,
             format!(

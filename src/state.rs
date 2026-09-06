@@ -1741,10 +1741,7 @@ impl State {
         let data = object(vec![
             ("schedule_id", string(schedule_id)),
             ("outcome", string("ran")),
-            (
-                "next_run_at",
-                next_run_at.map(string).unwrap_or_else(null),
-            ),
+            ("next_run_at", next_run_at.map(string).unwrap_or_else(null)),
         ]);
         append_event_locked(&tx, self.retention, "schedule.ran", &data)?;
         tx.commit()
@@ -2206,10 +2203,7 @@ impl State {
         )
         .map_err(|err| StateError::from_sqlite("append_audit: insert", err))?;
         prune_audit_locked(conn, self.retention)?;
-        let event_data = object(vec![
-            ("action", string(action)),
-            ("seq", integer(seq)),
-        ]);
+        let event_data = object(vec![("action", string(action)), ("seq", integer(seq))]);
         let event_seq = append_event_locked(conn, self.retention, "journal.appended", &event_data)?;
         Ok(AuditRow {
             seq,
@@ -2350,24 +2344,18 @@ fn schedule_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRow> {
 
 /// One schedule row as an `hf-rpc`-facing value (list_schedules RPC shape;
 /// the `doc` field is the parsed canonical hf-schedule/v1 document or null).
-fn schedule_val(row: &ScheduleRow) -> Val {
+pub fn schedule_val(row: &ScheduleRow) -> Val {
     object(vec![
         ("schedule_id", string(&row.schedule_id)),
         ("state_epoch", integer(row.state_epoch)),
         ("enabled", bool_(row.enabled)),
         (
             "next_run_at",
-            row.next_run_at
-                .as_deref()
-                .map(string)
-                .unwrap_or_else(null),
+            row.next_run_at.as_deref().map(string).unwrap_or_else(null),
         ),
         ("created_at", string(&row.created_at)),
         ("updated_at", string(&row.updated_at)),
-        (
-            "doc",
-            Val::parse_json(&row.doc).unwrap_or_else(|_| null()),
-        ),
+        ("doc", Val::parse_json(&row.doc).unwrap_or_else(|_| null())),
     ])
 }
 

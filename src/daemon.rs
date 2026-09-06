@@ -771,6 +771,8 @@ struct ApplyParams {
     production_branches: Vec<String>,
     worktrees_root: std::path::PathBuf,
     integration_repo: std::path::PathBuf,
+    /// Daemon-owned archive/salvage root (optional; issue #9 AC7).
+    archive_root: Option<std::path::PathBuf>,
     /// Production/hotfix/first-write flag bundle (typed, from the caller's
     /// interactive session — never from recurring automation).
     interactive: bool,
@@ -939,6 +941,17 @@ fn apply_params(request: &Request) -> Result<ApplyParams, (String, String)> {
     };
     let worktrees_root = absolute("worktrees_root")?;
     let integration_repo = absolute("integration_repo")?;
+    // archive_root is optional but must be absolute when present.
+    let archive_root = match topology.get("archive_root") {
+        None | Some(Val::Null) => None,
+        Some(Val::Str(_)) => Some(absolute("archive_root")?),
+        Some(_) => {
+            return Err((
+                "refusal.malformed".to_string(),
+                "topology.archive_root must be a string when present".to_string(),
+            ));
+        }
+    };
     let flags = match params.get("flags") {
         None | Some(Val::Null) => None,
         Some(Val::Obj(_)) => params.get("flags"),
@@ -976,9 +989,8 @@ fn apply_params(request: &Request) -> Result<ApplyParams, (String, String)> {
                     None
                 }
             });
-            let int_field = |key: &str| -> Option<i64> {
-                caps.and_then(|c| non_negative(c.get(key)))
-            };
+            let int_field =
+                |key: &str| -> Option<i64> { caps.and_then(|c| non_negative(c.get(key))) };
             let host_proof_at = admission
                 .get("host_proof")
                 .and_then(|proof| proof.get("measured_at"))
@@ -1012,6 +1024,7 @@ fn apply_params(request: &Request) -> Result<ApplyParams, (String, String)> {
         production_branches,
         worktrees_root,
         integration_repo,
+        archive_root,
         interactive: flag("interactive"),
         digest_confirmed: flag("digest_confirmed"),
         scheduled: flag("scheduled"),
@@ -1484,6 +1497,7 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
         production_branches: &parsed.production_branches,
         worktrees_root: &parsed.worktrees_root,
         integration_repo: &parsed.integration_repo,
+        archive_root: parsed.archive_root.as_deref(),
         observed_feature_head: parsed.feature_head.as_deref(),
         observed_integration_base: parsed.integration_base.as_deref(),
         env: &effect_env,
@@ -2038,11 +2052,7 @@ fn method_schedule_resume(shared: &Arc<Shared>, request: &Request) -> String {
     method_schedule_set_enabled(shared, request, true)
 }
 
-fn method_schedule_set_enabled(
-    shared: &Arc<Shared>,
-    request: &Request,
-    enabled: bool,
-) -> String {
+fn method_schedule_set_enabled(shared: &Arc<Shared>, request: &Request, enabled: bool) -> String {
     let schedule_id = match request
         .params
         .as_ref()
@@ -2077,7 +2087,11 @@ fn method_schedule_set_enabled(
                     shared,
                     request,
                     &key,
-                    if enabled { "schedule.resume" } else { "schedule.pause" },
+                    if enabled {
+                        "schedule.resume"
+                    } else {
+                        "schedule.pause"
+                    },
                     true,
                     object(vec![("schedule", crate::state::schedule_val(&row))]),
                     None,
@@ -2086,7 +2100,11 @@ fn method_schedule_set_enabled(
                     shared,
                     request,
                     &key,
-                    if enabled { "schedule.resume" } else { "schedule.pause" },
+                    if enabled {
+                        "schedule.resume"
+                    } else {
+                        "schedule.pause"
+                    },
                     false,
                     null(),
                     Some((err.code, err.message)),
@@ -2227,7 +2245,10 @@ fn method_schedule_evaluate(shared: &Arc<Shared>, request: &Request) -> String {
         &request.id,
         object(vec![
             ("evaluated", integer(summary.total() as i64)),
-            ("ran", Val::Arr(summary.ran.iter().map(|id| string(id)).collect())),
+            (
+                "ran",
+                Val::Arr(summary.ran.iter().map(|id| string(id)).collect()),
+            ),
             (
                 "paused",
                 Val::Arr(
@@ -2522,7 +2543,13 @@ fn prune_backups_with_journal(
             .lock_state()
             .map_err(|message| ("state.unavailable", message))?;
         state
-            .resolve_claim(&key, &request.method, "spent", &canonical_text(&outcome), None)
+            .resolve_claim(
+                &key,
+                &request.method,
+                "spent",
+                &canonical_text(&outcome),
+                None,
+            )
             .map_err(|err| (err.code, err.message))?;
     }
     publish_after_state_change(shared, None);

@@ -608,7 +608,9 @@ mod tests {
         let remaining = list_backups(&backups).expect("list");
         assert_eq!(remaining.len(), 1);
         assert!(
-            remaining[0].created_at.starts_with(&time::rfc3339_now()[..10]),
+            remaining[0]
+                .created_at
+                .starts_with(&time::rfc3339_now()[..10]),
             "the fresh backup survives"
         );
         // Size bound: a zero budget removes everything verified.
