@@ -60,3 +60,6 @@
 {"expect": "refuse", "family": "hf-workflow", "file": "workflow/workflow.unknown-version.json", "kind": "unknown-version", "note": "unsupported schema version must be refused"}
 {"expect": "accept", "family": "hf-workflow", "file": "workflow/workflow.valid.json", "kind": "valid", "note": "must validate", "sha256": "c052bb6e4dbc2e5f3c2dba01f5db50a35c11cbcd5adb17ec6d2d5819abd1ba2e"}
 {"expect": "accept", "family": "hf-workflow", "file": "workflow/workflow.doctrine.json", "kind": "doctrine", "note": "bundled Doctrine default workflow (versioned; engine slice #6)", "sha256": "88c368277cb8a19bb9e32d6b7e56a8307a3b72eaad2939028efd5dfcc850eb6c"}
+{"expect": "accept", "family": "hf-schedule", "file": "schedule/schedule.valid.json", "kind": "valid", "note": "recurring non-destructive read schedule must validate"}
+{"expect": "refuse", "family": "hf-schedule", "file": "schedule/schedule.malformed.json", "kind": "malformed", "note": "a schedule carrying a non-read capability must be refused"}
+{"expect": "refuse", "family": "hf-schedule", "file": "schedule/schedule.unknown-version.json", "kind": "unknown-version", "note": "unsupported schedule schema version must be refused"}

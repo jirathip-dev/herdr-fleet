@@ -78,6 +78,28 @@ to journal fails closed — the mutation does not start.
 - Retention defaults are design commitments; actual sizes/budgets are
   [awaiting-evidence] (benchmarks, [benchmarks.md](benchmarks.md)).
 
+## Lifecycle additions (issue #9)
+
+- **Migration `m0004_schedules_lifecycle_v4`** (0 → 4 chain) adds two
+  columns to the `schedules` table: `doc` (the canonical `hf-schedule/v1`
+  document text) and `updated_at`. `SCHEMA_VERSION` is 4.
+- **Schedule rows** are the durable recurring-grant cadence records
+  (spec-lifecycle.md): `enabled` is a hard pause flag — the evaluation
+  path never toggles it; `next_run_at` is the single-flight window guard
+  (NULL means immediately due, e.g. after create/resume). Evaluation
+  commits window advance + `read.schedule.ran` audit + `schedule.ran`
+  event atomically; a refused evaluation (expired, policy/issue changed)
+  parks the row with a journaled reason.
+- **Retention of daemon-owned backups** is bounded by age, count, and
+  total bytes (`backup::BackupPolicy` defaults: keep 8, 90 days, 1 GiB);
+  `backup.create` prunes verified pairs outside the policy and journals
+  the prune intent (`mutate.backup.prune`) before removing anything.
+- **Deletion of audit records is itself an explicit destructive
+  operation**: the single `DELETE FROM audit` lives inside the append-side
+  retention prune (`prune_audit_locked`, always keeping the chain
+  genesis); there is no purge/truncate surface anywhere
+  (static probe in tests/no_network_surface.rs).
+
 ## Fixture map
 
 Accept: `migration.valid.json` (0→1, checksummed), `audit.valid.jsonl`

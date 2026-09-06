@@ -206,12 +206,7 @@ fn kill(mut child: Child, label: &str) {
 // Schedule documents + journal helpers
 // ---------------------------------------------------------------------------
 
-fn schedule_doc(
-    schedule_id: &str,
-    anchor: &str,
-    expires_at: &str,
-    every_secs: i64,
-) -> Val {
+fn schedule_doc(schedule_id: &str, anchor: &str, expires_at: &str, every_secs: i64) -> Val {
     object(vec![
         ("schema", string("hf-schedule/v1")),
         ("schedule_id", string(schedule_id)),
@@ -281,7 +276,12 @@ fn schedule_create_list_pause_resume_delete_round_trip() {
     let daemon = fixture.spawn(PathMode::Host);
     wait_ready(&fixture);
     let now = herdr_fleet::time::unix_now();
-    let doc = schedule_doc("sd_0123456789abcdef", &ts(now, 3600), "2999-01-01T00:00:00Z", 300);
+    let doc = schedule_doc(
+        "sd_0123456789abcdef",
+        &ts(now, 3600),
+        "2999-01-01T00:00:00Z",
+        300,
+    );
 
     let created = rpc_ok(
         &fixture.socket,
@@ -305,7 +305,10 @@ fn schedule_create_list_pause_resume_delete_round_trip() {
 
     // List carries the full row including the parsed doc.
     let listed = rpc_ok(&fixture.socket, &fresh_id(2), "schedules.list", None);
-    let rows = listed.get("schedules").and_then(Val::as_array).expect("rows");
+    let rows = listed
+        .get("schedules")
+        .and_then(Val::as_array)
+        .expect("rows");
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].get("schedule_id").and_then(Val::as_str),
@@ -332,7 +335,10 @@ fn schedule_create_list_pause_resume_delete_round_trip() {
         ])),
     );
     assert_eq!(
-        paused.get("schedule").and_then(|row| row.get("enabled")).and_then(Val::as_bool),
+        paused
+            .get("schedule")
+            .and_then(|row| row.get("enabled"))
+            .and_then(Val::as_bool),
         Some(false)
     );
     let resumed = rpc_ok(
@@ -345,7 +351,10 @@ fn schedule_create_list_pause_resume_delete_round_trip() {
         ])),
     );
     assert_eq!(
-        resumed.get("schedule").and_then(|row| row.get("enabled")).and_then(Val::as_bool),
+        resumed
+            .get("schedule")
+            .and_then(|row| row.get("enabled"))
+            .and_then(Val::as_bool),
         Some(true)
     );
     assert_eq!(
@@ -368,7 +377,10 @@ fn schedule_create_list_pause_resume_delete_round_trip() {
     );
     assert_eq!(deleted.get("deleted").and_then(Val::as_bool), Some(true));
     let listed = rpc_ok(&fixture.socket, &fresh_id(6), "schedules.list", None);
-    let rows = listed.get("schedules").and_then(Val::as_array).expect("rows");
+    let rows = listed
+        .get("schedules")
+        .and_then(Val::as_array)
+        .expect("rows");
     assert!(rows.is_empty(), "delete must remove the row");
 
     // Deleting an absent schedule is a typed state error.
@@ -399,7 +411,12 @@ fn schedule_evaluate_fires_due_once_and_expired_schedules_park() {
     let now = herdr_fleet::time::unix_now();
 
     // Due now (anchor two windows back; cadence 60s).
-    let due = schedule_doc("sd_1111111111111111", &ts(now, -120), "2999-01-01T00:00:00Z", 60);
+    let due = schedule_doc(
+        "sd_1111111111111111",
+        &ts(now, -120),
+        "2999-01-01T00:00:00Z",
+        60,
+    );
     rpc_ok(
         &fixture.socket,
         &fresh_id(10),
@@ -419,8 +436,15 @@ fn schedule_evaluate_fires_due_once_and_expired_schedules_park() {
         herdr_fleet::canonical::canonical_text(&evaluated)
     );
     let records = schedule_ran_records(&fixture.socket, &fresh_id(12));
-    assert_eq!(records.len(), 1, "exactly one fresh evaluation is journaled");
-    assert_eq!(schedule_ids(&records), vec!["sd_1111111111111111:ran".to_string()]);
+    assert_eq!(
+        records.len(),
+        1,
+        "exactly one fresh evaluation is journaled"
+    );
+    assert_eq!(
+        schedule_ids(&records),
+        vec!["sd_1111111111111111:ran".to_string()]
+    );
 
     // Single flight: an immediate second evaluation in the same window is
     // idle (the persisted window is the guard).
@@ -431,7 +455,10 @@ fn schedule_evaluate_fires_due_once_and_expired_schedules_park() {
         "second evaluation in the same window must not re-fire: {}",
         herdr_fleet::canonical::canonical_text(&second)
     );
-    assert_eq!(schedule_ran_records(&fixture.socket, &fresh_id(14)).len(), 1);
+    assert_eq!(
+        schedule_ran_records(&fixture.socket, &fresh_id(14)).len(),
+        1
+    );
 
     // An EXPIRED schedule refuses evaluation and parks itself (enabled=0):
     // an explicit human re-arm (create/resume) is the only way back.
@@ -446,15 +473,28 @@ fn schedule_evaluate_fires_due_once_and_expired_schedules_park() {
         ])),
     );
     let evaluated = rpc_ok(&fixture.socket, &fresh_id(16), "schedules.evaluate", None);
-    let paused = evaluated.get("paused").and_then(Val::as_array).expect("paused");
-    assert_eq!(paused.len(), 1, "expired schedule must park: {}", herdr_fleet::canonical::canonical_text(&evaluated));
-    assert!(paused[0]
-        .get("reason")
-        .and_then(Val::as_str)
-        .unwrap_or("")
-        .contains("expired"));
+    let paused = evaluated
+        .get("paused")
+        .and_then(Val::as_array)
+        .expect("paused");
+    assert_eq!(
+        paused.len(),
+        1,
+        "expired schedule must park: {}",
+        herdr_fleet::canonical::canonical_text(&evaluated)
+    );
+    assert!(
+        paused[0]
+            .get("reason")
+            .and_then(Val::as_str)
+            .unwrap_or("")
+            .contains("expired")
+    );
     let list_doc = rpc_ok(&fixture.socket, &fresh_id(17), "schedules.list", None);
-    let rows = list_doc.get("schedules").and_then(Val::as_array).expect("rows");
+    let rows = list_doc
+        .get("schedules")
+        .and_then(Val::as_array)
+        .expect("rows");
     let expired_row = rows
         .iter()
         .find(|row| row.get("schedule_id").and_then(Val::as_str) == Some("sd_2222222222222222"))
@@ -480,7 +520,12 @@ fn cold_boot_fires_due_schedule_once_per_boot_without_tools_on_path() {
     wait_ready(&fixture);
     let now = herdr_fleet::time::unix_now();
     // The schedule is long overdue (downtime covered many windows).
-    let due = schedule_doc("sd_3333333333333333", &ts(now, -7200), "2999-01-01T00:00:00Z", 60);
+    let due = schedule_doc(
+        "sd_3333333333333333",
+        &ts(now, -7200),
+        "2999-01-01T00:00:00Z",
+        60,
+    );
     rpc_ok(
         &fixture.socket,
         &fresh_id(20),
@@ -505,7 +550,11 @@ fn cold_boot_fires_due_schedule_once_per_boot_without_tools_on_path() {
     let daemon = fixture.spawn(PathMode::WithoutTools);
     wait_ready(&fixture);
     let records = schedule_ran_records(&fixture.socket, &fresh_id(22));
-    assert_eq!(records.len(), 1, "a restart must not re-fire an advanced window");
+    assert_eq!(
+        records.len(),
+        1,
+        "a restart must not re-fire an advanced window"
+    );
     // The daemon answers status normally even without herdr on PATH.
     rpc_ok(&fixture.socket, &fresh_id(23), "status", None);
     kill(daemon, "third daemon");
@@ -529,7 +578,10 @@ fn grant_doc() -> Val {
         ("repository", string("example-org/widgets")),
         (
             "issue",
-            object(vec![("number", integer(123)), ("revision", string(REVISION))]),
+            object(vec![
+                ("number", integer(123)),
+                ("revision", string(REVISION)),
+            ]),
         ),
         ("workflow_hash", string(WORKFLOW_HASH)),
         ("policy_hash", string(POLICY_HASH)),
@@ -555,7 +607,12 @@ fn seed_state(db_path: &Path) {
     let state = State::open(db_path, Retention::default()).expect("open state");
     state.issue_grant(&grant_doc()).expect("issue grant");
     state
-        .start_instance(INSTANCE_ID, GRANT_ID, "fleet-doctrine-1", "2026-09-06T00:00:00Z")
+        .start_instance(
+            INSTANCE_ID,
+            GRANT_ID,
+            "fleet-doctrine-1",
+            "2026-09-06T00:00:00Z",
+        )
         .expect("start instance");
 }
 
@@ -577,11 +634,15 @@ fn make_plan(steps: Vec<Val>) -> Val {
         ("repository", string("example-org/widgets")),
         (
             "issue",
-            object(vec![("number", integer(123)), ("revision", string(REVISION))]),
+            object(vec![
+                ("number", integer(123)),
+                ("revision", string(REVISION)),
+            ]),
         ),
         ("steps", Val::Arr(steps)),
     ]);
-    let digest = herdr_fleet::canonical::sha256_hex(&herdr_fleet::canonical::canonical_bytes(&seed));
+    let digest =
+        herdr_fleet::canonical::sha256_hex(&herdr_fleet::canonical::canonical_bytes(&seed));
     let plan_id = format!("hf_plan_{}", &digest[..16]);
     let mut map = match seed {
         Val::Obj(map) => map,
@@ -682,7 +743,12 @@ impl Drop for AdmissionScenario {
     }
 }
 
-fn admission_flags(caps_global: i64, caps_repository: i64, caps_harness: i64, measured_at: &str) -> Val {
+fn admission_flags(
+    caps_global: i64,
+    caps_repository: i64,
+    caps_harness: i64,
+    measured_at: &str,
+) -> Val {
     object(vec![
         (
             "caps",
@@ -807,7 +873,12 @@ fn paused_schedule_and_instance_survive_restart_and_boot_recovery() {
     let daemon = fixture.spawn(PathMode::Host);
     wait_ready(&fixture);
     let now = herdr_fleet::time::unix_now();
-    let due = schedule_doc("sd_4444444444444444", &ts(now, -7200), "2999-01-01T00:00:00Z", 60);
+    let due = schedule_doc(
+        "sd_4444444444444444",
+        &ts(now, -7200),
+        "2999-01-01T00:00:00Z",
+        60,
+    );
     rpc_ok(
         &fixture.socket,
         &fresh_id(40),

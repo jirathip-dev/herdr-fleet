@@ -2020,15 +2020,9 @@ fn method_schedule_create(shared: &Arc<Shared>, request: &Request) -> String {
                 }
             };
             match outcome {
-                Ok(result) => finish_mutation(
-                    shared,
-                    request,
-                    &key,
-                    "schedule.create",
-                    true,
-                    result,
-                    None,
-                ),
+                Ok(result) => {
+                    finish_mutation(shared, request, &key, "schedule.create", true, result, None)
+                }
                 Err((code, message)) => finish_mutation(
                     shared,
                     request,
@@ -2166,15 +2160,9 @@ fn method_schedule_delete(shared: &Arc<Shared>, request: &Request) -> String {
                 }
             };
             match outcome {
-                Ok(result) => finish_mutation(
-                    shared,
-                    request,
-                    &key,
-                    "schedule.delete",
-                    true,
-                    result,
-                    None,
-                ),
+                Ok(result) => {
+                    finish_mutation(shared, request, &key, "schedule.delete", true, result, None)
+                }
                 Err((code, message)) => finish_mutation(
                     shared,
                     request,

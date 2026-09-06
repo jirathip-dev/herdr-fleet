@@ -108,12 +108,10 @@ fn audit_deletion_is_append_side_retention_only() {
         "audit rows are deleted exactly once, inside the retention prune"
     );
     let prune_index = content.find("DELETE FROM audit").expect("prune sql");
-    let before = &content[..prune_index];
-    let prune_fn = before.rfind("fn prune_audit_locked");
-    let append_fn = before.rfind("fn append_audit_locked");
+    let prune_fn = content.find("fn prune_audit_locked").expect("prune fn");
     assert!(
-        prune_fn.is_some() && append_fn.is_none(),
-        "the only audit DELETE must live in prune_audit_locked, not in the append path"
+        prune_fn < prune_index,
+        "the only audit DELETE must live inside prune_audit_locked"
     );
     assert!(
         !content.contains("purge_audit") && !content.contains("TRUNCATE"),

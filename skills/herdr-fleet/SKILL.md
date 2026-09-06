@@ -1,7 +1,7 @@
 ---
 name: herdr-fleet
-description: "Use when working with or on the herdr-fleet repository or CLI. Read-only CLI core plus daemon-mediated plan/apply mutations; no live harness runs."
-version: 1.4.0
+description: "Use when working with or on the herdr-fleet repository or CLI. Read-only CLI core, daemon-mediated mutations, and lifecycle (schedules/admission/recovery); no live harness runs."
+version: 1.5.0
 author: herdr-fleet contributors
 license: Apache-2.0 OR MIT
 platforms: [macos, linux]
@@ -13,19 +13,25 @@ metadata:
 # herdr-fleet
 
 herdr-fleet is a public companion CLI for operating Herdr coding-agent
-fleets. Roadmap slices #3–#8 are merged: a read-only CLI core (#4), a
+fleets. Roadmap slices #3–#9 are merged: a read-only CLI core (#4), a
 daemon foundation with SQLite state and a local socket RPC (#5), the
 deterministic workflow engine with the bundled Doctrine default workflow
 (#6), the capability-negotiated harness adapters (#7: Hermes, Claude
 Code, Codex + a declarative generic argv adapter, verified with
-fake-executable contract tests that need no credentials), and the
+fake-executable contract tests that need no credentials), the
 control-plane mutation layer (#8: the daemon mediates plan `apply` — one
 typed, digest-bound, capability-gated plan step per request — with durable
 review-evidence rows, recorded first-real-write approvals, and
-worktree-confined harness execution). The daemon never starts/stops Herdr,
-never mutates external repositories, and never stores credentials. No live
-workflow execution or release behavior exists yet, and no real harness
-session runs from public CI (children #9–#10 unrouted).
+worktree-confined harness execution), and the lifecycle layer (#9:
+durable recurring non-destructive `hf-schedule/v1` schedules with
+single-flight/coalesced evaluation and cold-boot recovery, fan-out
+admission with host-resource proofs and monorepo-overlap refusal, cleanup
+archive/salvage with byte-verified manifests, a verified system-SSH
+remote transport contract, and retention-bounded backup pruning). The
+daemon never starts/stops Herdr, never mutates external repositories, and
+never stores credentials. No live workflow execution or release behavior
+exists yet, and no real harness session runs from public CI (child #10
+unrouted).
 
 ## When to use
 

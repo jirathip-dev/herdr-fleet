@@ -23,15 +23,44 @@ remain usable without it; SQLite owns state; no network control API).
 ```
 
 - `method` is a closed set: `capabilities`, `doctor`, `status`, `plan`,
-  `apply`, `grants.list`, `grants.revoke`, `schedules.list`, `state.epoch`,
-  `backup.create`, `restore.begin`, `journal.tail`, `events.subscribe`
-  (issue #5 adds the event stream over the socket; the closed set above is
-  mirrored by the Rust schema validator and the fixture oracle).
+  `apply`, `grants.list`, `grants.revoke`, `schedules.list`,
+  `schedules.create`, `schedules.pause`, `schedules.resume`,
+  `schedules.delete`, `schedules.evaluate`, `state.epoch`, `backup.create`,
+  `restore.begin`, `journal.tail`, `events.subscribe`
+  (issues #5/#9 add the event stream and the lifecycle methods over the
+  socket; the closed set above is mirrored by the Rust schema validator and
+  the fixture oracle).
 - `apply` **requires** `params.idempotency_key` (`ik_` format): an apply
   without a key is refused at parse time (`rpc/request.malformed.json`).
   Replaying the same request id + idempotency key returns the recorded
   response instead of re-dispatching (daemon replay table).
 - Unknown methods are refused with a typed refusal (never guessed).
+
+## Lifecycle methods (issue #9)
+
+- `schedules.create` accepts one canonical `hf-schedule/v1` document in
+  `params.schedule` (see [spec-lifecycle.md](spec-lifecycle.md)) and
+  persists it as a schedule row (`m0004` columns: the canonical doc +
+  `updated_at`). Like every mutation it requires `params.idempotency_key`
+  and journals its intent (`mutate.schedule.create`) before the row write.
+- `schedules.pause` / `schedules.resume` durably flip the row's `enabled`
+  flag (`mutate.schedule.pause` / `mutate.schedule.resume`). Paused
+  schedules survive daemon/service/host restarts; the evaluation path can
+  never enable one, and resume additionally clears the evaluation window so
+  the next boot/evaluate tick is due again (explicit human re-arm).
+- `schedules.delete` removes the row after journaling its intent
+  (`mutate.schedule.delete`); deleting an absent schedule is a typed
+  `state.not_found`.
+- `schedules.evaluate` runs one fresh evaluation tick (see
+  spec-lifecycle.md semantics): each due schedule fires at most once and
+  atomically persists its next window with its `read.schedule.ran` audit +
+  `schedule.ran` event; refused schedules park themselves (`enabled:false`)
+  with a journaled reason and need an explicit human re-arm. Evaluations
+  are not idempotency-claimed (a crash leaves at most one extra fresh
+  evaluation, never a backlog replay).
+- Cold boot runs the same evaluation once per due schedule before the
+  socket serves (recovery with Herdr absent is covered in
+  spec-lifecycle.md).
 
 ## Responses: `hf-rpc-response/v1`
 

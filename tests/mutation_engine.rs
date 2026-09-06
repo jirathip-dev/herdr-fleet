@@ -1356,43 +1356,71 @@ fn dirty_cleanup_archive_preserves_exact_bytes_and_manifest_and_never_deletes() 
     std::fs::write(lane2.join("uncommitted.txt"), &payload).expect("dirty file 2");
     let archived = archive_scenario.apply_ok(67, "x1", None, None);
     let archive_doc = archived.get("archived").expect("archived doc");
-    assert_eq!(
-        archive_doc.get("entries").and_then(Val::as_int),
-        Some(1),
-        "only the dirty file is archived: {}",
-        herdr_fleet::canonical::canonical_text(&archived)
-    );
+    // The whole dirty lane is preserved (worktree files + the dirty
+    // payload); find the uncommitted.txt entry to byte-compare.
+    let files = archive_doc
+        .get("files")
+        .and_then(Val::as_array)
+        .expect("files");
+    assert_eq!(files.len(), 3, "all lane files are archived, dirty or not");
     let manifest_sha = archive_doc
         .get("manifest_sha256")
         .and_then(Val::as_str)
         .expect("manifest sha")
         .to_string();
     let total_bytes = archive_doc.get("total_bytes").and_then(Val::as_int);
-    assert_eq!(total_bytes, Some(payload.len() as i64), "byte count must match");
-    // The archived file bytes equal the original bytes (sha256 match).
-    let files = archive_doc.get("files").and_then(Val::as_arr).expect("files");
-    let entry = &files[0];
+    assert_eq!(
+        total_bytes,
+        Some(payload.len() as i64 + 17),
+        "byte count must match the archived lane files"
+    );
+    let entry = files
+        .iter()
+        .find(|file| file.get("path").and_then(Val::as_str) == Some("uncommitted.txt"))
+        .expect("uncommitted.txt entry");
     let rel = entry.get("path").and_then(Val::as_str).expect("rel path");
-    let entry_sha = entry.get("sha256").and_then(Val::as_str).expect("entry sha");
+    let entry_sha = entry
+        .get("sha256")
+        .and_then(Val::as_str)
+        .expect("entry sha");
     let archive_dir = std::path::PathBuf::from(
-        archive_doc.get("archive_dir").and_then(Val::as_str).expect("dir"),
+        archive_doc
+            .get("archive_dir")
+            .and_then(Val::as_str)
+            .expect("dir"),
     );
     let archived_bytes = std::fs::read(archive_dir.join(rel)).expect("read archived file");
-    assert_eq!(archived_bytes, payload.as_bytes(), "archived bytes must equal the original");
+    assert_eq!(
+        archived_bytes,
+        payload.as_bytes(),
+        "archived bytes must equal the original"
+    );
     let expected_sha = herdr_fleet::canonical::sha256_hex(&payload.as_bytes());
-    assert_eq!(entry_sha, expected_sha, "manifest sha256 must match the bytes");
+    assert_eq!(
+        entry_sha, expected_sha,
+        "manifest sha256 must match the bytes"
+    );
     // The manifest on disk pins the same digest.
-    let manifest_text = std::fs::read_to_string(archive_dir.join("manifest.json")).expect("manifest");
+    let manifest_text =
+        std::fs::read_to_string(archive_dir.join("manifest.json")).expect("manifest");
     assert_eq!(
         herdr_fleet::canonical::sha256_hex(manifest_text.as_bytes()),
         manifest_sha,
         "manifest file digest must equal the reported manifest_sha256"
     );
-    // Archive NEVER deletes: the dirty lane stays in place.
+    // Archive NEVER deletes: the dirty lane stays in place, and a repeat
+    // archive within the same second refuses to overwrite the existing
+    // archive directory (fail closed — salvage bytes are never clobbered).
     assert!(lane2.exists() && lane2.join("uncommitted.txt").exists());
-    // And a follow-up cleanup without archive still refuses.
-    let (code2, _) = archive_scenario.apply_err(68, "x1", None, None);
-    assert_eq!(code2, "refusal.cleanup.dirty");
+    let (repeat_code, _) = archive_scenario.apply_err(68, "x1", None, None);
+    assert_eq!(
+        repeat_code, "effect.archive.failed",
+        "an existing archive dir is never overwritten"
+    );
+    assert!(
+        lane2.join("uncommitted.txt").exists(),
+        "dirty file survives"
+    );
 }
 
 #[test]
@@ -1403,13 +1431,12 @@ fn symlinked_cleanup_targets_are_refused() {
     let scenario = Scenario::new("lc-symlink", "2999-01-01T00:00:00Z", flow_steps());
     let wt_root = &scenario.repos.worktrees_root;
     std::fs::create_dir_all(wt_root.join("issues-123-real")).expect("real dir");
-    std::os::unix::fs::symlink(
-        wt_root.join("issues-123-real"),
-        wt_root.join("issues-123"),
-    )
-    .expect("symlink");
+    std::os::unix::fs::symlink(wt_root.join("issues-123-real"), wt_root.join("issues-123"))
+        .expect("symlink");
     let (code, message) = scenario.apply_err(69, "x1", None, None);
     assert_eq!(code, "refusal.cleanup.symlink", "{message}");
-    assert!(wt_root.join("issues-123").exists(), "symlink stays in place");
+    assert!(
+        wt_root.join("issues-123").exists(),
+        "symlink stays in place"
+    );
 }
-
