@@ -224,7 +224,7 @@ Failure → remedy:
 | Symptom (exit) | Envelope | Remedy |
 | --- | --- | --- |
 | `gh` unavailable, no `--revision` (1) | `forge.unavailable` — "pass `--revision <40hex>` to render the plan offline" | Render offline with `--revision` or make `gh` available. |
-| Unconfigured repository (2) | stderr: `plan: no configured repository matches "not-configured"; configure it first (see 'herdr-fleet config init')` | Add the repository to the config (section 2). |
+| Unconfigured repository (2) | stderr: ``plan: no configured repository matches "not-configured"; configure it first (see `herdr-fleet config init`); run `herdr-fleet plan --help``` `` | Add the repository to the config (section 2). |
 | Non-numeric issue / malformed `--revision` (2) | usage error on stderr | `<issue>` is a positive integer; `--revision` is exactly 40 hex. |
 
 Determinism check: run the same offline command twice and diff — byte
@@ -260,12 +260,31 @@ $ ./target/release/herdr-fleet daemon status --json       # exit 0 (live)
  "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
 ```
 
-Stop with Ctrl-C / SIGTERM in the daemon terminal. Without a daemon:
+Stop the daemon with Ctrl-C / SIGTERM in the daemon terminal. The binary
+installs no signal handler, so the socket file is **not** unlinked on exit:
+immediately after a stop — or a crash — `daemon status` reports the stale
+socket:
+
+```console
+$ ./target/release/herdr-fleet daemon status --json   # after stop/crash: exit 1
+{"command":"daemon status","error":{"code":"daemon.stale","details":null,
+ "message":"a stale daemon socket exists at .../herdr-fleet/daemon.sock; a fresh `daemon run` reclaims it","retryable":true},
+ "exit_code":1,"kind":"error","schema":"hf-output/v1"}
+```
+
+Remedy: start a fresh `daemon run` — it reclaims the stale socket,
+reopens/migrates the state, and reconciles interrupted claims on start;
+verify with `daemon status --json` again (exit 0). Full recovery flow:
+section 8.
+
+The `daemon.absent` envelope below appears only when the runtime directory
+never served a daemon (fresh boot or a fresh XDG runtime dir) or after the
+stale socket has been reclaimed/removed:
 
 ```console
 $ ./target/release/herdr-fleet daemon status --json       # exit 1
-{"command":"daemon status","error":{"code":"daemon.absent",...,
- "message":"no daemon is running on .../herdr-fleet/daemon.sock; read-only commands (doctor/status/plan) stay available without it",...},
+{"command":"daemon status","error":{"code":"daemon.absent","details":null,
+ "message":"no daemon is running on .../herdr-fleet/daemon.sock; read-only commands (doctor/status/plan) stay available without it","retryable":false},
  "exit_code":1,"kind":"error","schema":"hf-output/v1"}
 ```
 

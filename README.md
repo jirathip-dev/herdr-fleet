@@ -192,7 +192,8 @@ $ ./target/release/herdr-fleet doctor --json
  "config":{...,"status":"ok"}},"exit_code":0,"kind":"ok","schema":"hf-output/v1"}
 $ cd /path/to/widgets && /path/to/herdr-fleet status --json
 {"command":"status","data":{"expected_repositories":1,"freshness":"fresh",
- "observed_repositories":1,...},"exit_code":0,"kind":"ok","schema":"hf-output/v1"}
+ "observations":[...],"observed_repositories":1,...},
+ "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
 ```
 
 **Plan** — render a deterministic, read-only plan (never applied by the CLI):
@@ -212,7 +213,8 @@ $ ./target/release/herdr-fleet plan example-org/widgets 7 \
 it from another:
 
 ```console
-$ ./target/release/herdr-fleet daemon run        # foreground; Ctrl-C stops it
+$ ./target/release/herdr-fleet daemon run        # foreground; Ctrl-C stops the process
+                                                # (socket stays stale until a fresh `daemon run` reclaims it — see [docs/OPERATIONS.md](docs/OPERATIONS.md) §5)
 $ ./target/release/herdr-fleet daemon status --json
 {"command":"daemon status","data":{"daemon":{"pid":<pid>,...},
  "state":{"active_grants":0,"epoch":1,"schema_version":4,...}},
