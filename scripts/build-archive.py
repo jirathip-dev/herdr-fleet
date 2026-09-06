@@ -262,8 +262,7 @@ def write_canonical_json(path: str, value: dict) -> None:
 
 def cmd_build(args: argparse.Namespace) -> int:
     repo = os.path.abspath(args.repo)
-    if not os.path.isdir(os.path.join(repo, "Cargo.lock")) and not os.path.isfile(
-            os.path.join(repo, "Cargo.lock")):
+    if not os.path.isfile(os.path.join(repo, "Cargo.lock")):
         sys.stderr.write(f"error: {repo} does not look like the herdr-fleet repo "
                          "(no Cargo.lock)\n")
         return 1
@@ -453,7 +452,14 @@ def cmd_verify(args: argparse.Namespace) -> int:
         ok("archive contains exactly the documented members")
         inner_dir = tempfile.mkdtemp(prefix="hf-verify-")
         try:
-            tar.extractall(inner_dir)
+            # Verify runs on UNTRUSTED archives (a downloaded release
+            # artifact), so extraction must be sanitized. Pin the 'data'
+            # filter explicitly: it rejects absolute paths, '..' traversal,
+            # device nodes, and links whose target escapes the extraction
+            # directory. The default is interpreter-version-dependent
+            # (Python >= 3.14 defaults to 'data'; older interpreters default
+            # to the permissive legacy mode), so never rely on it.
+            tar.extractall(inner_dir, filter="data")
         except Exception as exc:  # tarfile errors surface as verification fails
             shutil.rmtree(inner_dir, ignore_errors=True)
             return fail(f"archive extraction failed: {exc}")

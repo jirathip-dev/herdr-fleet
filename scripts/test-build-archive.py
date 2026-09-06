@@ -16,11 +16,14 @@ a fixed HEAD. Never touches the network.
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -94,6 +97,42 @@ def checks():
         print(f"PASS: builder failure modes bite ({len(os.listdir(out_dir))} "
               "artifacts produced before failure)")
 
+        # --- verify refuses a crafted traversal member (safety hardening) -------
+        # A malicious archive whose member basenames match the documented
+        # layout but whose paths escape the extraction directory must be
+        # refused by verify (tarfile extractall runs with filter='data').
+        malicious = os.path.join(tmp, "herdr-fleet-0.1.0-linux-x86_64.tar.gz")
+        benign_names = ("LICENSE-APACHE", "LICENSE-MIT", "SBOM.spdx.json",
+                        "SHA256SUMS", "provenance.json")
+        with open(malicious, "wb") as raw:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw,
+                               mtime=0) as gz:
+                with tarfile.open(fileobj=gz, mode="w",
+                                  format=tarfile.GNU_FORMAT) as tar:
+                    for name in benign_names:
+                        info = tarfile.TarInfo("herdr-fleet-0.1.0/" + name)
+                        info.size = 0
+                        info.mtime = 0
+                        info.uid = 0
+                        info.gid = 0
+                        tar.addfile(info)
+                    # Traversal member: same basename as the documented
+                    # executable, path escapes the extraction directory.
+                    evil = tarfile.TarInfo(
+                        "herdr-fleet-0.1.0/../../../herdr-fleet")
+                    evil.size = 0
+                    evil.mtime = 0
+                    evil.uid = 0
+                    evil.gid = 0
+                    tar.addfile(evil)
+        refused = run([sys.executable, BUILDER, "verify",
+                       "--archive", malicious], check=False)
+        assert refused.returncode != 0, (
+            "verify must refuse an archive with a traversal member")
+        assert b"FAIL" in refused.stderr, refused.stderr.decode()
+        print("PASS: verify refuses a crafted traversal member "
+              "(extractall filter='data')")
+
         # --- real end-to-end build + verify -------------------------------------
         build_args = [sys.executable, BUILDER, "build", "--repo", REPO,
                       "--source-ref", source_ref, "--version", "0.1.0",
@@ -114,8 +153,6 @@ def checks():
               "(6 checks)")
 
         # --- provenance maps to source + schema facts ---------------------------
-        import tarfile
-        import hashlib
         with tarfile.open(archive, "r:gz") as tar:
             provenance_data = None
             for member in tar.getmembers():

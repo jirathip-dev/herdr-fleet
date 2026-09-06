@@ -285,7 +285,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     args = parser.parse_args(argv)
     if args.samples < 3 or args.warmup < 0:
-        parser.error("--samples must be >= 3")
+        parser.error("--samples must be >= 3 and --warmup must be >= 0")
     return args
 
 
