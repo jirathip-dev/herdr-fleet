@@ -2548,7 +2548,7 @@ const MIGRATIONS: [(&str, i64, i64); 4] = [
 /// them so a release archive's provenance record can bind the exact
 /// state-schema migration chain of the binary it ships.
 pub fn migration_chain_ids() -> &'static [&'static str] {
-    const IDS: [&'static str; MIGRATIONS.len()] = [M0001_ID, M0002_ID, M0003_ID, M0004_ID];
+    const IDS: [&str; MIGRATIONS.len()] = [M0001_ID, M0002_ID, M0003_ID, M0004_ID];
     &IDS
 }
 
