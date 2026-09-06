@@ -1,6 +1,6 @@
 # Spec: harness and forge capability negotiation
 
-Refs #3. Family: `hf-capability/v1`. Fixtures:
+Refs #3, #7. Family: `hf-capability/v1`. Fixtures:
 [`capability/`](../../schemas/fixtures/capability/capability.harness.valid.json). Design commitment
 (ADR-0003: adapters at a small typed capability boundary; unsupported
 capabilities return a typed refusal and never silently fall back to shell
@@ -52,14 +52,68 @@ caps are gated by grants and phases ([spec-plans.md](spec-plans.md)).
    (ADR-0003: fake-adapter contract tests prove core planning without any
    installed harness).
 
+## Adapter contract (issue #7)
+
+Refs #7. Implemented in `src/adapters.rs`; verified by fake-executable
+contract tests (`tests/harness_adapters.rs`) that public CI and fork PRs
+can run with **no harness credentials** (AC7).
+
+- **Official adapters**: Hermes (`hermes`), Claude Code (`claude`), Codex
+  (`codex`) — adapter examples per ADR-0003, with declared version ranges in
+  [compatibility.md](compatibility.md) (measured 2026-09-06) and the full
+  closed harness capability set above.
+- **Generic adapter**: the declarative `argv` kind — validated argv arrays,
+  explicit capability declarations, bare executable names resolved through
+  the allowlisted PATH (the verified absolute identity is what is spawned),
+  bounded time/output, cancellation, redaction, typed exits. No shell
+  evaluation, no command templates, no capability inference from prose, no
+  dynamic plugin SDK (AC9).
+- **Operations** (closed set): `start` binds a session handle; `prompt`
+  delivers untrusted text as data — a single final argv element that can
+  never alter adapter argv or policy (AC5); `observe`, `interrupt`,
+  `outcome`, and `identity` run the workspace session protocol (session
+  observation, interruption/cancellation, terminal outcome collection,
+  identity read-back) through the workspace executable. The workspace
+  invocation rows are a v1 candidate contract: their real-world parity is
+  [awaiting-evidence] until the human-gated clean-host smokes (AC6), and
+  fakes pin the exact argv shape in tests.
+- **Stable agent identity (AC3)**: an agent identity binds the Herdr
+  workspace session id + a stable terminal/native-session identity + a
+  generation counter. A mutable pane label is not part of the identity and
+  cannot substitute for any part; binding without all three parts is refused
+  (`refusal.identity.incomplete`), and an identity read-back that disagrees
+  with the bound triple is refused (`refusal.stale.identity`).
+- **Refusal and failure codes** (typed, `hf-error/v1` shape): `unknown.harness`
+  (kind outside the closed set), `unknown.capability` (capability/operation
+  not in the closed harness set or not declared), `refusal.unavailable.harness`
+  (executable missing/unspawnable), `refusal.credentials` (auth failure —
+  credentials stay in the harness, never in herdr-fleet, AC8),
+  `refusal.malformed.output` (unparsable structured output),
+  `refusal.stale.identity`, `refusal.identity.incomplete`,
+  `refusal.request.malformed`, `adapter.timeout` (deadline exceeded, the
+  child is killed; outcome class `ambiguous`), `adapter.process_death`
+  (`ambiguous`), and `adapter.exit` (ordinary non-zero exit).
+- **Boundaries**: adapters pass only the explicit environment allowlist
+  (`env_allow`, spec-config.md), never read the host environment
+  themselves, never store tokens, and never persist raw prompts or
+  transcripts (AC8; trust model T5). Unknown or unavailable harnesses fail
+  per-surface and never break independent read-only operations (AC4,
+  observe.rs pattern).
+- **Fake-adapter doctrine (AC1/AC7)**: the same core workflow/plan
+  fixtures drive fake implementations of every adapter contract (fake
+  executables declaring the same closed sets); every official adapter has
+  exact-version contract tests for success, missing executable/auth,
+  unsupported capability, timeout, cancellation, malformed output, stale
+  identity, and process death (AC2).
+
 ## Harness neutrality consequences
 
-- Hermes/Claude Code/Codex are 1.0 **adapter examples** with their own
-  compatibility matrices (future child #7); the domain core contains no
-  product-name branches and no model/provider names.
+- Hermes/Claude Code/Codex are 1.0 **adapter examples** (issue #7) with
+  their own compatibility matrices ([compatibility.md](compatibility.md));
+  the domain core contains no product-name branches and no model/provider
+  names.
 - An unknown or unavailable harness fails clearly without degrading
-  unrelated read-only operations (locked spec / ADR-0003 acceptance
-  implications).
+  unrelated read-only operations (issue #7 AC4; observe.rs pattern).
 - Herdr and `gh` themselves are negotiated the same way; see
   [compatibility.md](compatibility.md).
 

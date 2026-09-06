@@ -6,7 +6,11 @@
 //! - **github** — authenticated `gh api` reads from the invoking
 //!   environment's `gh` (no token storage, no credential handling),
 //! - **herdr** — a presence/version probe (`herdr --version`); workspace
-//!   protocol reads are deferred to the adapter slice (child #7).
+//!   session protocol reads (session observation, interruption, outcome
+//!   collection, identity read-back) landed as typed session operations in
+//!   the adapter slice (child #7, [`crate::adapters`]) with a v1 candidate
+//!   invocation contract whose real-world parity is verified on clean hosts
+//!   (issue #7 AC6), never in public CI.
 //!
 //! Every adapter runs through [`crate::process::run`] with a per-process
 //! deadline, an allowlisted environment, and no shell evaluation. Captured

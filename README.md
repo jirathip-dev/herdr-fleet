@@ -176,11 +176,14 @@ The umbrella issue
 [herdr-fleet#1](https://github.com/jirathip-dev/herdr-fleet/issues/1) tracks
 the approved target architecture and delivery graph. Roadmap slices #3
 (contract corpus + fixtures), #4 (read-only CLI core), #5 (daemon
-foundation: SQLite state, socket RPC, audit/journal, services), and #6
-(workflow engine + bundled Doctrine default) are implemented on `staging`;
-children #7–#10 are **unrouted** and will each require their own route
-grant. No adapters, live workflow execution, migrations, or releases exist
-yet.
+foundation: SQLite state, socket RPC, audit/journal, services), #6
+(workflow engine + bundled Doctrine default), and #7 (harness adapters:
+Hermes/Claude Code/Codex + declarative generic argv, verified with
+fake-executable contract tests on public CI) are implemented on `staging`;
+children #8–#10 are **unrouted** and will each require their own route
+grant. No live workflow execution, migrations, or releases exist yet, and
+no harness session runs from public CI or fork PRs (real harness parity is
+a human-gated clean-host smoke, issue #7 AC6).
 
 ## License
 
