@@ -60,6 +60,8 @@ pub enum Family {
     Grant,
     /// `hf-outcome/v1` — typed step outcome (idempotency-keyed).
     Outcome,
+    /// `hf-workflow/v1` — closed typed workflow DAG (engine slice #6).
+    Workflow,
 }
 
 impl Family {
@@ -81,6 +83,7 @@ impl Family {
             Family::Epoch => "hf-epoch",
             Family::Grant => "hf-grant",
             Family::Outcome => "hf-outcome",
+            Family::Workflow => "hf-workflow",
         }
     }
 
@@ -102,6 +105,7 @@ impl Family {
             Family::Epoch => "hf-epoch/v1",
             Family::Grant => "hf-grant/v1",
             Family::Outcome => "hf-outcome/v1",
+            Family::Workflow => "hf-workflow/v1",
         }
     }
 
@@ -207,7 +211,7 @@ pub fn validate_bytes(family: Family, bytes: &[u8]) -> Verdict {
     if verdict.refusal.is_some() {
         return verdict;
     }
-    if family == Family::Plan {
+    if matches!(family, Family::Plan | Family::Workflow) {
         let canonical = canonical_bytes(&doc);
         let without_lf = &canonical[..canonical.len() - 1];
         if bytes != canonical.as_slice() && bytes != without_lf {
@@ -275,6 +279,7 @@ pub fn validate_doc(family: Family, doc: &Val) -> Verdict {
         Family::Epoch => validate_epoch(doc),
         Family::Grant => validate_grant(doc),
         Family::Outcome => validate_outcome(doc),
+        Family::Workflow => validate_workflow(doc),
     }
 }
 
@@ -1052,7 +1057,7 @@ fn validate_capability(obj: &Val) -> Verdict {
 }
 
 /// Registry of the families this module validates (used by drift tests).
-pub const SUPPORTED_FAMILIES: [Family; 15] = [
+pub const SUPPORTED_FAMILIES: [Family; 16] = [
     Family::Config,
     Family::Policy,
     Family::Output,
@@ -1068,6 +1073,7 @@ pub const SUPPORTED_FAMILIES: [Family; 15] = [
     Family::Epoch,
     Family::Grant,
     Family::Outcome,
+    Family::Workflow,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1634,6 +1640,131 @@ fn validate_outcome(obj: &Val) -> Verdict {
                 );
             }
         }
+    }
+    Verdict::accept()
+}
+
+/// Closed hf-workflow/v1 node kinds (spec-workflow.md; probe mirror).
+pub const WORKFLOW_NODE_KINDS: [&str; 9] = [
+    "start",
+    "plan",
+    "orchestrator",
+    "implementer",
+    "reviewer",
+    "gate",
+    "human_approval",
+    "merge",
+    "terminal",
+];
+
+fn validate_workflow(obj: &Val) -> Verdict {
+    if let Err(verdict) = check_schema(obj, Family::Workflow) {
+        return verdict;
+    }
+    const KEYS: [&str; 4] = ["schema", "workflow_id", "nodes", "edges"];
+    if let Err(verdict) = require_keys(obj, &KEYS, &KEYS, "workflow") {
+        return verdict;
+    }
+    match obj.get("workflow_id") {
+        Some(Val::Str(text)) if is_slug(text) => {}
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "workflow.workflow_id invalid");
+        }
+    }
+    let Some(nodes) = obj.get("nodes") else {
+        return Verdict::refuse(Refusal::Malformed, "workflow: missing required nodes");
+    };
+    let Val::Arr(node_list) = nodes else {
+        return Verdict::refuse(
+            Refusal::Malformed,
+            "workflow.nodes must be a non-empty list",
+        );
+    };
+    if node_list.is_empty() {
+        return Verdict::refuse(
+            Refusal::Malformed,
+            "workflow.nodes must be a non-empty list",
+        );
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(node_list.len());
+    for node in node_list {
+        if let Err(verdict) = table(node, "workflow node") {
+            return verdict;
+        }
+        if let Err(verdict) = expect_str(node, "id", "workflow node", Some(is_slug)) {
+            return verdict;
+        }
+        let id = node.get("id").and_then(Val::as_str).unwrap_or_default();
+        if seen.contains(&id) {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                format!("workflow: duplicate node id {id:?}"),
+            );
+        }
+        seen.push(id);
+        match node.get("kind") {
+            Some(Val::Str(kind)) if WORKFLOW_NODE_KINDS.contains(&kind.as_str()) => {}
+            _ => {
+                return Verdict::refuse(
+                    Refusal::Malformed,
+                    "workflow node kind outside closed set",
+                );
+            }
+        }
+        if let Val::Obj(map) = node
+            && let Some(extra) = map
+                .keys()
+                .find(|key| !matches!(key.as_str(), "id" | "kind" | "params"))
+        {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                format!("workflow node {id:?}: unknown key {extra:?}"),
+            );
+        }
+        match node.get("params") {
+            None | Some(Val::Null) | Some(Val::Obj(_)) => {}
+            Some(other) => {
+                return Verdict::refuse(
+                    Refusal::Malformed,
+                    format!(
+                        "workflow node params must be object or null, got {}",
+                        other.type_name()
+                    ),
+                );
+            }
+        }
+    }
+    let Some(edges) = obj.get("edges") else {
+        return Verdict::refuse(Refusal::Malformed, "workflow: missing required edges");
+    };
+    match edges {
+        Val::Arr(edge_list) => {
+            for edge in edge_list {
+                if let Err(verdict) = table(edge, "workflow edge") {
+                    return verdict;
+                }
+                let keys_ok = matches!(
+                    edge,
+                    Val::Obj(map)
+                        if map.len() == 2 && map.contains_key("from") && map.contains_key("to")
+                );
+                if !keys_ok {
+                    return Verdict::refuse(
+                        Refusal::Malformed,
+                        "workflow edge must have exactly from|to",
+                    );
+                }
+                let from = edge.get("from").and_then(Val::as_str).unwrap_or_default();
+                let to = edge.get("to").and_then(Val::as_str).unwrap_or_default();
+                if !seen.contains(&from) || !seen.contains(&to) {
+                    return Verdict::refuse(
+                        Refusal::Malformed,
+                        "workflow edge references an unknown node id",
+                    );
+                }
+            }
+        }
+        _ => return Verdict::refuse(Refusal::Malformed, "workflow.edges must be a list"),
     }
     Verdict::accept()
 }
