@@ -29,7 +29,7 @@ use crate::time;
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The schema version this binary understands (also `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Bounded-retention defaults (rows kept besides the chain genesis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +179,58 @@ pub struct GrantRow {
     pub created_at: String,
 }
 
+/// A workflow engine instance row (m0002: workflow pin, phase, node, review
+/// rounds, pause state). Issuance/advance decisions belong to the engine;
+/// this handle persists them durably.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstanceRow {
+    /// Instance id (slug).
+    pub instance_id: String,
+    /// Repository identity.
+    pub repository: String,
+    /// Workflow id (slug).
+    pub workflow_id: String,
+    /// Workflow hash (64-hex; pinned at start — changed-in-flight refusal).
+    pub workflow_hash: String,
+    /// Policy hash (64-hex).
+    pub policy_hash: String,
+    /// Binding grant id.
+    pub grant_id: String,
+    /// Issue number.
+    pub issue_number: i64,
+    /// Acceptance revision (40-hex).
+    pub issue_revision: String,
+    /// Allowed phase (closed set).
+    pub phase: String,
+    /// Path-scoped lane scope.
+    pub scope: String,
+    /// Capabilities (closed set), JSON array text.
+    pub caps: String,
+    /// Current workflow node id ("" until started).
+    pub current_node: String,
+    /// Normal review/fix rounds used (AC4).
+    pub normal_rounds: u32,
+    /// Recovery rounds used (AC4).
+    pub recovery_rounds: u32,
+    /// Whether the item is in the human queue (AC4 exhaustion).
+    pub human_queue: bool,
+    /// Count of explicit terminal blockers (AC7).
+    pub terminal_blockers: u32,
+    /// Whether the instance is paused (AC8; durable across restart).
+    pub paused: bool,
+    /// Stored fresh authorized resume digest (AC8).
+    pub resume_digest: String,
+    /// State epoch the instance runs under.
+    pub state_epoch: i64,
+    /// Status (`new` | `running` | `paused` | `human_queue` | `blocked` |
+    /// `done` | `invalidated`).
+    pub status: String,
+    /// Created at (RFC3339 UTC).
+    pub created_at: String,
+    /// Last update (RFC3339 UTC).
+    pub updated_at: String,
+}
+
 /// The daemon-owned state handle. All methods serialize on an internal
 /// mutex (one writer); a failed write poisons the handle (fail closed).
 pub struct State {
@@ -267,27 +319,38 @@ impl State {
                 ));
             }
         }
-        let user_version: i64 = conn
+        let mut user_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|err| StateError::from_sqlite("read user_version", err))?;
+        // Apply pending migrations in order (linear chain; each migration
+        // records itself in schema_migrations before bumping user_version).
+        if user_version == 0 {
+            run_initial_migration(&mut conn)?;
+            user_version = M0001_APPLIES_TO;
+        }
+        if user_version == M0002_APPLIES_FROM {
+            run_m0002(&mut conn)?;
+            user_version = M0002_APPLIES_TO;
+        }
         match user_version {
-            0 => {
-                run_initial_migration(&mut conn)?;
-            }
             v if v == SCHEMA_VERSION => {
-                let recorded: Option<i64> = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
-                        params![M0001_ID],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(|err| StateError::from_sqlite("migration bookkeeping", err))?;
-                if recorded != Some(1) {
-                    return Err(state_error(
-                        "state.corrupt",
-                        "user_version matches but migration bookkeeping is missing",
-                    ));
+                for (migration_id, _, _) in MIGRATIONS {
+                    let recorded: Option<i64> = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                            params![migration_id],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|err| StateError::from_sqlite("migration bookkeeping", err))?;
+                    if recorded != Some(1) {
+                        return Err(state_error(
+                            "state.corrupt",
+                            format!(
+                                "user_version matches but migration bookkeeping is missing for {migration_id}"
+                            ),
+                        ));
+                    }
                 }
             }
             v => {
@@ -758,6 +821,315 @@ impl State {
         let mut out = Vec::new();
         for row in rows {
             out.push(row.map_err(|err| StateError::from_sqlite("list_grants: row", err))?);
+        }
+        Ok(out)
+    }
+
+    // ---------------------------------------------------------------------
+    // Workflow engine: durable route grants + instances (issue #6)
+    // ---------------------------------------------------------------------
+
+    /// Issue a route grant from a validated `hf-grant/v1` document (AC3
+    /// bindings: repository, issue set/revision, workflow/policy hashes,
+    /// phase, scope, caps, expiry, state epoch). Refused when the document
+    /// is invalid, when the grant id already exists, or when its epoch is
+    /// not the current epoch (grants die with their epoch).
+    pub fn issue_grant(&self, doc: &Val) -> Result<GrantRow, StateError> {
+        let verdict = crate::schema::validate_doc(crate::schema::Family::Grant, doc);
+        if !verdict.is_accepted() {
+            return Err(state_error(
+                "state.grant_invalid",
+                format!("grant document refused: {}", verdict.message()),
+            ));
+        }
+        let grant = grant_row_from_doc(doc)?;
+        let conn = self.lock("issue_grant")?;
+        let epoch = current_epoch_locked(&conn)?;
+        if grant.state_epoch != epoch {
+            return Err(state_error(
+                "state.epoch_mismatch",
+                format!(
+                    "grant epoch {} != current epoch {}; grants die with their epoch",
+                    grant.state_epoch, epoch
+                ),
+            ));
+        }
+        conn.execute(
+            "INSERT INTO grants (grant_id, repository, issue_number, issue_revision,
+                                 workflow_hash, policy_hash, phase, scope, caps,
+                                 expires_at, state_epoch, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active', ?12)",
+            params![
+                grant.grant_id,
+                grant.repository,
+                grant.issue_number,
+                grant.issue_revision,
+                grant.workflow_hash,
+                grant.policy_hash,
+                grant.phase,
+                grant.scope,
+                grant.caps,
+                grant.expires_at,
+                grant.state_epoch,
+                grant.created_at
+            ],
+        )
+        .map_err(|err| {
+            if err.to_string().contains("UNIQUE") {
+                state_error(
+                    "state.grant_exists",
+                    format!("grant {} already exists", grant.grant_id),
+                )
+            } else {
+                StateError::from_sqlite("issue_grant: insert", err)
+            }
+        })?;
+        Ok(grant)
+    }
+
+    /// Fetch one grant row by id (any status; engine revalidation reads the
+    /// live binding before every further mutation — AC2).
+    pub fn grant_by_id(&self, grant_id: &str) -> Result<Option<GrantRow>, StateError> {
+        let conn = self.lock("grant_by_id")?;
+        let row = conn
+            .query_row(
+                "SELECT grant_id, repository, issue_number, issue_revision, workflow_hash,
+                        policy_hash, phase, scope, caps, expires_at, state_epoch, status, created_at
+                   FROM grants WHERE grant_id = ?1",
+                params![grant_id],
+                |row| {
+                    Ok(GrantRow {
+                        grant_id: row.get(0)?,
+                        repository: row.get(1)?,
+                        issue_number: row.get(2)?,
+                        issue_revision: row.get(3)?,
+                        workflow_hash: row.get(4)?,
+                        policy_hash: row.get(5)?,
+                        phase: row.get(6)?,
+                        scope: row.get(7)?,
+                        caps: row.get(8)?,
+                        expires_at: row.get(9)?,
+                        state_epoch: row.get(10)?,
+                        status: row.get(11)?,
+                        created_at: row.get(12)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("grant_by_id: query", err))?;
+        Ok(row)
+    }
+
+    /// Invalidate an active grant (material issue/acceptance edit — AC2).
+    /// The engine refuses every further mutation once the grant is
+    /// invalidated; bound instances are paused by the caller.
+    pub fn invalidate_grant(&self, grant_id: &str, at: &str) -> Result<(), StateError> {
+        let conn = self.lock("invalidate_grant")?;
+        let affected = conn
+            .execute(
+                "UPDATE grants SET status = 'invalidated', revoked_at = ?2
+                  WHERE grant_id = ?1 AND status = 'active'",
+                params![grant_id, at],
+            )
+            .map_err(|err| StateError::from_sqlite("invalidate_grant: update", err))?;
+        if affected == 0 {
+            return Err(state_error(
+                "state.not_found",
+                format!("no active grant {grant_id:?} to invalidate"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Start a workflow instance bound to an active grant (durable pin of
+    /// workflow/policy hashes and the issue binding). Refused when the
+    /// grant is absent/inactive or its bindings disagree with the engine
+    /// pin (`workflow_hash`/`policy_hash`).
+    pub fn start_instance(
+        &self,
+        instance_id: &str,
+        grant_id: &str,
+        workflow_id: &str,
+        at: &str,
+    ) -> Result<InstanceRow, StateError> {
+        let Some(grant) = self.grant_by_id(grant_id)? else {
+            return Err(state_error(
+                "state.not_found",
+                format!("no grant {grant_id:?}"),
+            ));
+        };
+        if grant.status != "active" {
+            return Err(state_error(
+                "state.grant_inactive",
+                format!("grant {grant_id:?} is not active"),
+            ));
+        }
+        {
+            let conn = self.lock("start_instance")?;
+            conn.execute(
+                "INSERT INTO instances (instance_id, repository, state_epoch, status,
+                                        workflow_id, workflow_hash, policy_hash, grant_id,
+                                        issue_number, issue_revision, phase, scope, caps,
+                                        current_node, normal_rounds, recovery_rounds,
+                                        human_queue, terminal_blockers, paused, resume_digest,
+                                        created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'new', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, '', 0, 0, 0, 0, 0, '', ?13, ?13)",
+                params![
+                    instance_id,
+                    grant.repository,
+                    grant.state_epoch,
+                    workflow_id,
+                    grant.workflow_hash,
+                    grant.policy_hash,
+                    grant_id,
+                    grant.issue_number,
+                    grant.issue_revision,
+                    grant.phase,
+                    grant.scope,
+                    grant.caps,
+                    at
+                ],
+            )
+            .map_err(|err| StateError::from_sqlite("start_instance: insert", err))?;
+        }
+        let row = self.instance_by_id(instance_id)?.expect("just inserted");
+        Ok(row)
+    }
+
+    /// One instance row by id.
+    pub fn instance_by_id(&self, instance_id: &str) -> Result<Option<InstanceRow>, StateError> {
+        let conn = self.lock("instance_by_id")?;
+        let sql = format!("{} WHERE instance_id = ?1", instance_select_sql());
+        let row = conn
+            .query_row(sql.as_str(), params![instance_id], |row| {
+                instance_row_from(row)
+            })
+            .optional()
+            .map_err(|err| StateError::from_sqlite("instance_by_id: query", err))?;
+        Ok(row)
+    }
+
+    /// Pause a workflow instance durably (AC8). The caller mints the fresh
+    /// authorized resume digest via the engine; it is stored and required
+    /// again on resume, surviving restarts.
+    pub fn pause_instance(
+        &self,
+        instance_id: &str,
+        resume_digest: &str,
+        at: &str,
+    ) -> Result<(), StateError> {
+        let conn = self.lock("pause_instance")?;
+        let affected = conn
+            .execute(
+                "UPDATE instances SET paused = 1, resume_digest = ?2, status = 'paused',
+                        updated_at = ?3
+                  WHERE instance_id = ?1 AND paused = 0",
+                params![instance_id, resume_digest, at],
+            )
+            .map_err(|err| StateError::from_sqlite("pause_instance: update", err))?;
+        if affected == 0 {
+            return Err(state_error(
+                "state.not_paused",
+                format!("instance {instance_id:?} is not runnable (already paused or absent)"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resume a paused instance. `presented_digest` must equal the stored
+    /// fresh authorized digest (engine [`crate::engine::authorize_resume`]);
+    /// the digest is consumed on success so a stale digest can never resume
+    /// twice (AC8).
+    pub fn resume_instance(
+        &self,
+        instance_id: &str,
+        presented_digest: &str,
+        at: &str,
+    ) -> Result<(), StateError> {
+        let Some(row) = self.instance_by_id(instance_id)? else {
+            return Err(state_error(
+                "state.not_found",
+                format!("no instance {instance_id:?}"),
+            ));
+        };
+        if row.paused {
+            crate::engine::authorize_resume(&row.resume_digest, presented_digest)
+                .map_err(|err| state_error("state.stale_resume", err.message))?;
+        }
+        let conn = self.lock("resume_instance")?;
+        let affected = conn
+            .execute(
+                "UPDATE instances SET paused = 0, resume_digest = '', status = 'running',
+                        updated_at = ?2
+                  WHERE instance_id = ?1 AND paused = 1",
+                params![instance_id, at],
+            )
+            .map_err(|err| StateError::from_sqlite("resume_instance: update", err))?;
+        if affected == 0 {
+            return Err(state_error(
+                "state.not_paused",
+                format!("instance {instance_id:?} is not paused"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Advance a running instance: record the current node and review-round
+    /// counters (AC4) plus blocker accounting (AC7). The caller computes the
+    /// new values with the engine; this only persists them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn advance_instance(
+        &self,
+        instance_id: &str,
+        current_node: &str,
+        normal_rounds: u32,
+        recovery_rounds: u32,
+        human_queue: bool,
+        terminal_blockers: u32,
+        at: &str,
+    ) -> Result<(), StateError> {
+        let status = if human_queue {
+            "human_queue"
+        } else if terminal_blockers > 0 {
+            "blocked"
+        } else {
+            "running"
+        };
+        let conn = self.lock("advance_instance")?;
+        let affected = conn
+            .execute(
+                "UPDATE instances SET current_node = ?2, normal_rounds = ?3,
+                        recovery_rounds = ?4, human_queue = ?5, terminal_blockers = ?6,
+                        status = ?7, updated_at = ?8
+                  WHERE instance_id = ?1",
+                params![
+                    instance_id,
+                    current_node,
+                    normal_rounds,
+                    recovery_rounds,
+                    human_queue as i64,
+                    terminal_blockers,
+                    status,
+                    at
+                ],
+            )
+            .map_err(|err| StateError::from_sqlite("advance_instance: update", err))?;
+        let _ = affected;
+        Ok(())
+    }
+
+    /// List workflow instances (any status), oldest first.
+    pub fn list_instances(&self) -> Result<Vec<InstanceRow>, StateError> {
+        let conn = self.lock("list_instances")?;
+        let mut statement = conn
+            .prepare(&instance_select_sql())
+            .map_err(|err| StateError::from_sqlite("list_instances: prepare", err))?;
+        let rows = statement
+            .query_map([], |row| instance_row_from(row))
+            .map_err(|err| StateError::from_sqlite("list_instances: query", err))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|err| StateError::from_sqlite("list_instances: row", err))?);
         }
         Ok(out)
     }
@@ -1238,6 +1610,101 @@ impl State {
     }
 }
 
+/// Read a grant row out of an `hf-grant/v1` document (validated by the
+/// caller through [`crate::schema::validate_doc`]).
+fn grant_row_from_doc(doc: &Val) -> Result<GrantRow, StateError> {
+    let get = |key: &str| -> Result<String, StateError> {
+        doc.get(key)
+            .and_then(Val::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| state_error("state.grant_invalid", format!("grant missing {key}")))
+    };
+    let issue = doc
+        .get("issue")
+        .ok_or_else(|| state_error("state.grant_invalid", "grant missing issue"))?;
+    let issue_number = issue
+        .get("number")
+        .and_then(Val::as_int)
+        .ok_or_else(|| state_error("state.grant_invalid", "issue.number missing"))?;
+    let issue_revision = issue
+        .get("revision")
+        .and_then(Val::as_str)
+        .ok_or_else(|| state_error("state.grant_invalid", "issue.revision missing"))?;
+    let caps_text = match doc.get("caps") {
+        Some(Val::Arr(items)) => {
+            let parts: Vec<String> = items
+                .iter()
+                .filter_map(Val::as_str)
+                .map(str::to_string)
+                .collect();
+            canonical_text(&Val::Arr(parts.iter().map(|p| string(p)).collect()))
+        }
+        _ => {
+            return Err(state_error(
+                "state.grant_invalid",
+                "grant.caps must be an array",
+            ));
+        }
+    };
+    Ok(GrantRow {
+        grant_id: get("grant_id")?,
+        repository: get("repository")?,
+        issue_number,
+        issue_revision: issue_revision.to_string(),
+        workflow_hash: get("workflow_hash")?,
+        policy_hash: get("policy_hash")?,
+        phase: get("phase")?,
+        scope: get("scope")?,
+        caps: caps_text,
+        expires_at: get("expires_at")?,
+        state_epoch: doc
+            .get("state_epoch")
+            .and_then(Val::as_int)
+            .ok_or_else(|| state_error("state.grant_invalid", "state_epoch missing"))?,
+        status: "active".to_string(),
+        created_at: get("created_at")?,
+    })
+}
+
+/// Shared SELECT for instance rows (m0002 columns).
+fn instance_select_sql() -> String {
+    "SELECT instance_id, repository, workflow_id, workflow_hash, policy_hash, grant_id,
+            issue_number, issue_revision, phase, scope, caps, current_node,
+            normal_rounds, recovery_rounds, human_queue, terminal_blockers,
+            paused, resume_digest, state_epoch, status, created_at, updated_at
+       FROM instances"
+        .to_string()
+}
+
+/// Map one SQLite row onto [`InstanceRow`] (column order of
+/// [`instance_select_sql`]).
+fn instance_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<InstanceRow> {
+    Ok(InstanceRow {
+        instance_id: row.get(0)?,
+        repository: row.get(1)?,
+        workflow_id: row.get(2)?,
+        workflow_hash: row.get(3)?,
+        policy_hash: row.get(4)?,
+        grant_id: row.get(5)?,
+        issue_number: row.get(6)?,
+        issue_revision: row.get(7)?,
+        phase: row.get(8)?,
+        scope: row.get(9)?,
+        caps: row.get(10)?,
+        current_node: row.get(11)?,
+        normal_rounds: row.get(12)?,
+        recovery_rounds: row.get(13)?,
+        human_queue: row.get(14)?,
+        terminal_blockers: row.get(15)?,
+        paused: row.get(16)?,
+        resume_digest: row.get(17)?,
+        state_epoch: row.get(18)?,
+        status: row.get(19)?,
+        created_at: row.get(20)?,
+        updated_at: row.get(21)?,
+    })
+}
+
 /// Prune audit rows beyond the retention bound, always keeping the chain
 /// genesis (seq 0) so verification keeps its anchor.
 fn prune_audit_locked(
@@ -1391,6 +1858,40 @@ const M0001_ID: &str = "m0001_initial_state_v1";
 const M0001_APPLIES_FROM: i64 = 0;
 const M0001_APPLIES_TO: i64 = 1;
 
+/// m0002 adds the workflow-engine runtime columns to `instances` (issue #6:
+/// durable engine state for route-granted workflow instances).
+const M0002_ID: &str = "m0002_workflow_engine_instances_v2";
+const M0002_APPLIES_FROM: i64 = 1;
+const M0002_APPLIES_TO: i64 = 2;
+
+/// Ordered migration chain (id, applies_from, applies_to). The runner in
+/// [`State::open`] applies every pending migration before serving.
+const MIGRATIONS: [(&str, i64, i64); 2] = [
+    (M0001_ID, M0001_APPLIES_FROM, M0001_APPLIES_TO),
+    (M0002_ID, M0002_APPLIES_FROM, M0002_APPLIES_TO),
+];
+
+/// Engine-state columns added to `instances` by m0002 (SQLite ALTER ADD
+/// COLUMN; each statement must carry a default for existing rows).
+const M0002_SQL: &str = "\
+ALTER TABLE instances ADD COLUMN workflow_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE instances ADD COLUMN workflow_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE instances ADD COLUMN policy_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE instances ADD COLUMN grant_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE instances ADD COLUMN issue_number INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE instances ADD COLUMN issue_revision TEXT NOT NULL DEFAULT '';
+ALTER TABLE instances ADD COLUMN phase TEXT NOT NULL DEFAULT '';
+ALTER TABLE instances ADD COLUMN scope TEXT NOT NULL DEFAULT '';
+ALTER TABLE instances ADD COLUMN caps TEXT NOT NULL DEFAULT '';
+ALTER TABLE instances ADD COLUMN current_node TEXT NOT NULL DEFAULT '';
+ALTER TABLE instances ADD COLUMN normal_rounds INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE instances ADD COLUMN recovery_rounds INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE instances ADD COLUMN human_queue INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE instances ADD COLUMN terminal_blockers INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE instances ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE instances ADD COLUMN resume_digest TEXT NOT NULL DEFAULT '';
+";
+
 const M0001_SQL: &str = "\
 CREATE TABLE schema_migrations (
     migration_id TEXT PRIMARY KEY,
@@ -1539,10 +2040,38 @@ fn run_initial_migration(conn: &mut Connection) -> Result<(), StateError> {
         ],
     )
     .map_err(|err| StateError::from_sqlite("migrate: genesis", err))?;
-    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+    tx.pragma_update(None, "user_version", M0001_APPLIES_TO)
         .map_err(|err| StateError::from_sqlite("migrate: user_version", err))?;
     tx.commit()
         .map_err(|err| StateError::from_sqlite("migrate: commit", err))?;
+    Ok(())
+}
+
+/// Run migration m0002 in one transaction: engine runtime columns on the
+/// `instances` table (workflow pin, phase/scope/caps, node, rounds, pause).
+fn run_m0002(conn: &mut Connection) -> Result<(), StateError> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| StateError::from_sqlite("migrate m0002: begin", err))?;
+    let checksum = sha256_hex(M0002_SQL.as_bytes());
+    tx.execute_batch(M0002_SQL)
+        .map_err(|err| StateError::from_sqlite("migrate m0002", err))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (migration_id, applies_from, applies_to, checksum, applied_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            M0002_ID,
+            M0002_APPLIES_FROM,
+            M0002_APPLIES_TO,
+            checksum,
+            time::rfc3339_now()
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("migrate m0002: bookkeeping", err))?;
+    tx.pragma_update(None, "user_version", M0002_APPLIES_TO)
+        .map_err(|err| StateError::from_sqlite("migrate m0002: user_version", err))?;
+    tx.commit()
+        .map_err(|err| StateError::from_sqlite("migrate m0002: commit", err))?;
     Ok(())
 }
 
@@ -1573,6 +2102,168 @@ mod tests {
             ("method", string("backup.create")),
             ("params", object(vec![("idempotency_key", string(key))])),
         ]))
+    }
+
+    /// A synthetic hf-grant/v1 document (all AC3 bindings).
+    fn sample_grant_doc() -> Val {
+        let workflow_hash = "0".repeat(64);
+        let policy_hash = "f".repeat(64);
+        object(vec![
+            ("schema", string("hf-grant/v1")),
+            ("grant_id", string("gr_0123456789abcdef")),
+            ("repository", string("example-org/widgets")),
+            (
+                "issue",
+                object(vec![
+                    ("number", integer(123)),
+                    ("revision", string(&"a".repeat(40))),
+                ]),
+            ),
+            ("workflow_hash", string(&workflow_hash)),
+            ("policy_hash", string(&policy_hash)),
+            ("phase", string("merge")),
+            ("scope", string("worktrees/issues/123")),
+            ("caps", Val::Arr(vec![string("read"), string("merge")])),
+            ("expires_at", string("2999-01-01T00:00:00Z")),
+            ("state_epoch", integer(1)),
+            ("created_at", string("2026-09-06T00:00:00Z")),
+        ])
+    }
+
+    #[test]
+    fn m0002_migrates_instances_for_the_engine() {
+        let path = temp_db("m0002.db");
+        let state = State::open(&path, Retention::default()).expect("open");
+        let (_, _, _, version) = state.summary().expect("summary");
+        assert_eq!(version, SCHEMA_VERSION);
+        // A legacy v1 database is migrated in place (m0002 adds engine
+        // columns); reopening never loses recorded migrations.
+        let reopened = State::open(&path, Retention::default()).expect("reopen");
+        assert_eq!(reopened.list_instances().expect("list").len(), 0);
+    }
+
+    #[test]
+    fn grant_issuance_binds_and_duplicates_are_refused() {
+        let path = temp_db("engine-grants.db");
+        let state = State::open(&path, Retention::default()).expect("open");
+        let grant = state.issue_grant(&sample_grant_doc()).expect("issue");
+        assert_eq!(grant.status, "active");
+        assert_eq!(state.list_grants().expect("list").len(), 1);
+
+        let duplicate = state
+            .issue_grant(&sample_grant_doc())
+            .expect_err("duplicate refused");
+        assert_eq!(duplicate.code, "state.grant_exists");
+
+        // Wrong epoch is refused (grants die with their epoch).
+        let mut doc = sample_grant_doc();
+        let map = match &mut doc {
+            Val::Obj(map) => map,
+            _ => unreachable!(),
+        };
+        map.insert("state_epoch".to_string(), integer(99));
+        let wrong_epoch = state.issue_grant(&doc).expect_err("epoch refused");
+        assert_eq!(wrong_epoch.code, "state.epoch_mismatch");
+    }
+
+    #[test]
+    fn engine_instance_pause_is_durable_across_restart_and_resume_needs_fresh_digest() {
+        let path = temp_db("engine-pause.db");
+        let at = "2026-09-06T00:00:00Z";
+        {
+            let state = State::open(&path, Retention::default()).expect("open");
+            state.issue_grant(&sample_grant_doc()).expect("issue");
+            state
+                .start_instance("run-1", "gr_0123456789abcdef", "fleet-doctrine-1", at)
+                .expect("start");
+            let digest = crate::engine::mint_resume_digest("run-1", 1, "pause-1");
+            state.pause_instance("run-1", &digest, at).expect("pause");
+            let row = state.instance_by_id("run-1").expect("read").expect("row");
+            assert!(row.paused);
+            assert_eq!(row.resume_digest, digest);
+            // A stale digest is refused before any state change.
+            let stale = state
+                .resume_instance("run-1", &"0".repeat(64), at)
+                .expect_err("stale digest refused");
+            assert_eq!(stale.code, "state.stale_resume");
+        }
+        // Restart: reopen the same state file; pause must survive.
+        {
+            let state = State::open(&path, Retention::default()).expect("reopen");
+            let row = state.instance_by_id("run-1").expect("read").expect("row");
+            assert!(row.paused, "pause durable across restart");
+            assert!(!row.resume_digest.is_empty());
+            let fresh = crate::engine::mint_resume_digest("run-1", 1, "pause-1");
+            state.resume_instance("run-1", &fresh, at).expect("resume");
+            let row = state.instance_by_id("run-1").expect("read").expect("row");
+            assert!(!row.paused);
+            assert_eq!(row.status, "running");
+            // Digest is consumed: the same digest cannot resume again.
+            let replay = state
+                .resume_instance("run-1", &fresh, at)
+                .expect_err("digest consumed");
+            assert_eq!(replay.code, "state.not_paused");
+        }
+    }
+
+    #[test]
+    fn issue_edit_invalidates_grant_and_engine_stops_further_mutation() {
+        let path = temp_db("engine-issue-edit.db");
+        let at = "2026-09-06T00:00:00Z";
+        let state = State::open(&path, Retention::default()).expect("open");
+        state.issue_grant(&sample_grant_doc()).expect("issue");
+        let grant = state
+            .grant_by_id("gr_0123456789abcdef")
+            .expect("read")
+            .expect("grant");
+
+        // Material issue/acceptance edit: observed revision differs.
+        let mut edited = "a".repeat(40);
+        edited.replace_range(0..1, "b");
+        let refused = crate::engine::grant_binding_valid(&grant.issue_revision, &edited)
+            .expect_err("stale grant");
+        assert_eq!(refused.code, "engine.grant_stale");
+        state
+            .invalidate_grant("gr_0123456789abcdef", at)
+            .expect("invalidate");
+        let after = state
+            .grant_by_id("gr_0123456789abcdef")
+            .expect("read")
+            .expect("grant");
+        assert_eq!(after.status, "invalidated");
+        // Active-grant listing no longer offers it; a bound instance cannot
+        // start on an invalidated grant.
+        assert_eq!(state.list_grants().expect("list").len(), 0);
+        let denied = state
+            .start_instance("run-2", "gr_0123456789abcdef", "fleet-doctrine-1", at)
+            .expect_err("start refused");
+        assert_eq!(denied.code, "state.grant_inactive");
+    }
+
+    #[test]
+    fn engine_advance_persists_review_rounds_and_blockers() {
+        let path = temp_db("engine-advance.db");
+        let at = "2026-09-06T00:00:00Z";
+        let state = State::open(&path, Retention::default()).expect("open");
+        state.issue_grant(&sample_grant_doc()).expect("issue");
+        state
+            .start_instance("run-3", "gr_0123456789abcdef", "fleet-doctrine-1", at)
+            .expect("start");
+        state
+            .advance_instance("run-3", "exact-head-review", 1, 0, false, 0, at)
+            .expect("advance");
+        let row = state.instance_by_id("run-3").expect("read").expect("row");
+        assert_eq!(row.current_node, "exact-head-review");
+        assert_eq!(row.normal_rounds, 1);
+        assert_eq!(row.status, "running");
+        // Review exhaustion -> human queue; a terminal blocker is counted.
+        state
+            .advance_instance("run-3", "exact-head-review", 3, 1, true, 1, at)
+            .expect("advance");
+        let row = state.instance_by_id("run-3").expect("read").expect("row");
+        assert!(row.human_queue);
+        assert_eq!(row.terminal_blockers, 1);
+        assert_eq!(row.status, "human_queue");
     }
 
     #[test]
