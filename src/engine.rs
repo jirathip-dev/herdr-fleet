@@ -505,7 +505,7 @@ pub fn accept_advisory(doc: &Val) -> Result<Advisory, EngineError> {
             });
         }
     };
-    for (key, _) in map {
+    for key in map.keys() {
         if AUTHORITY_PARAM_KEYS.contains(&key.as_str())
             || key.starts_with("target")
             || key == "transition"

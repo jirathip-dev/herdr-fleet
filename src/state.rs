@@ -1125,7 +1125,7 @@ impl State {
             .prepare(&instance_select_sql())
             .map_err(|err| StateError::from_sqlite("list_instances: prepare", err))?;
         let rows = statement
-            .query_map([], |row| instance_row_from(row))
+            .query_map([], instance_row_from)
             .map_err(|err| StateError::from_sqlite("list_instances: query", err))?;
         let mut out = Vec::new();
         for row in rows {
