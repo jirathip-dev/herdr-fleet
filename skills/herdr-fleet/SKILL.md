@@ -1,166 +1,221 @@
 ---
 name: herdr-fleet
-description: "Use when working with or on the herdr-fleet repository or CLI. Read-only CLI core, daemon-mediated mutations, lifecycle (schedules/admission/recovery), and release-readiness machinery (archives/provenance/baselines); no live harness runs."
-version: 1.6.0
+description: "Use when working with or on the herdr-fleet repository or CLI. Read-only CLI core (config/doctor/status/plan/capabilities), single-writer daemon (run/status), service unit plans, and grant-gated mutations via the daemon apply RPC; no live harness runs."
+version: 1.7.0
 author: herdr-fleet contributors
 license: Apache-2.0 OR MIT
 platforms: [macos, linux]
 metadata:
   hermes:
-    tags: [herdr-fleet, cli, fleet, repository, read-only-core]
+    tags: [herdr-fleet, cli, fleet, repository, read-only-core, operations]
 ---
 
 # herdr-fleet
 
 herdr-fleet is a public companion CLI for operating Herdr coding-agent
-fleets. Roadmap slices #3–#10 are merged: a read-only CLI core (#4), a
-daemon foundation with SQLite state and a local socket RPC (#5), the
-deterministic workflow engine with the bundled Doctrine default workflow
-(#6), the capability-negotiated harness adapters (#7: Hermes, Claude
-Code, Codex + a declarative generic argv adapter, verified with
-fake-executable contract tests that need no credentials), the
+fleets. Roadmap slices #3-#10 are merged on `staging` (PRs #13-#21): a
+read-only CLI core (#4), a daemon foundation with SQLite state and a local
+socket RPC (#5), the deterministic workflow engine with the bundled
+Doctrine default workflow (#6), the capability-negotiated harness adapters
+(#7: Hermes, Claude Code, Codex + a declarative generic argv adapter,
+verified with fake-executable contract tests that need no credentials), the
 control-plane mutation layer (#8: the daemon mediates plan `apply` — one
 typed, digest-bound, capability-gated plan step per request — with durable
 review-evidence rows, recorded first-real-write approvals, and
-worktree-confined harness execution), the lifecycle layer (#9:
-durable recurring non-destructive `hf-schedule/v1` schedules with
-single-flight/coalesced evaluation and cold-boot recovery, fan-out
-admission with host-resource proofs and monorepo-overlap refusal, cleanup
-archive/salvage with byte-verified manifests, a verified system-SSH
-remote transport contract, and retention-bounded backup pruning), and the
-release-readiness layer (#10: deterministic platform archives with
-SHA-256 checksums, an offline Cargo.lock-derived SPDX SBOM and a
-release-provenance/v1 record; clean-host verification scripts; a measured
-baseline + regression-budget machinery; and the active in-repo
-release/version policy). The daemon never starts/stops Herdr, never
-mutates external repositories, and never stores credentials. No live
-workflow execution or release execution exists yet, and no real harness
-session runs from public CI (release execution and the clean-host matrix
-are human-gated).
+worktree-confined harness execution), the lifecycle layer (#9: durable
+recurring non-destructive schedules with single-flight/coalesced evaluation
+and cold-boot recovery, fan-out admission, cleanup archive/salvage with
+byte-verified manifests, a verified system-SSH remote transport contract,
+and retention-bounded backup pruning), and the release-readiness layer
+(#10: deterministic platform archives with checksums, offline SPDX SBOM,
+release provenance; clean-host verification; measured baselines; in-repo
+release policy). The daemon never starts/stops Herdr, the CLI never mutates
+repositories or fleet state directly, and no live workflow execution,
+release execution, or real harness session runs from public CI (those are
+human-gated).
 
 ## When to use
 
-- You are contributing to the herdr-fleet repository (Rust, docs, contracts,
-  CI).
-- You need to know what the CLI does today without guessing.
+- You are contributing to the herdr-fleet repository (Rust, docs,
+  contracts, CI).
+- You need to know what the CLI does today — or operate it read-only —
+  without guessing.
 
 ## Safe discovery (read-only, no side effects)
 
-Start from the committed documentation — never invent commands:
-
-1. Index and status: `README.md` (current slice, boundaries, quickstart).
-2. Contracts: `docs/contracts/README.md` (schema registry, spec-cli/config/
-   plans/capabilities, capability-map, compatibility — the #3 corpus this
-   slice implements).
-3. Canonical gates: `docs/DEVELOPMENT.md` (the `just` recipes; `just ci`
-   is the full local aggregate mirroring CI).
-4. Process: `docs/WORKFLOW.md`; architecture: `docs/ARCHITECTURE.md` and
+1. Index and status: `README.md` (current surface, boundaries, quickstart).
+2. Operations runbook: `docs/OPERATIONS.md` (task-ordered; every claim
+   exercised against the real binary).
+3. Contracts: `docs/contracts/README.md` (schema registry, specs for
+   CLI/config/plans/daemon/state/capabilities, capability-map,
+   compatibility — the #3 corpus this surface implements).
+4. Canonical gates: `docs/DEVELOPMENT.md` (`just ci` is the full local
+   aggregate).
+5. Process: `docs/WORKFLOW.md`; architecture: `docs/ARCHITECTURE.md` and
    the ADRs under `docs/decisions/`.
-5. Repository contract for agents: `AGENTS.md` (public-data boundary,
+6. Repository contract for agents: `AGENTS.md` (public-data boundary,
    branch discipline, smallest-change rule).
-6. To inspect the compiled binary (after `cargo build --locked`):
-   `herdr-fleet --help`, then per command
-   `doctor|status|plan|capabilities|config init|validate|show`.
+7. To inspect the compiled binary (after `cargo build --locked`):
+   `herdr-fleet --help`, then per command.
 
-## Current command surface (issue #4 read-only core)
+## Command surface (100% of `--help`; classification per command)
 
-| Command | Behavior |
-| --- | --- |
-| `config init` | Prints an annotated `hf-config/v1` TOML template to stdout (writes nothing). |
-| `config validate [--config PATH] [--json]` | Validates the config document and its named policy overlay. |
-| `config show [--config PATH] [--json]` | Renders the effective configuration (repositories, identities, pins). |
-| `doctor [--json]` | Checks prerequisites (git/herdr/gh) + config; never installs or starts anything. |
-| `status [--config PATH] [--json]` | Bounded read-only observation of configured repositories via local git + authenticated `gh`; degradation is explicit, never hidden. |
-| `plan <repository> <issue> [--revision HEX40] [--config PATH] [--json]` | Renders a deterministic read-only `hf-plan/v1` with a canonical digest and a redacted acceptance revision. |
-| `capabilities [--json]` | Reports declared forge read capabilities. |
+| Command | Classification | Behavior |
+| --- | --- | --- |
+| `config init` | read-only | Prints an annotated `hf-config/v1` TOML template to stdout (writes nothing). |
+| `config validate [--config PATH] [--json]` | read-only | Validates the config document and its named policy overlay (exit 5 refusals on unknown keys/versions/overlays). |
+| `config show [--config PATH] [--json]` | read-only | Renders the effective configuration (repositories, identities, harnesses, daemon, policy). |
+| `doctor [--json]` | read-only | Checks git/herdr(>=0.8.2)/gh + config; never installs/starts anything. Exit 0 ok, 3 missing/degraded, 5 invalid config. |
+| `status [--config PATH] [--json]` | read-only | Bounded observation of configured repositories from inside the local checkout (git + authenticated `gh` + herdr probe); degradation explicit. |
+| `plan <repository> <issue> [--revision HEX40] [--config PATH] [--json]` | read-only (renders; NEVER applies) | Deterministic `hf-plan/v1` with canonical sha256 digest + redacted acceptance-revision binding. |
+| `capabilities [--json]` | read-only | Declared forge read capabilities (`read_refs`, `read_issues`, `read_checks`). |
+| `daemon run [--socket PATH] [--config PATH]` | local state server (no fleet/external mutation) | Foreground single-writer daemon: flock, SQLite state open/migrated, interrupted-claim reconciliation, `hf-rpc/v1` on the per-user Unix socket. Second daemon refused. |
+| `daemon status [--config PATH] [--json]` | read-only probe | Live daemon + state facts; exit 1 `daemon.absent`/`daemon.stale` when not running. |
+| `service doctor [--config PATH] [--json]` | read-only | Daemon-environment checks (platform, config, socket, unit placement). |
+| `service install-plan [--config PATH] [--json]` | read-only (renders; never activates) | Renders the per-user launchd/systemd unit text + install steps. |
+| `service status-plan [--config PATH] [--json]` | read-only (renders) | Renders verification steps for the unit. |
+| `service uninstall-plan [--config PATH] [--json]` | read-only (renders) | Renders removal steps for the unit. |
+| daemon `apply` RPC (NOT a CLI subcommand) | **grant-gated mutation** | One digest-bound plan step per request over the socket, idempotency-keyed, journaled before effect; typed `hf-outcome/v1`. |
 
-Exit codes: 0 ok · 1 operational error · 2 usage · 3 partial · 4 refusal ·
-5 config error. In `--json` mode stdout carries exactly one `hf-output/v1`
-envelope; diagnostics go to stderr. Adapter reads (git/gh/herdr) run through
-a bounded env-isolated runner and one redaction pass at the boundary.
+There is no CLI mutation command. Any task that needs a fleet mutation must
+route through the daemon `apply` RPC with an authorized route grant — never
+through a workaround.
 
-## Bundled Doctrine default workflow (issue #6, link not duplicate)
+## JSON envelope contract
 
-The Doctrine default workflow (fake/no-effect step kinds only) has one
-canonical source in this repository; this skill links to it and never
-duplicates it:
+- `--json` commands write exactly one `hf-output/v1` document to stdout:
+  `schema`, `command`, `kind` (`ok` | `error` | `partial`), `data` or
+  `error` (with stable `code`, `retryable`), `exit_code`.
+- Exit codes (with or without `--json`): 0 ok · 1 operational error ·
+  2 usage · 3 partial · 4 refusal · 5 config error.
+- Diagnostics go to stderr; JSON output never prompts. Adapter reads run
+  through a bounded env-isolated runner with one redaction pass at the
+  boundary (never trust/shell-evaluate adapter or remote text).
+
+## Observe → plan (read-only) flow — do this unaided first
+
+1. Build: `cargo build --locked` (release: add `--release`).
+2. `herdr-fleet config init > ~/.config/herdr-fleet/config.toml`, edit it
+   to the repository you operate, then
+   `herdr-fleet config validate --json` → expect `kind:"ok"`, exit 0
+   (`config.invalid` exit 5 = fix the document).
+3. `herdr-fleet doctor --json` → expect all checks `status:"ok"`, exit 0
+   (exit 3 = a prerequisite is missing/degraded — install/auth the named
+   tool, never have the CLI do it).
+4. From inside the repository's local checkout:
+   `herdr-fleet status --json` → expect `freshness:"fresh"` and
+   `observed_repositories >= 1`, exit 0; `git.available:false` /
+   `github.available:false` are explicit degradations, not errors.
+5. `herdr-fleet plan <owner/name> <issue> --revision <40-hex> --json` →
+   expect `kind:"ok"`, exit 0, with a `hf-plan/v1` document, `plan_id`,
+   `digest` (sha256 over canonical bytes), and `state_epoch`. Without
+   `--revision`, authenticated `gh` is required (else exit 1
+   `forge.unavailable`; the message suggests offline mode). Rerun the same
+   command and diff: output is byte-deterministic.
+
+Never present `plan` output as applied work — plans are read-only
+renderings until an authorized grant + daemon `apply` executes them.
+
+## Plan digest + grant flow (mutations, #8 semantics)
+
+- The digest binds the plan: same inputs → same canonical bytes → same
+  `digest`; tampered bytes are refused at apply (`refusal.plan.identity`).
+- A route grant (`hf-grant/v1`) is the only authorization to start durable
+  work: it binds repository, plan digest, capabilities, role/policy
+  hashes, `state_epoch`, expiry, and instance; grants expire and die with
+  their epoch (material edits or restore rotate the epoch and invalidate
+  prior grants).
+- `apply` runs ONE plan step per request, requires `params.idempotency_key`
+  (`ik_` + 8-64 `[a-z0-9-]`), revalidates live under the state lock
+  (epoch/grant/expiry/revision/hashes/capability) and journals
+  (`mutate.*`) before the effect. Replaying a consumed key returns the
+  recorded response (at-most-once dispatch, exactly-once read-back).
+- Outcomes are typed `hf-outcome/v1`: `succeeded` | `failed` | `refused` |
+  `ambiguous` | `superseded`. `ambiguous` (crash/timeout/restore) always
+  requires external reconciliation before a new key.
+- Kind gates: merge needs current review evidence bound to the exact head
+  (`refusal.evidence.stale` on moved bindings); issue closure requires the
+  instance at `post_merge_verify` with passing evidence; production-branch
+  effects need a fresh interactive TTY-confirmed digest; real-external
+  scopes need the recorded first-write approval.
+- Normative sources (link, never duplicate): `docs/contracts/spec-plans.md`
+  (apply semantics, grants, epochs, idempotency), `docs/contracts/
+  spec-daemon.md` (RPC request/response, methods, replay),
+  `docs/contracts/spec-review-evidence.md` (evidence rows).
+- Tests that prove these flows: `tests/mutation_engine.rs` (socket-level
+  flows over disposable local repositories), `tests/daemon_rpc.rs`,
+  `tests/daemon_lifecycle.rs` — no credentials, no external state.
+
+## Bundled Doctrine default workflow (#6, link not duplicate)
 
 - Canonical source (versioned + hash-pinned):
   `schemas/fixtures/workflow/workflow.doctrine.json` (`workflow_id`
   `fleet-doctrine-1`, `hf-workflow/v1`).
 - Normative spec and engine rules: `docs/contracts/spec-workflow.md`
-  ("Engine semantics" and "Bundled Doctrine default", issue #6).
+  ("Engine semantics" and "Bundled Doctrine default").
 - Rust embedding + pinned digest: `src/engine.rs`
   (`engine::doctrine_default`, `engine::DOCTRINE_DIGEST`).
 - The public skill uses this workflow's model-agnostic default roles
   (orchestrator/implementer/reviewer); workflow content can never carry
   policy, capabilities, target, or approval authority.
 
-## Harness adapters (issue #7, link not duplicate)
-
-The harness adapter contract has one canonical home in this repository;
-this skill links to it and never duplicates it:
+## Harness adapters (#7, link not duplicate)
 
 - Normative contract: `docs/contracts/spec-capabilities.md` ("Adapter
-  contract", issue #7) — closed operation set, typed refusal codes,
-  identity-triple rule, fake-adapter doctrine.
+  contract") — closed operation set, typed refusal codes, identity-triple
+  rule, fake-adapter doctrine.
 - Declared version ranges and measured version facts:
-  `docs/contracts/compatibility.md` (Hermes Agent / Claude Code / Codex
-  rows, 2026-09-06).
-- Rust implementation: `src/adapters.rs` (`herdr_fleet::adapters`); contract
-  tests with fake executables: `tests/harness_adapters.rs` — public CI and
-  fork PRs need no harness credentials. Real harness parity is a
-  human-gated clean-host smoke documented in `.report-7.md`, never run from
-  this repository's CI (AC6/AC7).
+  `docs/contracts/compatibility.md`.
+- Rust implementation: `src/adapters.rs` (`herdr_fleet::adapters`);
+  contract tests with fake executables: `tests/harness_adapters.rs` —
+  public CI and fork PRs need no harness credentials. Real harness parity
+  is a human-gated clean-host smoke, never run from this repository's CI.
 
-## Control-plane mutations (issue #8, link not duplicate)
+## Control-plane mutations (#8, link not duplicate)
 
-The daemon-mediated mutation layer has one canonical home; this skill links
-to it and never duplicates it:
-
-- Normative contract: `docs/contracts/spec-plans.md` ("Apply semantics",
-  issue #8) and `docs/contracts/spec-review-evidence.md` (durable evidence
-  rows, m0003/schema v3).
+- Normative contract: `docs/contracts/spec-plans.md` ("Apply semantics")
+  and `docs/contracts/spec-review-evidence.md` (durable evidence rows).
 - Rust implementation: `src/mutation.rs` (`herdr_fleet::mutation` engine +
   effect registry), `src/daemon.rs` (`plan`/`apply` RPC handlers), durable
   rows + invalidation semantics in `src/state.rs`.
 - Acceptance tests: `tests/mutation_engine.rs` (socket-level flows over
   disposable local repositories) — public CI needs no credentials.
 
-## Release readiness (issue #10, link not duplicate)
+## Lifecycle, cleanup, and recovery (#9 — pointers)
 
-The release-readiness machinery has one canonical home; this skill links to
-it and never duplicates it:
+- Schedules/admission/cleanup-archive/recovery/remote semantics:
+  `docs/contracts/spec-lifecycle.md` (recurring non-destructive
+  `hf-schedule/v1`; cold boot runs one fresh evaluation per due schedule
+  before the socket serves; fan-out admission refuses without host-resource
+  proofs or on monorepo overlap; cleanup archives with byte-verified
+  salvage manifests; system-SSH remote transport is a verified contract).
+- Daemon recovery: after a crash/kill, `daemon status --json` reports
+  `daemon.stale` (exit 1, retryable); a fresh `daemon run` reclaims the
+  socket, migrates state, reconciles interrupted claims, and serves —
+  read-only commands never need the daemon.
+- State/journal/backup: `docs/contracts/spec-state.md` (migrations
+  m0001-m0004, audit/event journals, backup/restore with retention);
+  restore rotates the epoch and invalidates prior grants.
+- Operations runbook: `docs/OPERATIONS.md` sections 5, 7, 8 (daemon
+  lifecycle, cleanup/archives, recovery after crash/cold boot).
+- Release archives/provenance/upgrade: `docs/RELEASING.md` (execution
+  human-gated).
+
+## Release readiness (#10, link not duplicate)
 
 - Normative contract + version/schema policy + documented command rows:
   `docs/RELEASING.md` (in-repo machinery active; release EXECUTION
-  human-gated: no promotion/tag/upload/attestation/soak from CI or lanes).
+  human-gated).
 - Deterministic archive builder + verifier (`scripts/build-archive.py`,
   `scripts/test-build-archive.py`): platform archives with SHA-256
-  checksums, offline SPDX SBOM from `Cargo.lock`, and the
-  `release-provenance/v1` record binding source ref + binary-reported
-  schema facts (`herdr-fleet --version`).
+  checksums, offline SPDX SBOM from `Cargo.lock`, and
+  `release-provenance/v1` records.
 - Clean-host verification (`scripts/clean-host-verify.sh`,
-  `scripts/clean-host-probe.py`, `scripts/test-clean-host-probe.py`): the
-  AC2 command rows humans run on fresh macOS/Linux hosts; fixture-level
-  self-tests run the same checks in disposable temp dirs.
+  `scripts/clean-host-probe.py`, `scripts/test-clean-host-probe.py`).
 - Baseline machinery + committed table (`scripts/measure-baseline.py`,
   `docs/contracts/baseline-linux-x86_64.csv`,
-  `docs/contracts/benchmarks.md`): pure-core latency/RSS budgets, opt-in
-  same-host-class checks, never a CI gate.
-- Compatibility probe mapping: `docs/contracts/compatibility.md`
-  ("Capability-probe mapping", issue #10 AC4).
-
-## Current limitation (CLI read-only; daemon-mediated effects only)
-
-The CLI performs **no fleet mutations**: no spawn, rearm, review, plugin,
-or release effects exist outside the daemon's `plan`/`apply` RPC, and apply
-executes one capability-gated plan step per request against an authorized
-grant + instance — never unplanned work. The daemon never mutates external
-repositories in this repository's tests (disposable local repositories and
-fakes only). Do not present the locked-target architecture (under
-`docs/architecture/`) as current behavior — it is the approved *target*
-model from the roadmap umbrella.
+  `docs/contracts/benchmarks.md`): never a CI gate.
+- Compatibility probe mapping: `docs/contracts/compatibility.md`.
 
 ## Safety direction (plan/apply gates)
 
@@ -169,21 +224,20 @@ back, and revalidated against live grant/instance/epoch state immediately
 before the effect; production/destructive actions require fresh interactive
 TTY confirmation (and recorded first-write approval for real-external
 scopes) and can never be scheduled. Any proposal to add mutation behavior
-outside this machinery is out-of-scope for the read-only core and routes
-through the roadmap.
+outside this machinery is out-of-scope and routes through the roadmap.
 
 ## Adapter-example note
 
 Hermes (or any agent harness) may appear in this repository only as a
-clearly labeled *adapter example* of the future harness-neutral design —
-never as a required invocation path, profile layout, or core dependency.
-This skill is usable with any harness or with none.
+clearly labeled *adapter example* of the harness-neutral design — never as
+a required invocation path, profile layout, or core dependency. This skill
+is usable with any harness or with none.
 
 ## Repository rules that bind work here
 
 - Public-data rule: never commit host paths, private repository names,
-  credentials, provider/model policy, or live scheduler identity (CI
-  scans every PR).
+  credentials, provider/model policy, or live scheduler identity (CI scans
+  every PR).
 - Branches: PRs target `staging`; `main` changes only via human promotion
   (or the documented hotfix exception).
 - License: Apache-2.0 OR MIT; DCO not adopted.

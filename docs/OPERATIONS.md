@@ -1,0 +1,504 @@
+# Operations runbook
+
+Task-ordered, human-oriented guide to operating `herdr-fleet` day to day:
+install → configure → observe → plan → daemon/service lifecycle →
+grant-gated mutations (dry-run → apply → verify) → cleanup → recovery →
+remote transport → upgrade. Every command below was exercised against the
+real release binary (`cargo build --release --locked`) in a private,
+disposable sandbox with **synthetic fixtures only** — a fake `gh`/`herdr` on
+a controlled PATH, a synthetic local git checkout of `example-org/widgets`,
+and isolated XDG config/state/runtime dirs. No repository, fleet, host
+service manager, or external system was mutated; quoted outputs are trimmed
+and host paths are redacted (`.../`), per the repository's public-data rule.
+
+Normative contracts (authoritative; this runbook links, never duplicates):
+[contracts/README.md](contracts/README.md) (corpus index),
+[contracts/spec-cli.md](contracts/spec-cli.md) (envelopes/exit codes),
+[contracts/spec-daemon.md](contracts/spec-daemon.md) (RPC),
+[contracts/spec-plans.md](contracts/spec-plans.md) (plan/apply/grant/outcome
+semantics),
+[contracts/spec-lifecycle.md](contracts/spec-lifecycle.md)
+(schedules/admission/cleanup/recovery/remote),
+[RELEASING.md](RELEASING.md) (archives/upgrade policy).
+
+Exit-code contract (with or without `--json`): 0 ok · 1 operational error ·
+2 usage · 3 partial · 4 refusal · 5 config error. In `--json` mode stdout
+carries exactly one `hf-output/v1` document; diagnostics go to stderr; JSON
+output never prompts.
+
+---
+
+## 1. Install
+
+Prerequisites: Rust 1.97.1 (pinned by `rust-toolchain.toml`), `git` on
+PATH. `doctor` (section 3) additionally checks `herdr` >= 0.8.2 and
+authenticated `gh`; nothing here installs them.
+
+```console
+$ git clone https://github.com/jirathip-dev/herdr-fleet.git
+$ cd herdr-fleet
+$ cargo build --release --locked
+$ ./target/release/herdr-fleet --version        # exit 0
+herdr-fleet 0.1.0
+...
+state schema version: 4
+migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4
+document schema families: hf-config/v1, hf-policy/v1, hf-output/v1, hf-error/v1, ...
+```
+
+`--version` reports the schema facts the binary was built against — the
+same facts release archives bind to their provenance records
+([RELEASING.md](RELEASING.md)).
+
+Failure → remedy:
+
+| Symptom | Remedy |
+| --- | --- |
+| `cargo build` fails to fetch | Offline host: pre-fetch with the committed `Cargo.lock` (`cargo fetch --locked`), then `--offline`. |
+| `--version` exits != 0 | Wrong toolchain: install the pinned 1.97.1 (see [DEVELOPMENT.md](DEVELOPMENT.md)) and rebuild `--locked`. |
+
+## 2. Configure
+
+Prerequisites: a target repository identity of the form `owner/name`.
+
+The CLI never writes files: `config init` prints an annotated
+`hf-config/v1` template to stdout; you redirect it to the canonical XDG
+location yourself.
+
+```console
+$ ./target/release/herdr-fleet config init > ~/.config/herdr-fleet/config.toml   # exit 0
+$ $EDITOR ~/.config/herdr-fleet/config.toml
+```
+
+Minimal document (schema + one repository; optional tables only — daemon,
+policy, repository, harness, workflow, role):
+
+```toml
+schema = "hf-config/v1"
+
+[daemon]
+enabled = true
+
+[policy]
+overlay = "policy.toml"
+
+[repository.widgets]
+origin = "https://github.com/example-org/widgets"
+branch = "staging"
+enabled = true
+```
+
+Validate and inspect:
+
+```console
+$ ./target/release/herdr-fleet config validate            # exit 0
+config valid: .../.config/herdr-fleet/config.toml
+$ ./target/release/herdr-fleet config validate --json     # exit 0
+{"command":"config validate","data":{"config_path":".../.config/herdr-fleet/config.toml",
+ "policy_overlay":{"path":".../.config/herdr-fleet/policy.toml","valid":true},
+ "valid":true},"exit_code":0,"kind":"ok","schema":"hf-output/v1"}
+$ ./target/release/herdr-fleet config show --json         # exit 0
+{"command":"config show","data":{"config_path":".../.config/herdr-fleet/config.toml",
+ "daemon_enabled":true,"daemon_socket":null,
+ "repositories":[{"branch":"staging","enabled":true,"identity":"example-org/widgets",
+ "key":"widgets","origin":"https://github.com/example-org/widgets"}], ...},
+ "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
+```
+
+Failure → remedy:
+
+| Symptom (exit) | Envelope | Remedy |
+| --- | --- | --- |
+| Named overlay missing (5) | `policy.not_found` | Create the `[policy] overlay` file you named (it is never implicitly discovered). |
+| Unsupported version (5) | `config.invalid`, `refusal: refuse-version` | `schema` must be `hf-config/v1` (and the overlay `hf-policy/v1`); see the template. |
+| `--config PATH` unreadable (5) | `config.invalid` | Point `--config` at an existing file or fix permissions. |
+
+## 3. Observe (read-only)
+
+Prerequisites: nothing beyond what you are observing. `doctor` checks git,
+`herdr`, and `gh` presence/versions/auth and the config document; it never
+installs, starts, or stops anything.
+
+```console
+$ ./target/release/herdr-fleet doctor --json              # exit 0
+{"command":"doctor","data":{"checks":[
+ {"detail":"git version 2.52.0","name":"git","status":"ok"},
+ {"detail":"herdr 0.8.2 (declared minimum 0.8.2)","name":"herdr","status":"ok"},
+ {"detail":"gh 9.9.9; authenticated; scopes: repo, read:org","name":"gh","status":"ok"}],
+ "config":{"path":".../.config/herdr-fleet/config.toml","status":"ok"}},
+ "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
+```
+
+Declared read capabilities (static; no negotiation, no shell guessing):
+
+```console
+$ ./target/release/herdr-fleet capabilities --json        # exit 0
+{"command":"capabilities","data":{"capability":{
+ "actor":"herdr-fleet","axis":"forge",
+ "capabilities":["read_refs","read_issues","read_checks"],
+ "schema":"hf-capability/v1"}},"exit_code":0,"kind":"ok","schema":"hf-output/v1"}
+```
+
+`status` observes each enabled configured repository **from inside its
+local checkout** (the invoking directory) through local git + authenticated
+`gh`, plus a herdr probe. Bounded: at most 4 concurrent observers, 10s per
+process; partial failures are explicit, never hidden.
+
+```console
+$ cd .../widgets-checkout
+$ /path/to/herdr-fleet status --json                      # exit 0
+{"command":"status","data":{"expected_repositories":1,"freshness":"fresh",
+ "observed_repositories":1,
+ "observations":[
+  {"completeness":"complete","freshness":"fresh","payload":{
+   "compatible":true,"declared_minimum":"0.8.2","present":true,
+   "source":"herdr --version","surface":"herdr","version":"0.8.2"},
+   "schema":"hf-observation/v1","subject":{"id":"herdr","type":"host"}},
+  {"completeness":"complete","freshness":"fresh","observed_at":"<ts>","payload":{
+   "git":{"available":true,"branch":"staging","head":"ef1c...b4c8",
+    "origin_matches":true,"source":"local git checkout","surface":"git"},
+   "github":{"archived":false,"available":true,"default_branch":"staging",
+    "identity_matches":true,"remote_identity":"example-org/widgets",
+    "source":"gh api repos/owner/name","surface":"github"}},
+   "schema":"hf-observation/v1","subject":{"id":"example-org/widgets","type":"repository"}}],
+ "timings_ms":{"partial_failures":0,"requests":3,...}},
+ "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
+```
+
+Failure → remedy:
+
+| Symptom (exit) | Envelope/detail | Remedy |
+| --- | --- | --- |
+| Missing prerequisites (3) | checks `status: "missing"`, e.g. `gh not found on PATH — GitHub reads need authenticated gh` | Install/auth the named tool; re-run `doctor`. |
+| Config invalid (5) | `config.invalid` | Fix the config per section 2. |
+| `github.available:false` (still 0) | `reason: "gh.unavailable"` | Degradation is explicit and reported, not hidden: authenticate `gh` or accept the local-only observation. |
+| `git.available:false` (still 0) | `reason: "no_local_checkout"` | Run `status` from the repository's local checkout (or configure the repo you are standing in). |
+
+## 4. Plan (read-only)
+
+Prerequisites: a configured repository (section 2) and either authenticated
+`gh` (to derive the acceptance revision from the issue's live text) or an
+explicit `--revision <40-hex>`.
+
+`plan` renders a deterministic `hf-plan/v1` — the same inputs always
+produce the same canonical bytes and sha256 `digest`, and `state_epoch` is
+bound to the state it was computed against. **`plan` never applies
+anything.**
+
+Offline (explicit revision):
+
+```console
+$ ./target/release/herdr-fleet plan example-org/widgets 7 \
+    --revision 0123456789abcdef0123456789abcdef01234567 --json   # exit 0
+{"command":"plan","data":{
+ "digest":"816469e345ff69d255ccb4ed211326f0704dd16c3f2e6eabce2bd87fccd3e87b",
+ "issue_source":"argument",
+ "plan":{"issue":{"number":7,"revision":"0123...4567"},
+  "plan_id":"hf_plan_facc0e46cf38511f","repository":"example-org/widgets",
+  "schema":"hf-plan/v1","state_epoch":0,
+  "steps":[{"id":"p1","kind":"checkout","params":{"ref":"staging"}},
+   {"id":"p2","kind":"worktree_create","params":{"scope":"issues/7"}},
+   {"id":"p3","kind":"harness_start","params":null},
+   {"id":"p4","kind":"prompt","params":null},
+   {"id":"p5","kind":"collect_outcome","params":null},
+   {"id":"p6","kind":"review_evidence","params":null},
+   {"id":"p7","kind":"merge","params":null},
+   {"id":"p8","kind":"cleanup","params":null}],
+  "workflow_hash":"a906f1289dee1b1d3f1a5fbe3641c0cfcf166dc645e7a3827d419f010767c01f",
+  "workflow_id":"fleet-doctrine-1"}},
+ "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
+```
+
+Live (revision derived from the issue's redacted acceptance text through
+`gh`):
+
+```console
+$ ./target/release/herdr-fleet plan example-org/widgets 7 --json   # exit 0
+{"command":"plan","data":{"digest":"5566...93d",
+ "issue_source":"github",
+ "plan":{"issue":{"number":7,"revision":"463becfc6674875eee85a7371b3c6037980424ab"}, ...}}
+```
+
+Failure → remedy:
+
+| Symptom (exit) | Envelope | Remedy |
+| --- | --- | --- |
+| `gh` unavailable, no `--revision` (1) | `forge.unavailable` — "pass `--revision <40hex>` to render the plan offline" | Render offline with `--revision` or make `gh` available. |
+| Unconfigured repository (2) | stderr: ``plan: no configured repository matches "not-configured"; configure it first (see `herdr-fleet config init`); run `herdr-fleet plan --help``` `` | Add the repository to the config (section 2). |
+| Non-numeric issue / malformed `--revision` (2) | usage error on stderr | `<issue>` is a positive integer; `--revision` is exactly 40 hex. |
+
+Determinism check: run the same offline command twice and diff — byte
+identical stdout (the digest is over the canonical plan bytes).
+
+## 5. Daemon + service lifecycle
+
+Prerequisites: config with `[daemon] enabled = true` (section 2). The
+daemon is a single-writer per-user state server: flock + SQLite state +
+audit/event journals + one Unix socket. State location follows XDG
+(`.../.local/state/herdr-fleet/...` by default; isolate with
+`XDG_STATE_HOME`); the socket defaults to the XDG runtime dir
+(`.../herdr-fleet/daemon.sock`) unless `--socket` or `config daemon.socket`
+overrides it. A second daemon is refused.
+
+Start (foreground — run it in a terminal or under a service unit, section
+5.1):
+
+```console
+$ ./target/release/herdr-fleet daemon run
+# daemon.log: {"event":"daemon.start",...} {"event":"daemon.ready",
+#  "message":"state open; reconciled 0 interrupted claim(s); serving .../herdr-fleet/daemon.sock",...}
+```
+
+Probe from another terminal:
+
+```console
+$ ./target/release/herdr-fleet daemon status --json       # exit 0 (live)
+{"command":"daemon status","data":{"daemon":{"pid":<pid>,
+ "started_at":"<ts>","version":"0.1.0"},
+ "freshness":"fresh","state":{"active_grants":0,"epoch":1,"event_seq":0,
+ "journal_seq":0,"pending_claims":0,"poisoned":false,"schema_version":4}},
+ "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
+```
+
+Stop the daemon with Ctrl-C / SIGTERM in the daemon terminal. The binary
+installs no signal handler, so the socket file is **not** unlinked on exit:
+immediately after a stop — or a crash — `daemon status` reports the stale
+socket:
+
+```console
+$ ./target/release/herdr-fleet daemon status --json   # after stop/crash: exit 1
+{"command":"daemon status","error":{"code":"daemon.stale","details":null,
+ "message":"a stale daemon socket exists at .../herdr-fleet/daemon.sock; a fresh `daemon run` reclaims it","retryable":true},
+ "exit_code":1,"kind":"error","schema":"hf-output/v1"}
+```
+
+Remedy: start a fresh `daemon run` — it reclaims the stale socket,
+reopens/migrates the state, and reconciles interrupted claims on start;
+verify with `daemon status --json` again (exit 0). Full recovery flow:
+section 8.
+
+The `daemon.absent` envelope below appears only when the runtime directory
+never served a daemon (fresh boot or a fresh XDG runtime dir) or after the
+stale socket has been reclaimed/removed:
+
+```console
+$ ./target/release/herdr-fleet daemon status --json       # exit 1
+{"command":"daemon status","error":{"code":"daemon.absent","details":null,
+ "message":"no daemon is running on .../herdr-fleet/daemon.sock; read-only commands (doctor/status/plan) stay available without it","retryable":false},
+ "exit_code":1,"kind":"error","schema":"hf-output/v1"}
+```
+
+Read-only commands stay available without the daemon.
+
+Failure → remedy:
+
+| Symptom (exit) | Detail | Remedy |
+| --- | --- | --- |
+| Second daemon refused (1) | stderr: `another daemon is already running: another daemon holds the lock (pid <pid> ...)` | One daemon per user by design; probe with `daemon status`, do not stack daemons. |
+| No daemon (1) | `daemon.absent` | Start `daemon run` (or the service unit). |
+| Stale socket (1, retryable) | `daemon.stale` — "a stale daemon socket exists ...; a fresh `daemon run` reclaims it" | Start a fresh `daemon run`; it reclaims the socket (section 8). |
+| Wrong socket probed | `daemon.absent` naming a path you did not serve | Match `--socket` (or config `daemon.socket`) between `run` and `status`, or use the default path on both. |
+
+### 5.1 Service units (plans only — never activated by the CLI)
+
+`service doctor` checks the daemon environment read-only; the `*-plan`
+commands render the first-party per-user launchd/systemd unit text and the
+exact host steps. **They never install, start, stop, or query the host
+service manager** — a human executes the rendered steps on the target host.
+
+```console
+$ ./target/release/herdr-fleet service doctor --json      # exit 0
+{"command":"service doctor","data":{"checks":[
+ {"detail":"systemd","name":"platform","status":"ok"},
+ {"detail":"daemon.enabled=true","name":"config","status":"found"},
+ {"detail":"daemon not running","name":"socket","status":"absent"},
+ {"detail":".../.config/systemd/user/herdr-fleet.service","name":"service-unit","status":"absent"}],
+ "summary":{"daemon":"absent","platform":"systemd","unit":"absent"}},
+ "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
+```
+
+```console
+$ ./target/release/herdr-fleet service install-plan --json   # exit 0
+{"command":"service install-plan","data":{"platform":"systemd",
+ "steps":[
+  "write the rendered unit to .../.config/systemd/user/herdr-fleet.service (content printed by the install command)",
+  "run: systemctl --user daemon-reload",
+  "run: systemctl --user enable --now herdr-fleet.service",
+  "verify: systemctl --user --no-pager status herdr-fleet.service"],
+ "target":".../.config/systemd/user/herdr-fleet.service",
+ "unit":"# herdr-fleet per-user daemon unit (issue #5; rendered, not activated)
+[Unit]
+Description=herdr-fleet state daemon (single writer per user)
+...
+[Service]
+Type=simple
+ExecStart=<herdr-fleet-binary> daemon run --socket .../herdr-fleet/daemon.sock
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+...
+"}, "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
+```
+
+`service status-plan` renders the verification steps and `service
+uninstall-plan` the removal steps for the same unit; both exit 0 and both
+contain the unit text for inspection.
+
+Failure → remedy:
+
+| Symptom (exit) | Detail | Remedy |
+| --- | --- | --- |
+| `service doctor` rows not ok | e.g. `daemon.enabled=false` in config, socket absent | Enable the daemon in config / start the daemon first; re-run `service doctor`. |
+| Wrong platform unit | `platform` row says `launchd`/`systemd` | The renderer targets the host it runs on; run `*-plan` on the target host (macOS → launchd, Linux → systemd). |
+
+## 6. Grant-gated mutations (daemon `apply` — RPC only)
+
+Boundary: the CLI surface is read-only. There is **no** CLI subcommand that
+mutates; the only mutation path is the daemon `apply` RPC over the local
+socket (issue #8 semantics, [spec-plans.md](contracts/spec-plans.md),
+[spec-daemon.md](contracts/spec-daemon.md)). The material below is the operator
+workflow in terms of the documented contract and is **synthetic guidance**:
+this repository never mutates real repositories, fleets, or external state,
+and its tests use disposable local repositories and fakes only.
+
+Workflow: **render → grant → apply one step at a time → verify**, always
+with a fresh interactive TTY for production-branch effects.
+
+1. **Dry-run (render + validate).** Render the plan (section 4), keep the
+   envelope: `plan_id`, `digest`, `state_epoch`, and the exact step ids are
+   what grants and applies bind to. A plan's digest is over its canonical
+   bytes; any tamper changes the digest and apply refuses it
+   (`refusal.plan.identity`).
+2. **Grant.** A route grant (`hf-grant/v1`) is the only authorization to
+   start durable work. It binds repository, plan digest, capabilities,
+   role/policy hashes, `state_epoch`, expiry, and instance. Grants are
+   issued/consumed by the daemon, expire, and die with their epoch —
+   request one from the daemon (`grants.list` shows live grants;
+   `grants.revoke` cancels one).
+3. **Apply.** `apply` executes **one plan step per request** and requires
+   `params.idempotency_key` (`ik_` + 8-64 `[a-z0-9-]`). The daemon
+   recomputes the digest before anything is journaled, then revalidates
+   under the state lock: live epoch vs plan/grant/instance, grant status
+   and expiry (expired → `refusal.grant.expired`), the observed issue
+   revision vs the grant binding, workflow/policy hashes, and the step's
+   required capability. The intent is journaled (`mutate.*`) before the
+   effect; the effect runs outside the lock through allowlisted
+   subprocesses; the response is a typed `hf-outcome/v1`.
+4. **Verify.** Read the exact result back: the recorded outcome for a
+   consumed idempotency key is returned instead of re-dispatching
+   (exactly-once read-back; at-most-once dispatch). Replaying a request id
+   + key returns the recorded response. Kind-specific verification gates
+   run before sensitive steps: an integration merge requires current
+   review evidence bound to head/base/workflow/policy (moved bindings →
+   `refusal.evidence.stale`); issue closure requires the instance to sit at
+   `post_merge_verify` with passing evidence; production-branch effects
+   require a fresh interactive TTY-confirmed digest; real-external target
+   scopes require the recorded first-write approval.
+
+Outcome statuses: `succeeded` | `failed` | `refused` | `ambiguous` |
+`superseded`. `failed`/`refused` outcomes carry an `hf-error/v1`-shaped
+error. `ambiguous` (timeout, process death, post-effect record failure)
+**always requires external reconciliation before a new key**.
+
+Failure → remedy:
+
+| Symptom | Detail | Remedy |
+| --- | --- | --- |
+| Apply refused | `refusal.plan.identity` | The carried plan bytes were tampered; re-render and re-grant. |
+| Apply refused | `refusal.grant.expired` / epoch mismatch | Re-issue a grant against the live epoch; material edits or restore rotated the epoch and invalidated prior grants. |
+| Merge refused | `refusal.evidence.stale` | Re-review at the moved head; evidence must bind the current head/base/workflow/policy. |
+| Outcome `ambiguous` | interrupted/restored work | External reconciliation required before a new idempotency key — never blindly retry. |
+| Mutation request rejected | missing/`ik_`-malformed idempotency key | Every mutating apply requires a well-formed `params.idempotency_key`. |
+
+## 7. Cleanup and archives
+
+- **Worktree cleanup / salvage** (issue #9): the daemon's cleanup path
+  archives rather than destroys — cleanup keeps its salvage audit pair
+  (`mutate.cleanup` before, `salvage.cleanup` after) with byte-verified
+  manifests. Operator-facing semantics, retention, and audit deletion:
+  [spec-lifecycle.md](contracts/spec-lifecycle.md) sections 5 and 7.
+- **Backups**: `backup.create` snapshots state through the daemon;
+  retention-bounded pruning keeps the backup set bounded. Restore is an
+  epoch event: `restore.begin` creates a new state epoch, marks interrupted
+  work `ambiguous`, invalidates prior grants/digests, and only then do new
+  grants issue — see [spec-plans.md](contracts/spec-plans.md) (epoch restore) and
+  [spec-lifecycle.md](contracts/spec-lifecycle.md).
+- **Release archives** (issue #10) are a separate, human-gated surface:
+  deterministic platform archives with checksums + offline SBOM +
+  provenance are built by `scripts/build-archive.py` per
+  [RELEASING.md](RELEASING.md); release execution is human-only.
+
+## 8. Recovery after crash / cold boot
+
+The daemon is designed to be restarted freely; state is SQLite + journals,
+and the socket is reclaimable.
+
+```console
+$ ./target/release/herdr-fleet daemon status --json   # after a crash/kill: exit 1
+{"command":"daemon status","error":{"code":"daemon.stale",...,
+ "message":"a stale daemon socket exists at .../herdr-fleet/daemon.sock; a fresh `daemon run` reclaims it",...},
+ "exit_code":1,"kind":"error","schema":"hf-output/v1"}
+```
+
+Remedy — start a fresh daemon; it reclaims the stale socket, opens/migrates
+the state, and reconciles interrupted claims:
+
+```console
+$ ./target/release/herdr-fleet daemon run     # foreground; on ready, daemon.log shows
+#  "state open; reconciled 0 interrupted claim(s); serving .../herdr-fleet/daemon.sock"
+$ ./target/release/herdr-fleet daemon status --json    # exit 0 — live again
+{"command":"daemon status","data":{"daemon":{"pid":<pid>,...},
+ "state":{"active_grants":0,"epoch":1,...}},"exit_code":0,"kind":"ok","schema":"hf-output/v1"}
+```
+
+- **Cold boot**: the daemon runs the same recovery plus one fresh
+  evaluation per due schedule before the socket serves; recovery never
+  depends on herdr/git/gh being present (spec-lifecycle.md section 3).
+- **Journal inspection**: `journal.tail` reads the audit/event streams;
+  interrupted claims are reconciled at startup (the journal is the
+  authority for what was journaled before an effect).
+- **Restore after corruption/restore events**: epoch rotates (section 7);
+  interrupted work becomes `ambiguous` and needs external reconciliation.
+- Read-only commands never need the daemon — observing and planning stay
+  available while the daemon is down.
+
+## 9. Remote transport boundary
+
+The system-SSH remote transport is a **verified contract**, not a live
+background feature of the CLI: the surface an operator reaches is local
+(git/gh/herdr on the invoking host; the daemon on the per-user socket).
+Remote semantics — what may cross an SSH boundary, and the verified
+transport contract — are specified in
+[spec-lifecycle.md](contracts/spec-lifecycle.md) section 6. Nothing in this
+repository connects outward from CI or lanes, and no harness session runs
+from public CI or fork PRs.
+
+## 10. Upgrade
+
+1. Pull the new release, rebuild pinned: `cargo build --release --locked`.
+2. Check the schema facts: `herdr-fleet --version` (migration chain must
+   include the new `mNNNN_*` entry).
+3. Stop the daemon/service (Ctrl-C, or the service steps from section
+   5.1), start the new binary — the daemon opens/migrates SQLite state on
+   start (`daemon.ready` in `daemon.log`), then verify with
+   `daemon status --json` (state row shows `schema_version`).
+4. Re-issue grants after any restore/epoch rotation (section 7); schedules
+   survive restarts by design and stay paused until explicitly resumed.
+5. Release/version policy, archive verification, and rollback notes:
+   [RELEASING.md](RELEASING.md).
+
+---
+
+## Appendix: command/exit summary
+
+| Command | Read-only? | Typical exit |
+| --- | --- | --- |
+| `config init` / `config validate` / `config show` | yes | 0; 5 on config/policy errors |
+| `doctor` | yes | 0 ok; 3 missing/degraded; 5 invalid config |
+| `status` | yes | 0 (degradations explicit); 5 config errors |
+| `plan` | yes (never applies) | 0; 1 `forge.unavailable`; 2 usage; 5 config errors |
+| `capabilities` | yes | 0 |
+| `daemon run` | local state server (no fleet/external mutation) | foreground; 1 when another daemon holds the lock |
+| `daemon status` | yes | 0 live; 1 `daemon.absent`/`daemon.stale` |
+| `service doctor` / `install-plan` / `status-plan` / `uninstall-plan` | yes (plans only) | 0 |
+| daemon `apply` RPC | **grant-gated mutation** (one digest-bound plan step per request, idempotency-keyed) | typed `hf-outcome/v1`; refusals are typed and never downgraded |
