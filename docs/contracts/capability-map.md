@@ -37,7 +37,7 @@ position-less capability survives this table.
 | C10 | Review evidence contract binding feature head / integration base / workflow hash / policy hash | RETAIN | Review gates (core) | C7, C9 | AC4; integration merge requires distinct exact-head reviewer + hosted checks |
 | C11 | Herdr CLI/socket adapter (workspace/terminal/process execution substrate) | RETAIN | Adapter: herdr | C4, C18 compat | Locked spec: Herdr-first; external commands argv-only, bounded, scrubbed |
 | C12 | Git/GitHub read-back + read-only status adapters | RETAIN | Adapter: git/forge | C18 compat | Locked spec: live Git/GitHub read-back owns observed reality |
-| C13 | Official harness adapters: Hermes, Claude Code, Codex (+ constrained declarative argv adapter) | RETAIN | Adapter: harness | C3, C20 | Locked spec: first official adapters; others after 1.0; no shell templates |
+| C13 | Official harness adapters: Hermes, Claude Code, Codex, Pi (+ constrained declarative argv adapter) | RETAIN | Adapter: harness | C3, C20 | Locked spec: first official adapters; others after 1.0; no shell templates |
 | C14 | Agent-side skill packaging (`skills/herdr-fleet`) | RETAIN | Skill (docs) | C1 | Locked spec: generic skill installable from the repo, no machine-local policy |
 | C15 | Bounded schedules (scoped, expiring, single-flight, coalesced ticks) | RETAIN | Daemon scheduler | C4, C5 | Locked spec runtime section; never schedules production/destructive (risk model) |
 | C16 | SSH remote operation to a per-host daemon (system SSH only, no federation) | RETAIN | Daemon remote | C4 | Locked spec runtime section; optional after 1.0 core |

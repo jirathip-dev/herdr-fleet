@@ -59,9 +59,11 @@ contract tests (`tests/harness_adapters.rs`) that public CI and fork PRs
 can run with **no harness credentials** (AC7).
 
 - **Official adapters**: Hermes (`hermes`), Claude Code (`claude`), Codex
-  (`codex`) — adapter examples per ADR-0003, with declared version ranges in
-  [compatibility.md](compatibility.md) (measured 2026-09-06) and the full
-  closed harness capability set above.
+  (`codex`), and Pi (`pi`, earendil-works/pi — issue #33) — adapter
+  examples per ADR-0003, with declared version ranges in
+  [compatibility.md](compatibility.md) (Hermes/Claude Code/Codex measured
+  2026-09-06; Pi measured 2026-09-08) and the full closed harness
+  capability set above.
 - **Generic adapter**: the declarative `argv` kind — validated argv arrays,
   explicit capability declarations, bare executable names resolved through
   the allowlisted PATH (the verified absolute identity is what is spawned),
@@ -108,10 +110,13 @@ can run with **no harness credentials** (AC7).
 
 ## Harness neutrality consequences
 
-- Hermes/Claude Code/Codex are 1.0 **adapter examples** (issue #7) with
-  their own compatibility matrices ([compatibility.md](compatibility.md));
-  the domain core contains no product-name branches and no model/provider
-  names.
+- Hermes/Claude Code/Codex/Pi are 1.0 **adapter examples** (issues #7/#33)
+  with their own compatibility matrices
+  ([compatibility.md](compatibility.md)); the domain core contains no
+  product-name branches and no model/provider names. Pi's one-shot prompt
+  row carries provider/model as opaque adapter metadata in argv (measured
+  example row; never persisted, never on a wire); provider keys arrive
+  only through the environment allowlist.
 - An unknown or unavailable harness fails clearly without degrading
   unrelated read-only operations (issue #7 AC4; observe.rs pattern).
 - Herdr and `gh` themselves are negotiated the same way; see
