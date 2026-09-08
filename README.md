@@ -315,7 +315,7 @@ What exists today, in plain order:
   PRs** — real harness parity and release execution are human-gated.
 - **Herdr is a peer, not a dependency of the daemon's safety**: the daemon
   never starts/stops Herdr, and harnesses (Hermes, Claude Code, Codex, Pi,
-  or a generic argv adapter) appear only as adapter examples of a
+  Jcode, or a generic argv adapter) appear only as adapter examples of a
   harness-neutral design.
 - **Public core, private overlays**: everything here is public; deployment
   policy, credentials, model/provider choices, host paths, and private routing
