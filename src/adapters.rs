@@ -36,6 +36,20 @@
 //!   A mutable pane label is not part of the identity and can never
 //!   substitute for any of the three parts; binding without all three is a
 //!   typed refusal (`refusal.identity.incomplete`).
+//! - Pi lane lifecycle under Herdr (issue #33 A2): when a pi profile
+//!   operation runs inside a Herdr pane (`HERDR_ENV=1` + `HERDR_PANE_ID`
+//!   in the allowlisted environment), the adapter reports the lane
+//!   lifecycle through the workspace executable's `pane report-agent` row
+//!   (custom-integration contract: `--source custom:herdr-fleet-pi`,
+//!   `--agent pi`). `start` reports `working`; a terminal `prompt` reports
+//!   `idle` (Herdr has no done state), except `refusal.credentials` which
+//!   reports `blocked` (a user decision — provider key — is required; the
+//!   message is static and never carries credential detail). Reporting is
+//!   best-effort and never changes the typed op result, and is a no-op
+//!   outside Herdr. `herdr agent start --kind pi` remains the
+//!   substrate/orchestrator path for interactive pi panes (requires a pane
+//!   at an interactive shell prompt); headless adapter runs report through
+//!   the pane rows instead.
 //! - Unknown or unavailable harnesses fail with a typed refusal
 //!   (`unknown.harness`, `refusal.unavailable.harness`) and never disturb
 //!   independent read-only operations (observe.rs pattern, AC4).
@@ -943,6 +957,88 @@ fn workspace_args(op: Op, session_id: &str) -> Vec<String> {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// Pi lane lifecycle reporting under Herdr (issue #33 A2)
+//
+// Herdr's custom-integration contract (docs/integrations, herdr 0.8.2):
+// an agent running in a Herdr pane inherits `HERDR_ENV`/`HERDR_PANE_ID`/
+// `HERDR_BIN_PATH`/`HERDR_SOCKET_PATH`; integrations report semantic state
+// through `pane report-agent <pane> --source <id> --agent <label>
+// --state <working|idle|blocked>` and release the source's authority with
+// `pane release-agent` when the agent exits. Reports must only fire when
+// `HERDR_ENV=1` and the required variables are present, and `--source`
+// must stay stable and unique to the integration.
+// ---------------------------------------------------------------------------
+
+/// Stable, unique lifecycle source id this adapter reports under (herdr
+/// custom-integration contract). Never reported outside a Herdr pane.
+pub const HERDR_LIFECYCLE_SOURCE: &str = "custom:herdr-fleet-pi";
+
+/// The agent label reported for pi lanes (herdr `agent list` shows the
+/// lane as `agent=pi`).
+pub const HERDR_LIFECYCLE_AGENT: &str = "pi";
+
+/// The herdr pane context of an operation: `Some(pane_id)` when the
+/// allowlisted environment marks a Herdr pane (`HERDR_ENV=1` with a
+/// non-empty `HERDR_PANE_ID`); `None` otherwise, which makes lifecycle
+/// reporting a no-op outside Herdr.
+pub fn herdr_pane_context(env: &BTreeMap<String, String>) -> Option<&str> {
+    if env.get("HERDR_ENV").map(String::as_str) != Some("1") {
+        return None;
+    }
+    env.get("HERDR_PANE_ID")
+        .map(String::as_str)
+        .filter(|pane| !pane.is_empty())
+}
+
+/// The herdr lifecycle report after a typed pi operation result
+/// (issue #33 A2). Herdr has no `done` state, so a terminal one-shot
+/// `prompt` reports `idle`; `refusal.credentials` reports `blocked` (a
+/// user decision is required — the provider key — with a static message
+/// that never carries credential text). `start` reports `working` while
+/// the lane is active. Returns `(state, message)` or `None` when no
+/// report applies.
+fn herdr_lifecycle_report(result: &OpResult) -> Option<(&'static str, Option<&'static str>)> {
+    match result.op {
+        Op::Start if result.status == "succeeded" => Some(("working", None)),
+        Op::Prompt => match result.code {
+            Some(CODE_CREDENTIALS) => Some(("blocked", Some("harness credentials required"))),
+            _ => Some(("idle", None)),
+        },
+        _ => None,
+    }
+}
+
+/// Run the documented `pane report-agent` row for one lifecycle report.
+/// Best-effort sideband: the typed op result is never changed by a report
+/// failure (missing/unusable workspace executable, nonzero exit).
+fn report_herdr_lifecycle(
+    pane: &str,
+    state: &str,
+    message: Option<&str>,
+    env: &BTreeMap<String, String>,
+) {
+    let mut args = vec![
+        "pane".to_string(),
+        "report-agent".to_string(),
+        pane.to_string(),
+        "--source".to_string(),
+        HERDR_LIFECYCLE_SOURCE.to_string(),
+        "--agent".to_string(),
+        HERDR_LIFECYCLE_AGENT.to_string(),
+        "--state".to_string(),
+        state.to_string(),
+    ];
+    if let Some(message) = message {
+        args.push("--message".to_string());
+        args.push(message.to_string());
+    }
+    match run_typed(WORKSPACE_EXECUTABLE, &args, ADAPTER_TIMEOUT, env, None) {
+        ProcessOutcome::Ok(_) => {}
+        ProcessOutcome::Failed(_) => {}
+    }
+}
+
 /// Run one typed operation against a profile (see module docs for the
 /// bounds). `Op::Start` binds no subprocess (the handle is already bound);
 /// `Op::Prompt` runs the harness executable with the payload as a single
@@ -970,6 +1066,26 @@ pub fn execute_op_in_worktree(
 }
 
 fn execute_op_at(
+    profile: &Profile,
+    request: &OpRequest<'_>,
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+) -> OpResult {
+    let result = execute_op_inner(profile, request, env, cwd);
+    // Issue #33 A2: a pi profile running inside a Herdr pane reports the
+    // lane lifecycle through the workspace executable (best-effort sideband
+    // that never changes the typed op result; no-op outside Herdr).
+    if profile.kind == HarnessKind::Pi {
+        if let Some(pane) = herdr_pane_context(env) {
+            if let Some((state, message)) = herdr_lifecycle_report(&result) {
+                report_herdr_lifecycle(pane, state, message, env);
+            }
+        }
+    }
+    result
+}
+
+fn execute_op_inner(
     profile: &Profile,
     request: &OpRequest<'_>,
     env: &BTreeMap<String, String>,
@@ -1820,5 +1936,79 @@ mod tests {
             assert_eq!(err.code, CODE_STALE_IDENTITY);
             assert!(err.message.contains(field), "{} names {field}", err.message);
         }
+    }
+
+    #[test]
+    fn herdr_pane_context_requires_herdr_env_and_pane_id() {
+        let mut env = BTreeMap::new();
+        env.insert("PATH".to_string(), "/bin".to_string());
+        assert_eq!(herdr_pane_context(&env), None, "no herdr markers");
+        env.insert("HERDR_ENV".to_string(), "1".to_string());
+        assert_eq!(herdr_pane_context(&env), None, "env without pane id");
+        env.insert("HERDR_PANE_ID".to_string(), "w1:p2".to_string());
+        assert_eq!(herdr_pane_context(&env), Some("w1:p2"));
+        env.insert("HERDR_ENV".to_string(), "0".to_string());
+        assert_eq!(herdr_pane_context(&env), None, "HERDR_ENV=0 is not a pane");
+        env.insert("HERDR_ENV".to_string(), "1".to_string());
+        env.insert("HERDR_PANE_ID".to_string(), "".to_string());
+        assert_eq!(herdr_pane_context(&env), None, "empty pane id");
+    }
+
+    #[test]
+    fn herdr_lifecycle_report_maps_typed_results_to_semantic_states() {
+        let profile = Profile::official(HarnessKind::Pi, "pi").expect("profile");
+        let session = sample_session();
+        let started = std::time::Instant::now();
+        let result_for = |op: Op, status: &'static str, code: Option<&'static str>| -> OpResult {
+            op_result(
+                &profile,
+                &OpRequest {
+                    op,
+                    session: &session,
+                    payload: if op == Op::Prompt { Some("x") } else { None },
+                    timeout: Duration::from_secs(1),
+                },
+                status,
+                code,
+                None,
+                None,
+                None,
+                started,
+            )
+        };
+        // start succeeded -> working; terminal prompts -> idle except
+        // credentials -> blocked; workspace ops -> no report.
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Start, "succeeded", None)),
+            Some(("working", None))
+        );
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Start, "refused", Some(CODE_BAD_REQUEST))),
+            None
+        );
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Prompt, "succeeded", None)),
+            Some(("idle", None))
+        );
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Prompt, "ambiguous", Some(CODE_TIMEOUT))),
+            Some(("idle", None))
+        );
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Prompt, "refused", Some(CODE_CREDENTIALS))),
+            Some(("blocked", Some("harness credentials required")))
+        );
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Prompt, "failed", Some(CODE_EXIT))),
+            Some(("idle", None))
+        );
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Outcome, "succeeded", None)),
+            None
+        );
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Identity, "succeeded", None)),
+            None
+        );
     }
 }

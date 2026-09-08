@@ -74,6 +74,16 @@ impl FakeBins {
         env.insert("PATH".to_string(), self.path.to_string_lossy().into_owned());
         env
     }
+
+    /// The allowlisted environment plus herdr pane markers (`HERDR_ENV=1`,
+    /// `HERDR_PANE_ID`), simulating an adapter-driven lane running inside a
+    /// herdr pane (issue #33 A2).
+    fn env_herdr(&self) -> BTreeMap<String, String> {
+        let mut env = self.env();
+        env.insert("HERDR_ENV".to_string(), "1".to_string());
+        env.insert("HERDR_PANE_ID".to_string(), "w33:p1".to_string());
+        env
+    }
 }
 
 impl Drop for FakeBins {
@@ -1176,4 +1186,197 @@ fn harness_prompt_runs_confined_to_the_assigned_worktree() {
         expected_cwd,
         "harness child must run inside the assigned worktree"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #33 A2: herdr lifecycle reporting rows (pi adapter under herdr)
+//
+// herdr's custom-integration contract (herdr 0.8.2 docs/integrations): an
+// agent running in a herdr pane inherits HERDR_ENV/HERDR_PANE_ID; reports
+// go through `pane report-agent <pane> --source <id> --agent <label>
+// --state <state>`; the source must be stable and unique; reporting is a
+// no-op outside herdr. The fake `herdr` below logs the exact argv it
+// receives to `$HF_FAKE_LOG` (allowlisted in the test env) so the tests
+// pin the documented rows byte-for-byte.
+// ---------------------------------------------------------------------------
+
+/// A fake `herdr` that logs every invocation's argv to `$HF_FAKE_LOG` and
+/// exits 0 (report accepted). The log path travels in the allowlisted env.
+fn herdr_logger_body() -> &'static str {
+    "echo \"$*\" >> \"$HF_FAKE_LOG\"\nexit 0\n"
+}
+
+fn pi_profile() -> Profile {
+    Profile::official(HarnessKind::Pi, "pi").expect("pi profile")
+}
+
+/// Read the fake-herdr argv log written by the last run.
+fn read_fake_log(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+#[test]
+fn pi_start_under_herdr_reports_working_with_the_documented_row() {
+    let bins = FakeBins::new();
+    let log = bins.path.join("herdr-argv.log");
+    bins.bin("herdr", herdr_logger_body());
+    let profile = pi_profile();
+    let mut env = bins.env_herdr();
+    env.insert(
+        "HF_FAKE_LOG".to_string(),
+        log.to_string_lossy().into_owned(),
+    );
+    let result = run_op_retry(
+        &profile,
+        &OpRequest {
+            op: Op::Start,
+            session: session_ref(),
+            payload: None,
+            timeout: ADAPTER_TIMEOUT,
+        },
+        &env,
+    );
+    assert_eq!(result.status, "succeeded");
+    assert_eq!(
+        read_fake_log(&log),
+        "pane report-agent w33:p1 --source custom:herdr-fleet-pi --agent pi --state working\n"
+    );
+}
+
+#[test]
+fn pi_prompt_under_herdr_reports_idle_after_a_successful_one_shot() {
+    let bins = FakeBins::new();
+    let log = bins.path.join("herdr-argv.log");
+    bins.bin("herdr", herdr_logger_body());
+    bins.bin("pi", &harness_body(HarnessKind::Pi, "echo", "0.85.1"));
+    let profile = pi_profile();
+    let mut env = bins.env_herdr();
+    env.insert(
+        "HF_FAKE_LOG".to_string(),
+        log.to_string_lossy().into_owned(),
+    );
+    let result = run_op_retry(
+        &profile,
+        &prompt_request("implement the thing", ADAPTER_TIMEOUT),
+        &env,
+    );
+    assert_eq!(result.status, "succeeded", "report must not change the op");
+    assert_eq!(
+        read_fake_log(&log),
+        "pane report-agent w33:p1 --source custom:herdr-fleet-pi --agent pi --state idle\n"
+    );
+}
+
+#[test]
+fn pi_prompt_credentials_under_herdr_reports_blocked_with_a_static_message() {
+    let bins = FakeBins::new();
+    let log = bins.path.join("herdr-argv.log");
+    bins.bin("herdr", herdr_logger_body());
+    bins.bin(
+        "pi",
+        "if [ \"$1\" = \"--version\" ]; then echo '0.85.1'; exit 0; fi\nif [ \"$1\" = \"--provider\" ] && [ \"$6\" = \"--\" ]; then echo 'No API key found for deepseek.' >&2; exit 1; fi\nexit 9\n",
+    );
+    let profile = pi_profile();
+    let mut env = bins.env_herdr();
+    env.insert(
+        "HF_FAKE_LOG".to_string(),
+        log.to_string_lossy().into_owned(),
+    );
+    let result = run_op_retry(
+        &profile,
+        &prompt_request("do the thing", ADAPTER_TIMEOUT),
+        &env,
+    );
+    assert_eq!(result.status, "refused");
+    assert_eq!(result.code, Some(CODE_CREDENTIALS));
+    assert_eq!(
+        read_fake_log(&log),
+        "pane report-agent w33:p1 --source custom:herdr-fleet-pi --agent pi --state blocked --message harness credentials required\n"
+    );
+}
+
+#[test]
+fn pi_prompt_timeout_under_herdr_reports_idle_after_the_deadline_kill() {
+    let bins = FakeBins::new();
+    let log = bins.path.join("herdr-argv.log");
+    bins.bin("herdr", herdr_logger_body());
+    bins.bin("pi", &harness_body(HarnessKind::Pi, "hang", "0.85.1"));
+    let profile = pi_profile();
+    let mut env = bins.env_herdr();
+    env.insert(
+        "HF_FAKE_LOG".to_string(),
+        log.to_string_lossy().into_owned(),
+    );
+    let result = run_op_retry(
+        &profile,
+        &prompt_request("please hang", Duration::from_millis(200)),
+        &env,
+    );
+    assert_eq!(result.status, "ambiguous");
+    assert_eq!(result.code, Some(CODE_TIMEOUT));
+    assert_eq!(
+        read_fake_log(&log),
+        "pane report-agent w33:p1 --source custom:herdr-fleet-pi --agent pi --state idle\n"
+    );
+}
+
+#[test]
+fn pi_operations_outside_herdr_never_report_lifecycle() {
+    // No HERDR_* markers in the allowlisted env: the workspace executable
+    // must never be invoked for lifecycle reporting. The fake herdr would
+    // log any invocation, and would also fail workspace rows it must not
+    // receive; pi start/prompt still succeed (pure mode).
+    let bins = FakeBins::new();
+    let log = bins.path.join("herdr-argv.log");
+    bins.bin("herdr", herdr_logger_body());
+    bins.bin("pi", &harness_body(HarnessKind::Pi, "echo", "0.85.1"));
+    let profile = pi_profile();
+    let mut env = bins.env(); // no herdr markers
+    env.insert(
+        "HF_FAKE_LOG".to_string(),
+        log.to_string_lossy().into_owned(),
+    );
+    let start = run_op_retry(
+        &profile,
+        &OpRequest {
+            op: Op::Start,
+            session: session_ref(),
+            payload: None,
+            timeout: ADAPTER_TIMEOUT,
+        },
+        &env,
+    );
+    assert_eq!(start.status, "succeeded");
+    let prompt = run_op_retry(&profile, &prompt_request("hello", ADAPTER_TIMEOUT), &env);
+    assert_eq!(prompt.status, "succeeded");
+    assert_eq!(
+        read_fake_log(&log),
+        "",
+        "no lifecycle reports outside a herdr pane"
+    );
+}
+
+#[test]
+fn pi_herdr_report_failure_never_changes_the_typed_op_result() {
+    // The workspace executable fails every report row: the op result is
+    // unchanged (lifecycle reporting is best-effort sideband).
+    let bins = FakeBins::new();
+    bins.bin("herdr", "exit 1\n");
+    let profile = pi_profile();
+    let env = bins.env_herdr();
+    let result = run_op_retry(
+        &profile,
+        &OpRequest {
+            op: Op::Start,
+            session: session_ref(),
+            payload: None,
+            timeout: ADAPTER_TIMEOUT,
+        },
+        &env,
+    );
+    assert_eq!(result.status, "succeeded");
+    assert_eq!(result.code, None);
+    let prompt = run_op_retry(&profile, &prompt_request("hello", ADAPTER_TIMEOUT), &env);
+    assert_eq!(prompt.status, "refused");
+    assert_eq!(prompt.code, Some(CODE_UNAVAILABLE));
 }
