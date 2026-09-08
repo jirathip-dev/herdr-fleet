@@ -508,6 +508,60 @@ $ ./target/release/herdr-fleet daemon status --json    # exit 0 — live again
 - Read-only commands never need the daemon — observing and planning stay
   available while the daemon is down.
 
+### 8.1 Integration branch deleted (staging)
+
+`staging` is the permanent integration branch and the HEAD of every
+promotion PR (`staging` → `main`; see [WORKFLOW.md](WORKFLOW.md),
+"Promotion (staging → main)"). If the repository's automatic head-branch
+deletion setting (`delete_branch_on_merge`, "automatically delete head
+branches") is enabled, merging a promotion PR deletes `staging` itself —
+this happened after promotion PR #28 and blocked all later merges until a
+maintainer recreated the branch by hand. The CI `policy` job fails every
+run while `staging` is missing ("Integration branch exists (staging
+guard)" step); restore the branch before merging anything else:
+
+1. Confirm the branch is missing — empty output means gone:
+
+   ```console
+   $ git ls-remote origin refs/heads/staging
+   ```
+
+2. Find the last known head SHA of `staging`. Candidates, in order:
+
+   - the deleted promotion PR's head SHA — GitHub keeps it after deletion
+     (`gh pr view <pr> --json headRefOid`),
+   - a local remote-tracking ref fetched before the deletion
+     (`git rev-parse refs/remotes/origin/staging`), or
+   - the promotion squash-merge commit on `main` (it was created from
+     `staging`'s head).
+
+3. Restore the branch from that SHA:
+
+   ```console
+   $ git push origin <last-known-sha>:refs/heads/staging
+   ```
+
+   If the ruleset rejects the direct push to the long-lived branch, create
+   the ref through the GitHub refs API instead (run inside a checkout of
+   this repository so `gh` fills in `{owner}/{repo}`):
+
+   ```console
+   $ gh api --method POST repos/{owner}/{repo}/git/refs \
+     -f ref=refs/heads/staging -f sha=<last-known-sha>
+   ```
+
+4. Verify the restore, then re-check the setting:
+
+   ```console
+   $ git ls-remote origin refs/heads/staging    # must print the restored SHA
+   ```
+
+   Confirm the repository's automatic head-branch deletion
+   (`delete_branch_on_merge`) is **off** — a promotion PR whose head is
+   `staging` must never auto-delete it again. Restoring the ref directly
+   is the recovery action; it is not a PR and does not change promotion
+   policy.
+
 ## 9. Remote transport boundary
 
 The system-SSH remote transport is a **verified contract**, not a live
