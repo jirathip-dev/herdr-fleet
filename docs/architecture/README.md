@@ -37,9 +37,14 @@ optional read-only Corral edge, no workspace/pane edges into Herdr.
   reuses the committed locked-target Archify **export shell** — the same
   self-contained runtime, pre-paint theme resolver, toolbar, and CSS
   (generator `archify 2.17.0-dev.1`) — with the diagram body (SVG) authored in
-  the export's own markup conventions from the committed JSON. The
-  `<meta name="generator">` line states this exactly; no archify regeneration
-  was performed.
+  the export's own markup conventions from the committed JSON. The shell's
+  rendered chrome was **re-authored to the as-shipped identity as well**: the
+  page `<h1>` reads "herdr-fleet — As-Shipped Architecture (v0.1.0)" and the
+  footer info card ("Shipped v0.1.0") carries as-shipped prose and the
+  as-shipped arrow legend — no locked-target title, "Target contract" card, or
+  locked-target arrow legend remains anywhere in the file. The
+  `<meta name="generator">` line states the shell reuse exactly; no archify
+  regeneration was performed.
 - **PNG previews**: rendered from the local HTML (`file://`) with
   chrome-headless-shell (reports itself as Google Chrome for Testing
   151.0.7922.34), window 1440×900, `--force-device-scale-factor=1`, using the
@@ -75,9 +80,9 @@ file's default theme is dark.)
 | File | SHA-256 |
 | --- | --- |
 | `herdr-fleet.as-shipped.architecture.json` | `2ed3feb919d1fcd5b38f050089157d6b82e58e9434520fdabd9eb0624e665a48` |
-| `herdr-fleet.as-shipped.architecture.html` | `2e9366b8b2ac922d270cdd6cae551f38344faba5088f99b04ea5fbd790fc8de5` |
-| `herdr-fleet.as-shipped.architecture.preview.light.png` | `14f541fb395bc957db9297f4dea413ea6151e2bbec3334d595397bce64bac407` |
-| `herdr-fleet.as-shipped.architecture.preview.dark.png` | `c76ab4bfb708d0d77621c40bb3d485a04ab49f803d30cc36a655e1fef2e939cd` |
+| `herdr-fleet.as-shipped.architecture.html` | `4320f36196c6ea9e18f12552f9c3d78d471fba922c2eec2de02b3e1799f75011` |
+| `herdr-fleet.as-shipped.architecture.preview.light.png` | `8083da1b6117635bb0addbc2950cee5967b34e8c25e7610288c0fcc4fd95e9c2` |
+| `herdr-fleet.as-shipped.architecture.preview.dark.png` | `15db4361ee5ac8da80835088f7c6912a2a2301e4a95c3d28da7e824d96d9ea84` |
 
 ## Locked target architecture (v5)
 
