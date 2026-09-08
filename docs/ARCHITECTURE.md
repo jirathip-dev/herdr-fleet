@@ -7,28 +7,39 @@ The locked target is documented in the committed architecture artifacts in
 [ADR-0002](decisions/0002-staging-integration-main-release.md), and
 [ADR-0003](decisions/0003-companion-boundary-and-harness-neutrality.md).
 
-## Current scaffold (this bootstrap)
+## Current scaffold (as shipped)
 
-One Cargo package (library + `herdr-fleet` binary), stdlib only, zero
-external dependencies:
+One Cargo package (library + `herdr-fleet` binary). The read-only CLI core
+keeps a deliberately small dependency set (serde/toml/sha2); the daemon adds
+bundled SQLite + flock (rusqlite/fs2/libc) for its single-writer state
+store:
 
-- `src/lib.rs` — public identity surface (`PACKAGE_NAME`, `PACKAGE_VERSION`,
-  `about()`); `#![forbid(unsafe_code)]`.
-- `src/main.rs` — stdlib argument handling: `--help`/`-h`, `--version`/`-V`,
-  usage-on-error otherwise. No command claims unimplemented functionality.
-- `tests/cli_smoke.rs` — exercises the real binary (exit codes asserted).
-- `scripts/` — public-tree privacy scanner + self-tests.
-- `.github/workflows/` — policy, rust (ubuntu + macOS), supply-chain, and
-  secret-scan gates.
-- `docs/architecture/` — the approved locked-target artifacts (target, not
-  current state).
+- Read-only CLI surface: `config init|validate|show`, `doctor`, `status`,
+  `plan`, `capabilities`, and `service *-plan` — observing and rendering
+  only, never mutating.
+- Single-writer per-user state daemon: flock + migrated SQLite state,
+  audit/event journals, one Unix socket; the only mutation path is the
+  grant-gated daemon `apply` RPC (issue #8 semantics).
+- Domain behavior as `src/` modules (plan/engine/lifecycle/mutation/
+  observe/process/adapters/remote/backup/service) bound by the typed
+  contract specs under [`contracts/`](contracts/README.md).
+- Typed harness adapters at the edge: five official agent kinds — `hermes`,
+  `claude-code`, `codex`, `pi`, `jcode` — plus Herdr/Git/GitHub surfaces.
+- `tests/` — CLI, daemon RPC/lifecycle, mutation-engine, adapter-contract,
+  service-plan, and no-network-surface suites (fake executables + synthetic
+  fixtures only); `scripts/` — public-tree privacy scanner + self-tests;
+  `.github/workflows/` — policy, rust (ubuntu + macOS), supply-chain, and
+  secret-scan gates; `docs/architecture/` — committed diagram artifacts.
 
-There is **no** daemon, workflow engine, adapter, mutation, migration,
-release, or plugin machinery — deliberately (YAGNI; see below).
+The [README](../README.md) as-shipped architecture diagram and
+[OPERATIONS.md](OPERATIONS.md) are the authoritative current-state
+walkthrough; the sections below record the approved target and the ecosystem
+boundaries.
 
-## Planned module split (approved target — not implemented)
+## Module split (approved target — as implemented)
 
-The locked target keeps a harness-neutral core with adapters at the edge:
+The locked target keeps a harness-neutral core with adapters at the edge;
+that is the module structure the shipped slices implement:
 
 - **Plan/domain core** — typed workflow + plan engine, grants/digests,
   leases, idempotency, recovery. No product-name branching in domain types.
@@ -81,6 +92,48 @@ concerns tracked elsewhere. **Issue #2 changes no live state**: no cron,
 launchd, service, caller, daemon, live config, or runtime state is touched by
 this repository's content.
 
+## Layer responsibilities (Herdr hosts / herdr-fleet tracks / Corral displays)
+
+Each product owns one layer of a fleet lane's life:
+
+- **Herdr hosts.** Herdr is the terminal/workspace layer: it owns the
+  panes, worktrees, terminals, and the per-user server socket lanes run in.
+  It detects its recognized agent kinds in panes, rolls their states up
+  into the sidebar (`working`, `blocked`, `done`, `idle`, `unknown`), and
+  exposes the `herdr agent` / `herdr pane` CLI and socket API.
+- **herdr-fleet tracks.** herdr-fleet owns fleet state and discipline:
+  plans, route grants, lanes/instances, review evidence, journals, epochs,
+  and schedules live in its own single-writer daemon state store — never in
+  Herdr, which herdr-fleet observes but never controls (the
+  [README](../README.md) as-shipped diagram; [OPERATIONS.md](OPERATIONS.md)).
+  Where Herdr supports a custom reporting source, the shipped `pi`
+  (issue #33) and `jcode` (issue #37) adapter profiles also report a lane
+  into Herdr's sidebar through `herdr pane report-agent` custom rows
+  (`--source custom:herdr-fleet-pi` / `--source custom:herdr-fleet-jcode`)
+  with Herdr's semantic states — adapter-side reporting, contracted in
+  [spec-capabilities.md](contracts/spec-capabilities.md).
+- **Corral displays.** Corral is the optional, independent **read-only**
+  display layer: `corrald` consumes Herdr's per-user socket and renders
+  read-model boards. Corral has no runtime dependency on herdr-fleet and
+  herdr-fleet none on Corral; an optional future Corral adapter that reads
+  herdr-fleet status for lanes Herdr cannot classify is an open idea —
+  [Corral#443](https://github.com/jirathip-dev/corral/issues/443).
+
+**Recognized vs unrecognized harnesses.** Herdr 0.8.2 spawns from a closed
+list of recognized agent kinds — 22 kinds in the 0.8.2 measured for this
+revision (`herdr agent start --help`, 2026-09-09; the list grows as Herdr
+adds agents). jcode is a first-class herdr-fleet adapter (issue #37) but
+**not** a Herdr agent kind — by design, Herdr's owner declined an upstream
+feature request. An unrecognized harness runs fine in a pane (it is an
+ordinary terminal process) but gets no Herdr agent-kind lifecycle tracking,
+so the agents-sidebar gap for such lanes is **not a defect**. herdr-fleet's
+daemon state above, plus the custom `pane report-agent` rows, are the
+intended tracker: `pi` is also a recognized Herdr kind (`herdr agent start
+--kind pi` starts interactive Pi panes), while headless adapter lanes report
+through the custom rows; jcode registers through the custom rows only.
+OPERATIONS.md section 3.1 describes monitoring an unrecognized-harness lane
+from herdr-fleet state instead of `herdr agent list`.
+
 ## Corral's actual current path (separate product)
 
 ```text
@@ -96,12 +149,12 @@ repository implies a required herdr-fleet → Corral edge.
 
 ## YAGNI rule
 
-No speculative structure is added before its first real owner exists. The
-bootstrap therefore has no `domain/`, `adapters/`, `commands/`, `schemas/`,
-`examples/`, plugin, or TUI directories, no async runtime, no HTTP/GitHub
-client, no tracing stack, no config parser, and no dependency on clap. A
-future slice may introduce each only with a demonstrated need and its own
-review.
+No speculative structure is added before its first real owner exists. Each
+shipped surface above landed with its owning slice's demonstrated need and
+its own review; nothing speculative remains at the top level — no `domain/`,
+`commands/`, `examples/`, plugin, or TUI directories, no async runtime, no
+HTTP client crate, no tracing stack, and no dependency on clap. A future
+slice may introduce each only with a demonstrated need and its own review.
 
 ## Corral reuse/provenance process
 
@@ -124,8 +177,9 @@ journal, capability negotiation, review evidence), trust and risk models,
 the Corral archaeology/provenance matrix, compatibility and benchmark
 policy. Synthetic fixtures live under `schemas/fixtures/` and are verified
 by `scripts/check-contract-fixtures.py` + its self-test. The registry and
-specs bind the *target* only; no `src/`, daemon, adapter, or migration
-behavior exists yet (bootstrap rule).
+specs bind the approved target and — since the roadmap slices shipped — the
+implemented surface: the `src/` modules, daemon, adapters, and migrations
+described under "Current scaffold" above.
 
 ## Links
 
