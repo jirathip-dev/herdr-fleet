@@ -174,6 +174,52 @@ Failure → remedy:
 | `github.available:false` (still 0) | `reason: "gh.unavailable"` | Degradation is explicit and reported, not hidden: authenticate `gh` or accept the local-only observation. |
 | `git.available:false` (still 0) | `reason: "no_local_checkout"` | Run `status` from the repository's local checkout (or configure the repo you are standing in). |
 
+### 3.1 Monitoring a lane on an unrecognized harness (jcode example)
+
+herdr 0.8.2 recognizes a closed list of agent kinds at spawn ([ARCHITECTURE.md](ARCHITECTURE.md)
+"Layer responsibilities"). A harness outside that list — jcode today, a
+herdr-fleet first-class adapter (issue #37) but not a herdr agent kind —
+runs fine in a pane but never appears as a herdr agent-kind row, so
+`herdr agent list` is the wrong surface for its lifecycle; the
+agents-sidebar gap is expected, not a defect. Monitor the lane from
+herdr-fleet state and the pane rows instead:
+
+1. **State and phase.** The daemon state store is the tracker: the lane's
+   plan, route grant, instance, and recorded review evidence live there,
+   and every applied step returns a typed `hf-outcome/v1` — `succeeded` |
+   `failed` | `refused` | `ambiguous` | `superseded` (section 6;
+   [spec-plans.md](contracts/spec-plans.md)). Refusals carry
+   `hf-error/v1` codes (`refusal.credentials`, `refusal.grant.expired`,
+   ...). The typed exit taxonomy applies to the client surface: 0 ok · 1
+   operational · 2 usage · 3 partial · 4 refusal · 5 config error
+   ([spec-cli.md](contracts/spec-cli.md)).
+2. **Transcript.** The adapter's typed prompt result carries the step's
+   transcript (jcode: parsed from the `--json` envelope's `text` field, or
+   raw stdout when the output has no envelope shape). Raw prompts and
+   transcripts are never persisted (AC8; trust model T5) — the journal
+   records the step and its outcome, not the conversation. The live pane
+   terminal stays available as the working transcript: `herdr pane read
+   <pane>` reads it back at any time (no agent kind required).
+3. **Semantic lifecycle (adapter-side sideband).** When the pi/jcode
+   profile operation runs inside a herdr pane (`HERDR_ENV=1` +
+   `HERDR_PANE_ID` in the allowlisted environment), the adapter reports the
+   lane through `herdr pane report-agent <pane> --source
+   custom:herdr-fleet-pi|custom:herdr-fleet-jcode --agent pi|jcode
+   --state ...`: start → `working`; a terminal prompt result → `idle`
+   (herdr's agent list renders a custom-reported terminal `idle` as
+   `agent_status: done` while `herdr agent explain` reports the semantic
+   `idle`); `refusal.credentials` → `blocked` with the static message
+   `harness credentials required`. Releasing the reporting source's
+   authority (`herdr pane release-agent`, same `--source`/`--agent`) is the
+   lane owner's pane-closeout row.
+
+Truthful limits today: the pane rows come from the harness adapter inside
+the pane — no herdr-fleet daemon caller drives or consumes them yet in this
+bootstrap, and the daemon state store is not wired to them; consuming the
+rows in daemon-driven lifecycle reporting is future work on the shipped
+issue #8 state. The full row contract is in
+[spec-capabilities.md](contracts/spec-capabilities.md).
+
 ## 4. Plan (read-only)
 
 Prerequisites: a configured repository (section 2) and either authenticated
