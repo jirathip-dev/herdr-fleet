@@ -1,0 +1,315 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "herdr-fleet — As-Shipped Architecture (v0.1.0)",
+    "locale": "en",
+    "animation": "none",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1360,
+      840
+    ]
+  },
+  "components": [
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "Operator",
+      "sublabel": "one operator · macOS / Linux",
+      "pos": [
+        20,
+        328
+      ],
+      "size": [
+        180,
+        84
+      ]
+    },
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "CLI",
+      "sublabel": "read-only · 13 subcommands",
+      "pos": [
+        236,
+        328
+      ],
+      "size": [
+        170,
+        84
+      ]
+    },
+    {
+      "id": "daemon",
+      "type": "backend",
+      "label": "Local daemon",
+      "sublabel": "single writer · socket RPC",
+      "pos": [
+        442,
+        328
+      ],
+      "size": [
+        180,
+        84
+      ]
+    },
+    {
+      "id": "engine",
+      "type": "security",
+      "label": "Workflow engine",
+      "sublabel": "Doctrine default · typed steps",
+      "pos": [
+        658,
+        328
+      ],
+      "size": [
+        200,
+        84
+      ]
+    },
+    {
+      "id": "adapters",
+      "type": "messagebus",
+      "label": "Adapters",
+      "sublabel": "typed · git/gh · harness CLIs",
+      "pos": [
+        894,
+        328
+      ],
+      "size": [
+        200,
+        84
+      ]
+    },
+    {
+      "id": "herdrHost",
+      "type": "external",
+      "label": "Herdr",
+      "sublabel": "observed · never controlled",
+      "pos": [
+        1150,
+        150
+      ],
+      "size": [
+        190,
+        84
+      ]
+    },
+    {
+      "id": "gitHub",
+      "type": "external",
+      "label": "Git + GitHub",
+      "sublabel": "local git · authenticated gh",
+      "pos": [
+        1150,
+        328
+      ],
+      "size": [
+        190,
+        84
+      ],
+      "brand": "github"
+    },
+    {
+      "id": "harnesses",
+      "type": "external",
+      "label": "Agent harnesses",
+      "sublabel": "Hermes · Claude Code · Codex",
+      "pos": [
+        1150,
+        506
+      ],
+      "size": [
+        190,
+        84
+      ]
+    },
+    {
+      "id": "plansGrants",
+      "type": "database",
+      "label": "Plans · Grants · State",
+      "sublabel": "SQLite · digest · journal · epoch",
+      "pos": [
+        480,
+        514
+      ],
+      "size": [
+        300,
+        84
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "herdr-fleet core · v0.1.0 · one local host",
+      "wraps": [
+        "cli",
+        "daemon",
+        "engine",
+        "adapters",
+        "plansGrants"
+      ],
+      "pad": 28
+    }
+  ],
+  "connections": [
+    {
+      "id": "operate",
+      "from": "operator",
+      "to": "cli",
+      "label": "read-only commands",
+      "fromSide": "right",
+      "toSide": "left",
+      "route": "straight",
+      "labelAt": [
+        218,
+        426
+      ],
+      "variant": "default"
+    },
+    {
+      "id": "daemonRun",
+      "from": "cli",
+      "to": "daemon",
+      "label": "daemon run · status",
+      "fromSide": "right",
+      "toSide": "left",
+      "route": "straight",
+      "labelAt": [
+        424,
+        426
+      ],
+      "variant": "default"
+    },
+    {
+      "id": "applyStep",
+      "from": "daemon",
+      "to": "engine",
+      "label": "apply: one digest-bound step",
+      "fromSide": "right",
+      "toSide": "left",
+      "route": "straight",
+      "labelAt": [
+        640,
+        426
+      ],
+      "variant": "emphasis"
+    },
+    {
+      "id": "typedEffects",
+      "from": "engine",
+      "to": "adapters",
+      "label": "typed effects",
+      "fromSide": "right",
+      "toSide": "left",
+      "route": "straight",
+      "labelAt": [
+        876,
+        426
+      ],
+      "variant": "default"
+    },
+    {
+      "id": "gitEffects",
+      "from": "adapters",
+      "to": "gitHub",
+      "label": "worktree-confined git/gh",
+      "fromSide": "right",
+      "toSide": "left",
+      "route": "straight",
+      "labelAt": [
+        1122,
+        426
+      ],
+      "variant": "default"
+    },
+    {
+      "id": "harnessSession",
+      "from": "adapters",
+      "to": "harnesses",
+      "label": "start · prompt · observe",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight",
+      "labelAt": [
+        1119,
+        478
+      ],
+      "variant": "default",
+      "via": [
+        [
+          994,
+          460
+        ],
+        [
+          1245,
+          460
+        ]
+      ]
+    },
+    {
+      "id": "probes",
+      "from": "cli",
+      "to": "herdrHost",
+      "label": "read-only probes",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "route": "straight",
+      "labelAt": [
+        783,
+        252
+      ],
+      "variant": "default",
+      "via": [
+        [
+          321,
+          270
+        ],
+        [
+          1245,
+          270
+        ]
+      ]
+    },
+    {
+      "id": "grantApply",
+      "from": "operator",
+      "to": "daemon",
+      "label": "grant · apply RPC",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "route": "straight",
+      "labelAt": [
+        321,
+        488
+      ],
+      "variant": "security",
+      "via": [
+        [
+          110,
+          470
+        ],
+        [
+          532,
+          470
+        ]
+      ]
+    },
+    {
+      "id": "stateJournal",
+      "from": "engine",
+      "to": "plansGrants",
+      "label": "state · journal · epoch",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight",
+      "labelAt": [
+        758,
+        460
+      ],
+      "variant": "emphasis"
+    }
+  ]
+}
