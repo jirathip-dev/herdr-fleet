@@ -1,5 +1,6 @@
-//! Harness adapters (issue #7): capability-negotiated adapters for Hermes,
-//! Claude Code, Codex, and the declarative generic argv adapter.
+//! Harness adapters (issues #7, #33): capability-negotiated adapters for
+//! Hermes, Claude Code, Codex, Pi (earendil-works/pi), and the declarative
+//! generic argv adapter.
 //!
 //! # Adapter contract (docs/contracts/spec-capabilities.md, "Adapter
 //! contract", issue #7)
@@ -14,14 +15,16 @@
 //! directly (the caller passes an allowlisted environment map), and never
 //! store tokens or transcripts (trust model T5 / AC8).
 //!
-//! - Hermes / Claude Code / Codex are the three official 1.0 adapters
+//! - Hermes / Claude Code / Codex / Pi are the four official 1.0 adapters
 //!   (adapter examples per ADR-0003; metadata lives here, never in core
 //!   planning). Their declared version ranges are recorded in
-//!   docs/contracts/compatibility.md (measured 2026-09-06); the exact
-//!   real-world flag parity of the headless invocation rows is
-//!   [awaiting-evidence] until the human-gated clean-host smokes run
-//!   (AC6), so this slice verifies the contract with fake executables only
-//!   (AC7).
+//!   docs/contracts/compatibility.md (Hermes/Claude Code/Codex measured
+//!   2026-09-06; Pi 0.85.1 measured 2026-09-08 against the SHA-verified
+//!   linux-x64 prebuilt, with darwin arm64/x64 prebuilts available at that
+//!   version); the exact real-world flag parity of the headless invocation
+//!   rows is [awaiting-evidence] until the human-gated clean-host smokes
+//!   run (AC6), so this slice verifies the contract with fake executables
+//!   only (AC7).
 //! - The `argv` kind is the declarative generic adapter: validated static
 //!   argv prefixes per operation, explicit capability declarations, bare
 //!   executable names resolved through the allowlisted PATH (the resolved
@@ -160,8 +163,8 @@ impl AdapterError {
 // Kinds and official adapter metadata
 // ---------------------------------------------------------------------------
 
-/// The four closed adapter kinds. Hermes, Claude Code, and Codex are the
-/// official 1.0 adapters; `argv` is the declarative generic adapter.
+/// The five closed adapter kinds. Hermes, Claude Code, Codex, and Pi are
+/// the official 1.0 adapters; `argv` is the declarative generic adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HarnessKind {
     /// Hermes Agent (`hermes` on PATH).
@@ -170,16 +173,19 @@ pub enum HarnessKind {
     ClaudeCode,
     /// OpenAI Codex CLI (`codex` on PATH).
     Codex,
+    /// Pi (earendil-works/pi, `pi` on PATH).
+    Pi,
     /// Declarative generic argv adapter (bare executable resolved via PATH).
     Argv,
 }
 
 impl HarnessKind {
     /// The official adapters (Argv is excluded).
-    pub const OFFICIAL: [HarnessKind; 3] = [
+    pub const OFFICIAL: [HarnessKind; 4] = [
         HarnessKind::Hermes,
         HarnessKind::ClaudeCode,
         HarnessKind::Codex,
+        HarnessKind::Pi,
     ];
 
     /// Stable kind name used in config (`harness.<key>.kind`).
@@ -188,6 +194,7 @@ impl HarnessKind {
             HarnessKind::Hermes => "hermes",
             HarnessKind::ClaudeCode => "claude-code",
             HarnessKind::Codex => "codex",
+            HarnessKind::Pi => "pi",
             HarnessKind::Argv => "argv",
         }
     }
@@ -199,6 +206,7 @@ impl HarnessKind {
             "hermes" => Some(HarnessKind::Hermes),
             "claude-code" => Some(HarnessKind::ClaudeCode),
             "codex" => Some(HarnessKind::Codex),
+            "pi" => Some(HarnessKind::Pi),
             "argv" => Some(HarnessKind::Argv),
             _ => None,
         }
@@ -229,9 +237,10 @@ impl VersionRange {
 
 /// Official adapter metadata (adapter layer only — core never branches on
 /// actor ids, ADR-0003). Version facts are measured from public release
-/// metadata on 2026-09-06 (docs/contracts/compatibility.md rows); the
-/// minimum == current rows are provisional exact-version floors
-/// ([awaiting-evidence] until the human-gated clean-host matrix, AC6).
+/// metadata on 2026-09-06 (Hermes/Claude Code/Codex) and 2026-09-08 (Pi;
+/// docs/contracts/compatibility.md rows); the minimum == current rows are
+/// provisional exact-version floors ([awaiting-evidence] until the
+/// human-gated clean-host matrix, AC6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OfficialSpec {
     /// The kind.
@@ -242,13 +251,13 @@ pub struct OfficialSpec {
     pub actor: &'static str,
     /// Declared version range.
     pub range: VersionRange,
-    /// Declared capabilities (the full closed harness set for all three
+    /// Declared capabilities (the full closed harness set for all four
     /// official adapters).
     pub capabilities: &'static [&'static str],
 }
 
-/// The three official adapter specs.
-pub fn official_specs() -> [OfficialSpec; 3] {
+/// The four official adapter specs.
+pub fn official_specs() -> [OfficialSpec; 4] {
     [
         OfficialSpec {
             kind: HarnessKind::Hermes,
@@ -277,6 +286,16 @@ pub fn official_specs() -> [OfficialSpec; 3] {
             range: VersionRange {
                 minimum: (0, 153, 4),
                 current: (0, 153, 4),
+            },
+            capabilities: &HARNESS_CAPS,
+        },
+        OfficialSpec {
+            kind: HarnessKind::Pi,
+            executable: "pi",
+            actor: "pi",
+            range: VersionRange {
+                minimum: (0, 85, 1),
+                current: (0, 85, 1),
             },
             capabilities: &HARNESS_CAPS,
         },
@@ -889,6 +908,20 @@ fn prompt_args(profile: &Profile) -> Result<Vec<String>, AdapterError> {
         HarnessKind::Hermes => Ok(vec!["chat".to_string(), "-q".to_string()]),
         HarnessKind::ClaudeCode => Ok(vec!["-p".to_string()]),
         HarnessKind::Codex => Ok(vec!["exec".to_string()]),
+        // One-shot `--print` row (issue #33, measured against pi v0.85.1 on
+        // 2026-09-08). Provider/model are opaque adapter metadata carried as
+        // argv flags (never persisted, never on a wire); credentials arrive
+        // only through the allowlisted environment. The trailing `--` is
+        // pi's documented end-of-options guard, so a data-last payload that
+        // begins with `-` can never be parsed as an option.
+        HarnessKind::Pi => Ok(vec![
+            "--provider".to_string(),
+            "deepseek".to_string(),
+            "--model".to_string(),
+            "deepseek-chat".to_string(),
+            "--print".to_string(),
+            "--".to_string(),
+        ]),
         HarnessKind::Argv => Ok(profile.op_args.get("prompt").cloned().unwrap_or_default()),
     }
 }
@@ -1396,7 +1429,9 @@ fn run_typed(
 /// a `refusal.credentials` typed refusal. This is failure-shape
 /// classification of nonzero exits only — never capability inference from
 /// prose (ADR-0003), and the matched text never becomes a record.
-const AUTH_MARKERS: [&str; 8] = [
+/// `no api key found` is the measured missing-credentials stderr of pi
+/// v0.85.1 (`pi --provider deepseek ... --print ...`, 2026-09-08).
+const AUTH_MARKERS: [&str; 9] = [
     "authentication failed",
     "not authenticated",
     "not logged in",
@@ -1405,6 +1440,7 @@ const AUTH_MARKERS: [&str; 8] = [
     "login required",
     "auth required",
     "api key required",
+    "no api key found",
 ];
 
 /// Build a result with the wall-time already measured.
@@ -1490,7 +1526,7 @@ mod tests {
 
     #[test]
     fn closed_kind_set_and_official_metadata_are_consistent() {
-        assert_eq!(HarnessKind::OFFICIAL.len(), 3);
+        assert_eq!(HarnessKind::OFFICIAL.len(), 4);
         for kind in HarnessKind::OFFICIAL {
             assert_eq!(HarnessKind::parse(kind.name()), Some(kind));
             let spec = official_spec(kind).expect("official spec");
