@@ -1075,12 +1075,11 @@ fn execute_op_at(
     // Issue #33 A2: a pi profile running inside a Herdr pane reports the
     // lane lifecycle through the workspace executable (best-effort sideband
     // that never changes the typed op result; no-op outside Herdr).
-    if profile.kind == HarnessKind::Pi {
-        if let Some(pane) = herdr_pane_context(env) {
-            if let Some((state, message)) = herdr_lifecycle_report(&result) {
-                report_herdr_lifecycle(pane, state, message, env);
-            }
-        }
+    if profile.kind == HarnessKind::Pi
+        && let (Some(pane), Some((state, message))) =
+            (herdr_pane_context(env), herdr_lifecycle_report(&result))
+    {
+        report_herdr_lifecycle(pane, state, message, env);
     }
     result
 }
