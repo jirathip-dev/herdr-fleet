@@ -1,6 +1,6 @@
-//! Harness adapters (issues #7, #33): capability-negotiated adapters for
-//! Hermes, Claude Code, Codex, Pi (earendil-works/pi), and the declarative
-//! generic argv adapter.
+//! Harness adapters (issues #7, #33, #37): capability-negotiated adapters
+//! for Hermes, Claude Code, Codex, Pi (earendil-works/pi), Jcode
+//! (1jehuang/jcode), and the declarative generic argv adapter.
 //!
 //! # Adapter contract (docs/contracts/spec-capabilities.md, "Adapter
 //! contract", issue #7)
@@ -15,16 +15,18 @@
 //! directly (the caller passes an allowlisted environment map), and never
 //! store tokens or transcripts (trust model T5 / AC8).
 //!
-//! - Hermes / Claude Code / Codex / Pi are the four official 1.0 adapters
-//!   (adapter examples per ADR-0003; metadata lives here, never in core
-//!   planning). Their declared version ranges are recorded in
+//! - Hermes / Claude Code / Codex / Pi / Jcode are the five official 1.0
+//!   adapters (adapter examples per ADR-0003; metadata lives here, never
+//!   in core planning). Their declared version ranges are recorded in
 //!   docs/contracts/compatibility.md (Hermes/Claude Code/Codex measured
 //!   2026-09-06; Pi 0.85.1 measured 2026-09-08 against the SHA-verified
 //!   linux-x64 prebuilt, with darwin arm64/x64 prebuilts available at that
-//!   version); the exact real-world flag parity of the headless invocation
-//!   rows is [awaiting-evidence] until the human-gated clean-host smokes
-//!   run (AC6), so this slice verifies the contract with fake executables
-//!   only (AC7).
+//!   version; Jcode 0.84.0 measured 2026-09-08 against the SHA-verified
+//!   linux-x64 prebuilt of the upstream release, with darwin arm64/x64
+//!   prebuilts available at that version); the exact real-world flag
+//!   parity of the headless invocation rows is [awaiting-evidence] until
+//!   the human-gated clean-host smokes run (AC6), so this slice verifies
+//!   the contract with fake executables only (AC7).
 //! - The `argv` kind is the declarative generic adapter: validated static
 //!   argv prefixes per operation, explicit capability declarations, bare
 //!   executable names resolved through the allowlisted PATH (the resolved
@@ -36,12 +38,14 @@
 //!   A mutable pane label is not part of the identity and can never
 //!   substitute for any of the three parts; binding without all three is a
 //!   typed refusal (`refusal.identity.incomplete`).
-//! - Pi lane lifecycle under Herdr (issue #33 A2): when a pi profile
-//!   operation runs inside a Herdr pane (`HERDR_ENV=1` + `HERDR_PANE_ID`
-//!   in the allowlisted environment), the adapter reports the lane
-//!   lifecycle through the workspace executable's `pane report-agent` row
-//!   (custom-integration contract: `--source custom:herdr-fleet-pi`,
-//!   `--agent pi`). `start` reports `working`; a terminal `prompt` reports
+//! - One-shot official adapter lane lifecycle under Herdr (issues #33 A2,
+//!   #37): when a pi or jcode profile operation runs inside a Herdr pane
+//!   (`HERDR_ENV=1` + `HERDR_PANE_ID` in the allowlisted environment), the
+//!   adapter reports the lane lifecycle through the workspace executable's
+//!   `pane report-agent` row (custom-integration contract: pi reports
+//!   `--source custom:herdr-fleet-pi --agent pi`; jcode reports
+//!   `--source custom:herdr-fleet-jcode --agent jcode`). `start` reports
+//!   `working`; a terminal `prompt` reports
 //!   `idle` (Herdr has no done state), except `refusal.credentials` which
 //!   reports `blocked` (a user decision — provider key — is required; the
 //!   message is static and never carries credential detail). Reporting is
@@ -177,8 +181,9 @@ impl AdapterError {
 // Kinds and official adapter metadata
 // ---------------------------------------------------------------------------
 
-/// The five closed adapter kinds. Hermes, Claude Code, Codex, and Pi are
-/// the official 1.0 adapters; `argv` is the declarative generic adapter.
+/// The six closed adapter kinds. Hermes, Claude Code, Codex, Pi, and Jcode
+/// are the official 1.0 adapters; `argv` is the declarative generic
+/// adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HarnessKind {
     /// Hermes Agent (`hermes` on PATH).
@@ -189,17 +194,20 @@ pub enum HarnessKind {
     Codex,
     /// Pi (earendil-works/pi, `pi` on PATH).
     Pi,
+    /// Jcode (1jehuang/jcode, `jcode` on PATH).
+    Jcode,
     /// Declarative generic argv adapter (bare executable resolved via PATH).
     Argv,
 }
 
 impl HarnessKind {
     /// The official adapters (Argv is excluded).
-    pub const OFFICIAL: [HarnessKind; 4] = [
+    pub const OFFICIAL: [HarnessKind; 5] = [
         HarnessKind::Hermes,
         HarnessKind::ClaudeCode,
         HarnessKind::Codex,
         HarnessKind::Pi,
+        HarnessKind::Jcode,
     ];
 
     /// Stable kind name used in config (`harness.<key>.kind`).
@@ -209,6 +217,7 @@ impl HarnessKind {
             HarnessKind::ClaudeCode => "claude-code",
             HarnessKind::Codex => "codex",
             HarnessKind::Pi => "pi",
+            HarnessKind::Jcode => "jcode",
             HarnessKind::Argv => "argv",
         }
     }
@@ -221,6 +230,7 @@ impl HarnessKind {
             "claude-code" => Some(HarnessKind::ClaudeCode),
             "codex" => Some(HarnessKind::Codex),
             "pi" => Some(HarnessKind::Pi),
+            "jcode" => Some(HarnessKind::Jcode),
             "argv" => Some(HarnessKind::Argv),
             _ => None,
         }
@@ -251,8 +261,11 @@ impl VersionRange {
 
 /// Official adapter metadata (adapter layer only — core never branches on
 /// actor ids, ADR-0003). Version facts are measured from public release
-/// metadata on 2026-09-06 (Hermes/Claude Code/Codex) and 2026-09-08 (Pi;
-/// docs/contracts/compatibility.md rows); the minimum == current rows are
+/// metadata on 2026-09-06 (Hermes/Claude Code/Codex), 2026-09-08 (Pi;
+/// docs/contracts/compatibility.md rows), and 2026-09-08 (Jcode v0.84.0
+/// against the SHA-verified linux-x64 prebuilt of the upstream release,
+/// with darwin arm64/x64 prebuilts available at that version); the
+/// minimum == current rows are
 /// provisional exact-version floors ([awaiting-evidence] until the
 /// human-gated clean-host matrix, AC6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,8 +283,8 @@ pub struct OfficialSpec {
     pub capabilities: &'static [&'static str],
 }
 
-/// The four official adapter specs.
-pub fn official_specs() -> [OfficialSpec; 4] {
+/// The five official adapter specs.
+pub fn official_specs() -> [OfficialSpec; 5] {
     [
         OfficialSpec {
             kind: HarnessKind::Hermes,
@@ -310,6 +323,16 @@ pub fn official_specs() -> [OfficialSpec; 4] {
             range: VersionRange {
                 minimum: (0, 85, 1),
                 current: (0, 85, 1),
+            },
+            capabilities: &HARNESS_CAPS,
+        },
+        OfficialSpec {
+            kind: HarnessKind::Jcode,
+            executable: "jcode",
+            actor: "jcode",
+            range: VersionRange {
+                minimum: (0, 84, 0),
+                current: (0, 84, 0),
             },
             capabilities: &HARNESS_CAPS,
         },
@@ -764,7 +787,22 @@ pub fn probe_profile(profile: &Profile, env: &BTreeMap<String, String>) -> Probe
                 match out.status {
                     ProcStatus::Exit(0) => {
                         let first_line = out.stdout.lines().next().unwrap_or("").trim();
-                        match first_line.split_whitespace().find_map(parse_semver) {
+                        match first_line
+                            .split_whitespace()
+                            // A leading `v`/`V` is not part of the semver
+                            // grammar this crate validates (formats
+                            // `parse_semver`), but real harnesses commonly
+                            // prefix their version token with one — jcode
+                            // v0.84.0 prints `jcode v0.84.0 (57d587899)` —
+                            // so the probe strips one before parsing.
+                            .find_map(|token| {
+                                parse_semver(
+                                    token
+                                        .strip_prefix('v')
+                                        .or_else(|| token.strip_prefix('V'))
+                                        .unwrap_or(token),
+                                )
+                            }) {
                             Some(version) => {
                                 let compatible = profile
                                     .declared_range
@@ -936,6 +974,28 @@ fn prompt_args(profile: &Profile) -> Result<Vec<String>, AdapterError> {
             "--print".to_string(),
             "--".to_string(),
         ]),
+        // One-shot `jcode run` row (issue #37, measured against jcode
+        // v0.84.0 on 2026-09-08: `run --provider deepseek --model
+        // deepseek-chat --json -- <message>` exits 1 with the measured
+        // missing-key text when no provider key is present, and the `--`
+        // end-of-options guard is accepted, keeping the data-last payload
+        // safe). `--json` makes the real binary emit a machine-readable
+        // envelope on stdout (top-level object with a `text` field,
+        // verified 2026-09-08); the adapter parses that envelope back into
+        // the transcript and falls back to raw stdout when the output is
+        // not an envelope (defensive against non-envelope stdout). The
+        // provider/model pair is opaque adapter metadata in argv — never
+        // persisted, never on a wire; credentials arrive only through the
+        // allowlisted environment.
+        HarnessKind::Jcode => Ok(vec![
+            "run".to_string(),
+            "--provider".to_string(),
+            "deepseek".to_string(),
+            "--model".to_string(),
+            "deepseek-chat".to_string(),
+            "--json".to_string(),
+            "--".to_string(),
+        ]),
         HarnessKind::Argv => Ok(profile.op_args.get("prompt").cloned().unwrap_or_default()),
     }
 }
@@ -958,7 +1018,8 @@ fn workspace_args(op: Op, session_id: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Pi lane lifecycle reporting under Herdr (issue #33 A2)
+// Official one-shot adapter lane lifecycle reporting under Herdr (issues
+// #33 A2, #37)
 //
 // Herdr's custom-integration contract (docs/integrations, herdr 0.8.2):
 // an agent running in a Herdr pane inherits `HERDR_ENV`/`HERDR_PANE_ID`/
@@ -970,13 +1031,34 @@ fn workspace_args(op: Op, session_id: &str) -> Vec<String> {
 // must stay stable and unique to the integration.
 // ---------------------------------------------------------------------------
 
-/// Stable, unique lifecycle source id this adapter reports under (herdr
+/// Stable, unique lifecycle source id the pi adapter reports under (herdr
 /// custom-integration contract). Never reported outside a Herdr pane.
-pub const HERDR_LIFECYCLE_SOURCE: &str = "custom:herdr-fleet-pi";
+pub const HERDR_LIFECYCLE_SOURCE_PI: &str = "custom:herdr-fleet-pi";
+
+/// Stable, unique lifecycle source id the jcode adapter reports under
+/// (herdr custom-integration contract). Never reported outside a Herdr
+/// pane.
+pub const HERDR_LIFECYCLE_SOURCE_JCODE: &str = "custom:herdr-fleet-jcode";
 
 /// The agent label reported for pi lanes (herdr `agent list` shows the
 /// lane as `agent=pi`).
-pub const HERDR_LIFECYCLE_AGENT: &str = "pi";
+pub const HERDR_LIFECYCLE_AGENT_PI: &str = "pi";
+
+/// The agent label reported for jcode lanes (herdr `agent list` shows the
+/// lane as `agent=jcode`).
+pub const HERDR_LIFECYCLE_AGENT_JCODE: &str = "jcode";
+
+/// The herdr lifecycle (source id, agent label) pair an official adapter
+/// reports under (issues #33 A2 / #37); `None` for kinds with no lifecycle
+/// reporting (hermes/claude-code/codex report through the workspace's own
+/// agent kinds, and `argv` has no fixed agent identity).
+fn herdr_lifecycle_identity(kind: HarnessKind) -> Option<(&'static str, &'static str)> {
+    match kind {
+        HarnessKind::Pi => Some((HERDR_LIFECYCLE_SOURCE_PI, HERDR_LIFECYCLE_AGENT_PI)),
+        HarnessKind::Jcode => Some((HERDR_LIFECYCLE_SOURCE_JCODE, HERDR_LIFECYCLE_AGENT_JCODE)),
+        _ => None,
+    }
+}
 
 /// The herdr pane context of an operation: `Some(pane_id)` when the
 /// allowlisted environment marks a Herdr pane (`HERDR_ENV=1` with a
@@ -991,8 +1073,8 @@ pub fn herdr_pane_context(env: &BTreeMap<String, String>) -> Option<&str> {
         .filter(|pane| !pane.is_empty())
 }
 
-/// The herdr lifecycle report after a typed pi operation result
-/// (issue #33 A2). Herdr has no `done` state, so a terminal one-shot
+/// The herdr lifecycle report after a typed pi/jcode operation result
+/// (issues #33 A2 / #37). Herdr has no `done` state, so a terminal one-shot
 /// `prompt` reports `idle`; `refusal.credentials` reports `blocked` (a
 /// user decision is required — the provider key — with a static message
 /// that never carries credential text). `start` reports `working` while
@@ -1016,6 +1098,8 @@ fn report_herdr_lifecycle(
     pane: &str,
     state: &str,
     message: Option<&str>,
+    source: &str,
+    agent: &str,
     env: &BTreeMap<String, String>,
 ) {
     let mut args = vec![
@@ -1023,9 +1107,9 @@ fn report_herdr_lifecycle(
         "report-agent".to_string(),
         pane.to_string(),
         "--source".to_string(),
-        HERDR_LIFECYCLE_SOURCE.to_string(),
+        source.to_string(),
         "--agent".to_string(),
-        HERDR_LIFECYCLE_AGENT.to_string(),
+        agent.to_string(),
         "--state".to_string(),
         state.to_string(),
     ];
@@ -1072,14 +1156,16 @@ fn execute_op_at(
     cwd: Option<&Path>,
 ) -> OpResult {
     let result = execute_op_inner(profile, request, env, cwd);
-    // Issue #33 A2: a pi profile running inside a Herdr pane reports the
-    // lane lifecycle through the workspace executable (best-effort sideband
-    // that never changes the typed op result; no-op outside Herdr).
-    if profile.kind == HarnessKind::Pi
-        && let (Some(pane), Some((state, message))) =
-            (herdr_pane_context(env), herdr_lifecycle_report(&result))
+    // Issues #33 A2 / #37: a pi or jcode profile running inside a Herdr
+    // pane reports the lane lifecycle through the workspace executable
+    // (best-effort sideband that never changes the typed op result; no-op
+    // outside Herdr).
+    if let (Some((source, agent)), Some(pane)) = (
+        herdr_lifecycle_identity(profile.kind),
+        herdr_pane_context(env),
+    ) && let Some((state, message)) = herdr_lifecycle_report(&result)
     {
-        report_herdr_lifecycle(pane, state, message, env);
+        report_herdr_lifecycle(pane, state, message, source, agent, env);
     }
     result
 }
@@ -1173,16 +1259,29 @@ fn execute_op_inner(
             args.push(payload.to_string());
             let out = run_typed(&profile.executable, &args, request.timeout, env, cwd);
             match out {
-                ProcessOutcome::Ok(text) => op_result(
-                    profile,
-                    request,
-                    "succeeded",
-                    None,
-                    None,
-                    Some(object(vec![("transcript", string(&text))])),
-                    None,
-                    started,
-                ),
+                ProcessOutcome::Ok(text) => {
+                    // jcode's `--json` row makes the real binary emit a
+                    // machine-readable envelope on stdout; parse the
+                    // transcript out of it when the output has that shape
+                    // (issue #37; shape verified against jcode v0.84.0 on
+                    // 2026-09-08). Anything else is kept as raw stdout so a
+                    // non-envelope output never loses the transcript.
+                    let transcript = if profile.kind == HarnessKind::Jcode {
+                        jcode_envelope_text(&text).unwrap_or(text)
+                    } else {
+                        text
+                    };
+                    op_result(
+                        profile,
+                        request,
+                        "succeeded",
+                        None,
+                        None,
+                        Some(object(vec![("transcript", string(&transcript))])),
+                        None,
+                        started,
+                    )
+                }
                 ProcessOutcome::Failed(err) => op_result(
                     profile,
                     request,
@@ -1545,8 +1644,12 @@ fn run_typed(
 /// classification of nonzero exits only — never capability inference from
 /// prose (ADR-0003), and the matched text never becomes a record.
 /// `no api key found` is the measured missing-credentials stderr of pi
-/// v0.85.1 (`pi --provider deepseek ... --print ...`, 2026-09-08).
-const AUTH_MARKERS: [&str; 9] = [
+/// v0.85.1 (`pi --provider deepseek ... --print ...`, 2026-09-08);
+/// `api_key not found in environment` is the measured missing-credentials
+/// stderr of jcode v0.84.0 (`jcode run --provider deepseek ... --json ...`,
+/// 2026-09-08: `Error: DEEPSEEK_API_KEY not found in environment or
+/// <home>/.config/jcode/deepseek.env`, exit 1).
+const AUTH_MARKERS: [&str; 10] = [
     "authentication failed",
     "not authenticated",
     "not logged in",
@@ -1556,6 +1659,7 @@ const AUTH_MARKERS: [&str; 9] = [
     "auth required",
     "api key required",
     "no api key found",
+    "api_key not found in environment",
 ];
 
 /// Build a result with the wall-time already measured.
@@ -1620,6 +1724,19 @@ fn diagnostics(text: &str) -> String {
     out
 }
 
+/// The transcript text of a jcode `--json` envelope (issue #37). jcode's
+/// `run --json` row prints one JSON object on stdout whose `text` field
+/// carries the model's final answer (shape verified against jcode v0.84.0
+/// on 2026-09-08). `None` when stdout is not such an envelope — the raw
+/// stdout is kept as the transcript instead, so a non-envelope output
+/// never loses content.
+fn jcode_envelope_text(stdout: &str) -> Option<String> {
+    let doc = Val::parse_json(stdout).ok()?;
+    doc.get("text")
+        .and_then(Val::as_str)
+        .map(|text| text.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1641,7 +1758,7 @@ mod tests {
 
     #[test]
     fn closed_kind_set_and_official_metadata_are_consistent() {
-        assert_eq!(HarnessKind::OFFICIAL.len(), 4);
+        assert_eq!(HarnessKind::OFFICIAL.len(), 5);
         for kind in HarnessKind::OFFICIAL {
             assert_eq!(HarnessKind::parse(kind.name()), Some(kind));
             let spec = official_spec(kind).expect("official spec");
@@ -1655,6 +1772,7 @@ mod tests {
         }
         assert_eq!(HarnessKind::parse("teleport"), None);
         assert_eq!(HarnessKind::parse("OpenCode"), None);
+        assert_eq!(HarnessKind::parse("jcode"), Some(HarnessKind::Jcode));
         assert_eq!(HarnessKind::parse("argv"), Some(HarnessKind::Argv));
     }
 
@@ -1935,6 +2053,29 @@ mod tests {
             assert_eq!(err.code, CODE_STALE_IDENTITY);
             assert!(err.message.contains(field), "{} names {field}", err.message);
         }
+    }
+
+    #[test]
+    fn jcode_envelope_text_extracts_the_transcript_field() {
+        // The measured jcode v0.84.0 `--json` envelope shape (2026-09-08):
+        // one top-level object whose `text` field carries the final answer.
+        let envelope = r#"{
+  "session_id": "session_kangaroo_1788883711941_a3cc1cf55178c963",
+  "provider": "deepseek",
+  "model": "deepseek-chat",
+  "text": "implemented the ini parser; 12 tests pass",
+  "usage": {"input_tokens": 123, "output_tokens": 45,
+            "cache_read_input_tokens": null, "cache_creation_input_tokens": null}
+}"#;
+        assert_eq!(
+            jcode_envelope_text(envelope).as_deref(),
+            Some("implemented the ini parser; 12 tests pass")
+        );
+        // Non-envelope stdout (plain text) and JSON without `text` fall
+        // back to raw stdout (never lose the transcript).
+        assert_eq!(jcode_envelope_text("plain model output"), None);
+        assert_eq!(jcode_envelope_text(r#"{"session_id":"s1"}"#), None);
+        assert_eq!(jcode_envelope_text(""), None);
     }
 
     #[test]
