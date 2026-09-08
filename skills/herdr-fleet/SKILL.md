@@ -1,7 +1,7 @@
 ---
 name: herdr-fleet
 description: "Use when working with or on the herdr-fleet repository or CLI. Read-only CLI core (config/doctor/status/plan/capabilities), single-writer daemon (run/status), service unit plans, and grant-gated mutations via the daemon apply RPC; no live harness runs."
-version: 1.8.0
+version: 1.9.0
 author: herdr-fleet contributors
 license: Apache-2.0 OR MIT
 platforms: [macos, linux]
@@ -239,6 +239,24 @@ Hermes (or any agent harness) may appear in this repository only as a
 clearly labeled *adapter example* of the harness-neutral design — never as
 a required invocation path, profile layout, or core dependency. This skill
 is usable with any harness or with none.
+
+## Making this skill available to Pi lanes (issue #33 A1)
+
+Hermes lanes read this skill from the profile skill directory. Pi lanes
+(the pi harness adapter, issue #33) load the same operating knowledge
+through pi's native skills discovery (pi `docs/skills.md`; this directory
+is a standard skill: `SKILL.md` + freeform files):
+
+- Global: symlink (keeps the relative `docs/...` links working) or copy
+  this directory to `~/.pi/agent/skills/herdr-fleet/`.
+- Project: `cp -r skills/herdr-fleet <worktree>/.pi/skills/` (project
+  skills load once the project is trusted).
+- One-shot/CLI: `pi --skill <repo>/skills/herdr-fleet ...` (repeatable,
+  additive even with `--no-skills`).
+
+Verified 2026-09-08 (issue #33 A1): a real pi session loaded this skill
+and answered a herdr-fleet usage question from the skill content alone —
+redacted Q/A evidence in `.report-33.md`.
 
 ## Repository rules that bind work here
 

@@ -107,6 +107,29 @@ can run with **no harness credentials** (AC7).
   exact-version contract tests for success, missing executable/auth,
   unsupported capability, timeout, cancellation, malformed output, stale
   identity, and process death (AC2).
+- **Herdr lane-lifecycle reporting (issue #33 A2, pi adapter)**: when a pi
+  profile operation runs inside a Herdr pane (`HERDR_ENV=1` +
+  `HERDR_PANE_ID` in the allowlisted environment), the adapter reports the
+  lane through the workspace executable's `pane report-agent` row
+  (`--source custom:herdr-fleet-pi --agent pi`), per Herdr's
+  custom-integration contract (herdr 0.8.2). Typed-result mapping:
+
+  | Typed result | Herdr report |
+  | --- | --- |
+  | `start` succeeded | `working` (lane active) |
+  | terminal `prompt` — succeeded / failed / refused / ambiguous (timeout, process death, plain exit) | `idle` |
+  | terminal `prompt` with `refusal.credentials` | `blocked` + static message `harness credentials required` (a provider key decision is needed; the message never carries credential text) |
+
+  Herdr has no `done` state, so terminal lanes report `idle`. Reporting is
+  a best-effort sideband that never changes the typed op result and is a
+  no-op outside Herdr (no `HERDR_ENV=1`). `herdr agent start --kind pi` is
+  the substrate/orchestrator path for *interactive* pi panes (it requires
+  a pane at an interactive shell prompt and is not drivable by a headless
+  library adapter); headless adapter runs report through the pane rows
+  above. Releasing the reporting source's authority (`herdr pane
+  release-agent`, same `--source`/`--agent`) is the lane owner's
+  pane-closeout step for future daemon wiring. The rows are pinned by
+  fake-`herdr` contract tests in `tests/harness_adapters.rs`.
 
 ## Harness neutrality consequences
 
