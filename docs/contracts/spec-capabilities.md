@@ -120,7 +120,12 @@ can run with **no harness credentials** (AC7).
   | terminal `prompt` — succeeded / failed / refused / ambiguous (timeout, process death, plain exit) | `idle` |
   | terminal `prompt` with `refusal.credentials` | `blocked` + static message `harness credentials required` (a provider key decision is needed; the message never carries credential text) |
 
-  Herdr has no `done` state, so terminal lanes report `idle`. Reporting is
+  Herdr has no `done` state (semantic states are `idle`/`working`/
+  `blocked`), so terminal lanes report `idle`; on the live herdr 0.8.2
+  daemon the agent-list API renders a custom-reported terminal `idle` as
+  `agent_status: done` while `agent explain` reports the semantic `idle`
+  (verified 2026-09-08 on an isolated scratch pane — `.report-33.md`).
+  Reporting is
   a best-effort sideband that never changes the typed op result and is a
   no-op outside Herdr (no `HERDR_ENV=1`). `herdr agent start --kind pi` is
   the substrate/orchestrator path for *interactive* pi panes (it requires
