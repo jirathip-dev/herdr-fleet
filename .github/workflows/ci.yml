@@ -239,6 +239,19 @@ jobs:
           print("documentation-link check: clean")
           PY
 
+      - name: Integration branch exists (staging guard)
+        run: |
+          set -euo pipefail
+          if ! REF="$(git ls-remote origin refs/heads/staging)"; then
+            echo "::error::staging guard: 'git ls-remote origin refs/heads/staging' failed; cannot verify the integration branch"
+            exit 1
+          fi
+          if [ -z "$REF" ]; then
+            echo "::error::staging guard: integration branch 'staging' is MISSING on origin (delete_branch_on_merge deleted it after a promotion, or it was removed manually). Restore it per docs/OPERATIONS.md section 8.1 and re-check the auto-delete-head-branches repository setting is OFF before merging."
+            exit 1
+          fi
+          echo "staging guard: refs/heads/staging exists on origin ($REF)"
+
   rust-ubuntu:
     name: rust-ubuntu
     runs-on: ubuntu-latest
