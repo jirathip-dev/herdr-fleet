@@ -1,5 +1,6 @@
-//! Harness adapters (issue #7): capability-negotiated adapters for Hermes,
-//! Claude Code, Codex, and the declarative generic argv adapter.
+//! Harness adapters (issues #7, #33): capability-negotiated adapters for
+//! Hermes, Claude Code, Codex, Pi (earendil-works/pi), and the declarative
+//! generic argv adapter.
 //!
 //! # Adapter contract (docs/contracts/spec-capabilities.md, "Adapter
 //! contract", issue #7)
@@ -14,14 +15,16 @@
 //! directly (the caller passes an allowlisted environment map), and never
 //! store tokens or transcripts (trust model T5 / AC8).
 //!
-//! - Hermes / Claude Code / Codex are the three official 1.0 adapters
+//! - Hermes / Claude Code / Codex / Pi are the four official 1.0 adapters
 //!   (adapter examples per ADR-0003; metadata lives here, never in core
 //!   planning). Their declared version ranges are recorded in
-//!   docs/contracts/compatibility.md (measured 2026-09-06); the exact
-//!   real-world flag parity of the headless invocation rows is
-//!   [awaiting-evidence] until the human-gated clean-host smokes run
-//!   (AC6), so this slice verifies the contract with fake executables only
-//!   (AC7).
+//!   docs/contracts/compatibility.md (Hermes/Claude Code/Codex measured
+//!   2026-09-06; Pi 0.85.1 measured 2026-09-08 against the SHA-verified
+//!   linux-x64 prebuilt, with darwin arm64/x64 prebuilts available at that
+//!   version); the exact real-world flag parity of the headless invocation
+//!   rows is [awaiting-evidence] until the human-gated clean-host smokes
+//!   run (AC6), so this slice verifies the contract with fake executables
+//!   only (AC7).
 //! - The `argv` kind is the declarative generic adapter: validated static
 //!   argv prefixes per operation, explicit capability declarations, bare
 //!   executable names resolved through the allowlisted PATH (the resolved
@@ -33,6 +36,20 @@
 //!   A mutable pane label is not part of the identity and can never
 //!   substitute for any of the three parts; binding without all three is a
 //!   typed refusal (`refusal.identity.incomplete`).
+//! - Pi lane lifecycle under Herdr (issue #33 A2): when a pi profile
+//!   operation runs inside a Herdr pane (`HERDR_ENV=1` + `HERDR_PANE_ID`
+//!   in the allowlisted environment), the adapter reports the lane
+//!   lifecycle through the workspace executable's `pane report-agent` row
+//!   (custom-integration contract: `--source custom:herdr-fleet-pi`,
+//!   `--agent pi`). `start` reports `working`; a terminal `prompt` reports
+//!   `idle` (Herdr has no done state), except `refusal.credentials` which
+//!   reports `blocked` (a user decision — provider key — is required; the
+//!   message is static and never carries credential detail). Reporting is
+//!   best-effort and never changes the typed op result, and is a no-op
+//!   outside Herdr. `herdr agent start --kind pi` remains the
+//!   substrate/orchestrator path for interactive pi panes (requires a pane
+//!   at an interactive shell prompt); headless adapter runs report through
+//!   the pane rows instead.
 //! - Unknown or unavailable harnesses fail with a typed refusal
 //!   (`unknown.harness`, `refusal.unavailable.harness`) and never disturb
 //!   independent read-only operations (observe.rs pattern, AC4).
@@ -160,8 +177,8 @@ impl AdapterError {
 // Kinds and official adapter metadata
 // ---------------------------------------------------------------------------
 
-/// The four closed adapter kinds. Hermes, Claude Code, and Codex are the
-/// official 1.0 adapters; `argv` is the declarative generic adapter.
+/// The five closed adapter kinds. Hermes, Claude Code, Codex, and Pi are
+/// the official 1.0 adapters; `argv` is the declarative generic adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HarnessKind {
     /// Hermes Agent (`hermes` on PATH).
@@ -170,16 +187,19 @@ pub enum HarnessKind {
     ClaudeCode,
     /// OpenAI Codex CLI (`codex` on PATH).
     Codex,
+    /// Pi (earendil-works/pi, `pi` on PATH).
+    Pi,
     /// Declarative generic argv adapter (bare executable resolved via PATH).
     Argv,
 }
 
 impl HarnessKind {
     /// The official adapters (Argv is excluded).
-    pub const OFFICIAL: [HarnessKind; 3] = [
+    pub const OFFICIAL: [HarnessKind; 4] = [
         HarnessKind::Hermes,
         HarnessKind::ClaudeCode,
         HarnessKind::Codex,
+        HarnessKind::Pi,
     ];
 
     /// Stable kind name used in config (`harness.<key>.kind`).
@@ -188,6 +208,7 @@ impl HarnessKind {
             HarnessKind::Hermes => "hermes",
             HarnessKind::ClaudeCode => "claude-code",
             HarnessKind::Codex => "codex",
+            HarnessKind::Pi => "pi",
             HarnessKind::Argv => "argv",
         }
     }
@@ -199,6 +220,7 @@ impl HarnessKind {
             "hermes" => Some(HarnessKind::Hermes),
             "claude-code" => Some(HarnessKind::ClaudeCode),
             "codex" => Some(HarnessKind::Codex),
+            "pi" => Some(HarnessKind::Pi),
             "argv" => Some(HarnessKind::Argv),
             _ => None,
         }
@@ -229,9 +251,10 @@ impl VersionRange {
 
 /// Official adapter metadata (adapter layer only — core never branches on
 /// actor ids, ADR-0003). Version facts are measured from public release
-/// metadata on 2026-09-06 (docs/contracts/compatibility.md rows); the
-/// minimum == current rows are provisional exact-version floors
-/// ([awaiting-evidence] until the human-gated clean-host matrix, AC6).
+/// metadata on 2026-09-06 (Hermes/Claude Code/Codex) and 2026-09-08 (Pi;
+/// docs/contracts/compatibility.md rows); the minimum == current rows are
+/// provisional exact-version floors ([awaiting-evidence] until the
+/// human-gated clean-host matrix, AC6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OfficialSpec {
     /// The kind.
@@ -242,13 +265,13 @@ pub struct OfficialSpec {
     pub actor: &'static str,
     /// Declared version range.
     pub range: VersionRange,
-    /// Declared capabilities (the full closed harness set for all three
+    /// Declared capabilities (the full closed harness set for all four
     /// official adapters).
     pub capabilities: &'static [&'static str],
 }
 
-/// The three official adapter specs.
-pub fn official_specs() -> [OfficialSpec; 3] {
+/// The four official adapter specs.
+pub fn official_specs() -> [OfficialSpec; 4] {
     [
         OfficialSpec {
             kind: HarnessKind::Hermes,
@@ -277,6 +300,16 @@ pub fn official_specs() -> [OfficialSpec; 3] {
             range: VersionRange {
                 minimum: (0, 153, 4),
                 current: (0, 153, 4),
+            },
+            capabilities: &HARNESS_CAPS,
+        },
+        OfficialSpec {
+            kind: HarnessKind::Pi,
+            executable: "pi",
+            actor: "pi",
+            range: VersionRange {
+                minimum: (0, 85, 1),
+                current: (0, 85, 1),
             },
             capabilities: &HARNESS_CAPS,
         },
@@ -889,6 +922,20 @@ fn prompt_args(profile: &Profile) -> Result<Vec<String>, AdapterError> {
         HarnessKind::Hermes => Ok(vec!["chat".to_string(), "-q".to_string()]),
         HarnessKind::ClaudeCode => Ok(vec!["-p".to_string()]),
         HarnessKind::Codex => Ok(vec!["exec".to_string()]),
+        // One-shot `--print` row (issue #33, measured against pi v0.85.1 on
+        // 2026-09-08). Provider/model are opaque adapter metadata carried as
+        // argv flags (never persisted, never on a wire); credentials arrive
+        // only through the allowlisted environment. The trailing `--` is
+        // pi's documented end-of-options guard, so a data-last payload that
+        // begins with `-` can never be parsed as an option.
+        HarnessKind::Pi => Ok(vec![
+            "--provider".to_string(),
+            "deepseek".to_string(),
+            "--model".to_string(),
+            "deepseek-chat".to_string(),
+            "--print".to_string(),
+            "--".to_string(),
+        ]),
         HarnessKind::Argv => Ok(profile.op_args.get("prompt").cloned().unwrap_or_default()),
     }
 }
@@ -908,6 +955,88 @@ fn workspace_args(op: Op, session_id: &str) -> Vec<String> {
         session_id.to_string(),
         "--json".to_string(),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Pi lane lifecycle reporting under Herdr (issue #33 A2)
+//
+// Herdr's custom-integration contract (docs/integrations, herdr 0.8.2):
+// an agent running in a Herdr pane inherits `HERDR_ENV`/`HERDR_PANE_ID`/
+// `HERDR_BIN_PATH`/`HERDR_SOCKET_PATH`; integrations report semantic state
+// through `pane report-agent <pane> --source <id> --agent <label>
+// --state <working|idle|blocked>` and release the source's authority with
+// `pane release-agent` when the agent exits. Reports must only fire when
+// `HERDR_ENV=1` and the required variables are present, and `--source`
+// must stay stable and unique to the integration.
+// ---------------------------------------------------------------------------
+
+/// Stable, unique lifecycle source id this adapter reports under (herdr
+/// custom-integration contract). Never reported outside a Herdr pane.
+pub const HERDR_LIFECYCLE_SOURCE: &str = "custom:herdr-fleet-pi";
+
+/// The agent label reported for pi lanes (herdr `agent list` shows the
+/// lane as `agent=pi`).
+pub const HERDR_LIFECYCLE_AGENT: &str = "pi";
+
+/// The herdr pane context of an operation: `Some(pane_id)` when the
+/// allowlisted environment marks a Herdr pane (`HERDR_ENV=1` with a
+/// non-empty `HERDR_PANE_ID`); `None` otherwise, which makes lifecycle
+/// reporting a no-op outside Herdr.
+pub fn herdr_pane_context(env: &BTreeMap<String, String>) -> Option<&str> {
+    if env.get("HERDR_ENV").map(String::as_str) != Some("1") {
+        return None;
+    }
+    env.get("HERDR_PANE_ID")
+        .map(String::as_str)
+        .filter(|pane| !pane.is_empty())
+}
+
+/// The herdr lifecycle report after a typed pi operation result
+/// (issue #33 A2). Herdr has no `done` state, so a terminal one-shot
+/// `prompt` reports `idle`; `refusal.credentials` reports `blocked` (a
+/// user decision is required — the provider key — with a static message
+/// that never carries credential text). `start` reports `working` while
+/// the lane is active. Returns `(state, message)` or `None` when no
+/// report applies.
+fn herdr_lifecycle_report(result: &OpResult) -> Option<(&'static str, Option<&'static str>)> {
+    match result.op {
+        Op::Start if result.status == "succeeded" => Some(("working", None)),
+        Op::Prompt => match result.code {
+            Some(CODE_CREDENTIALS) => Some(("blocked", Some("harness credentials required"))),
+            _ => Some(("idle", None)),
+        },
+        _ => None,
+    }
+}
+
+/// Run the documented `pane report-agent` row for one lifecycle report.
+/// Best-effort sideband: the typed op result is never changed by a report
+/// failure (missing/unusable workspace executable, nonzero exit).
+fn report_herdr_lifecycle(
+    pane: &str,
+    state: &str,
+    message: Option<&str>,
+    env: &BTreeMap<String, String>,
+) {
+    let mut args = vec![
+        "pane".to_string(),
+        "report-agent".to_string(),
+        pane.to_string(),
+        "--source".to_string(),
+        HERDR_LIFECYCLE_SOURCE.to_string(),
+        "--agent".to_string(),
+        HERDR_LIFECYCLE_AGENT.to_string(),
+        "--state".to_string(),
+        state.to_string(),
+    ];
+    if let Some(message) = message {
+        args.push("--message".to_string());
+        args.push(message.to_string());
+    }
+    match run_typed(WORKSPACE_EXECUTABLE, &args, ADAPTER_TIMEOUT, env, None) {
+        ProcessOutcome::Ok(_) => {}
+        ProcessOutcome::Failed(_) => {}
+    }
 }
 
 /// Run one typed operation against a profile (see module docs for the
@@ -937,6 +1066,25 @@ pub fn execute_op_in_worktree(
 }
 
 fn execute_op_at(
+    profile: &Profile,
+    request: &OpRequest<'_>,
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+) -> OpResult {
+    let result = execute_op_inner(profile, request, env, cwd);
+    // Issue #33 A2: a pi profile running inside a Herdr pane reports the
+    // lane lifecycle through the workspace executable (best-effort sideband
+    // that never changes the typed op result; no-op outside Herdr).
+    if profile.kind == HarnessKind::Pi
+        && let (Some(pane), Some((state, message))) =
+            (herdr_pane_context(env), herdr_lifecycle_report(&result))
+    {
+        report_herdr_lifecycle(pane, state, message, env);
+    }
+    result
+}
+
+fn execute_op_inner(
     profile: &Profile,
     request: &OpRequest<'_>,
     env: &BTreeMap<String, String>,
@@ -1396,7 +1544,9 @@ fn run_typed(
 /// a `refusal.credentials` typed refusal. This is failure-shape
 /// classification of nonzero exits only — never capability inference from
 /// prose (ADR-0003), and the matched text never becomes a record.
-const AUTH_MARKERS: [&str; 8] = [
+/// `no api key found` is the measured missing-credentials stderr of pi
+/// v0.85.1 (`pi --provider deepseek ... --print ...`, 2026-09-08).
+const AUTH_MARKERS: [&str; 9] = [
     "authentication failed",
     "not authenticated",
     "not logged in",
@@ -1405,6 +1555,7 @@ const AUTH_MARKERS: [&str; 8] = [
     "login required",
     "auth required",
     "api key required",
+    "no api key found",
 ];
 
 /// Build a result with the wall-time already measured.
@@ -1490,7 +1641,7 @@ mod tests {
 
     #[test]
     fn closed_kind_set_and_official_metadata_are_consistent() {
-        assert_eq!(HarnessKind::OFFICIAL.len(), 3);
+        assert_eq!(HarnessKind::OFFICIAL.len(), 4);
         for kind in HarnessKind::OFFICIAL {
             assert_eq!(HarnessKind::parse(kind.name()), Some(kind));
             let spec = official_spec(kind).expect("official spec");
@@ -1784,5 +1935,79 @@ mod tests {
             assert_eq!(err.code, CODE_STALE_IDENTITY);
             assert!(err.message.contains(field), "{} names {field}", err.message);
         }
+    }
+
+    #[test]
+    fn herdr_pane_context_requires_herdr_env_and_pane_id() {
+        let mut env = BTreeMap::new();
+        env.insert("PATH".to_string(), "/bin".to_string());
+        assert_eq!(herdr_pane_context(&env), None, "no herdr markers");
+        env.insert("HERDR_ENV".to_string(), "1".to_string());
+        assert_eq!(herdr_pane_context(&env), None, "env without pane id");
+        env.insert("HERDR_PANE_ID".to_string(), "w1:p2".to_string());
+        assert_eq!(herdr_pane_context(&env), Some("w1:p2"));
+        env.insert("HERDR_ENV".to_string(), "0".to_string());
+        assert_eq!(herdr_pane_context(&env), None, "HERDR_ENV=0 is not a pane");
+        env.insert("HERDR_ENV".to_string(), "1".to_string());
+        env.insert("HERDR_PANE_ID".to_string(), "".to_string());
+        assert_eq!(herdr_pane_context(&env), None, "empty pane id");
+    }
+
+    #[test]
+    fn herdr_lifecycle_report_maps_typed_results_to_semantic_states() {
+        let profile = Profile::official(HarnessKind::Pi, "pi").expect("profile");
+        let session = sample_session();
+        let started = std::time::Instant::now();
+        let result_for = |op: Op, status: &'static str, code: Option<&'static str>| -> OpResult {
+            op_result(
+                &profile,
+                &OpRequest {
+                    op,
+                    session: &session,
+                    payload: if op == Op::Prompt { Some("x") } else { None },
+                    timeout: Duration::from_secs(1),
+                },
+                status,
+                code,
+                None,
+                None,
+                None,
+                started,
+            )
+        };
+        // start succeeded -> working; terminal prompts -> idle except
+        // credentials -> blocked; workspace ops -> no report.
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Start, "succeeded", None)),
+            Some(("working", None))
+        );
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Start, "refused", Some(CODE_BAD_REQUEST))),
+            None
+        );
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Prompt, "succeeded", None)),
+            Some(("idle", None))
+        );
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Prompt, "ambiguous", Some(CODE_TIMEOUT))),
+            Some(("idle", None))
+        );
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Prompt, "refused", Some(CODE_CREDENTIALS))),
+            Some(("blocked", Some("harness credentials required")))
+        );
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Prompt, "failed", Some(CODE_EXIT))),
+            Some(("idle", None))
+        );
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Outcome, "succeeded", None)),
+            None
+        );
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Identity, "succeeded", None)),
+            None
+        );
     }
 }

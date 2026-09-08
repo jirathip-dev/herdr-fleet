@@ -1,7 +1,7 @@
 ---
 name: herdr-fleet
 description: "Use when working with or on the herdr-fleet repository or CLI. Read-only CLI core (config/doctor/status/plan/capabilities), single-writer daemon (run/status), service unit plans, and grant-gated mutations via the daemon apply RPC; no live harness runs."
-version: 1.7.0
+version: 1.9.0
 author: herdr-fleet contributors
 license: Apache-2.0 OR MIT
 platforms: [macos, linux]
@@ -17,7 +17,8 @@ fleets. Roadmap slices #3-#10 are merged on `staging` (PRs #13-#21): a
 read-only CLI core (#4), a daemon foundation with SQLite state and a local
 socket RPC (#5), the deterministic workflow engine with the bundled
 Doctrine default workflow (#6), the capability-negotiated harness adapters
-(#7: Hermes, Claude Code, Codex + a declarative generic argv adapter,
+(#7: Hermes, Claude Code, Codex + a declarative generic argv adapter;
+#33 adds Pi, earendil-works/pi, with a measured 0.85.1 floor — all
 verified with fake-executable contract tests that need no credentials), the
 control-plane mutation layer (#8: the daemon mediates plan `apply` — one
 typed, digest-bound, capability-gated plan step per request — with durable
@@ -159,17 +160,23 @@ renderings until an authorized grant + daemon `apply` executes them.
   (orchestrator/implementer/reviewer); workflow content can never carry
   policy, capabilities, target, or approval authority.
 
-## Harness adapters (#7, link not duplicate)
+## Harness adapters (#7/#33, link not duplicate)
 
 - Normative contract: `docs/contracts/spec-capabilities.md` ("Adapter
   contract") — closed operation set, typed refusal codes, identity-triple
   rule, fake-adapter doctrine.
 - Declared version ranges and measured version facts:
-  `docs/contracts/compatibility.md`.
+  `docs/contracts/compatibility.md` — Hermes 0.21.0, Claude Code 2.1.263,
+  Codex 0.153.4 (measured 2026-09-06) and Pi 0.85.1 (earendil-works/pi,
+  measured 2026-09-08; darwin prebuilts available at that version, parity
+  human-gated).
 - Rust implementation: `src/adapters.rs` (`herdr_fleet::adapters`);
-  contract tests with fake executables: `tests/harness_adapters.rs` —
-  public CI and fork PRs need no harness credentials. Real harness parity
-  is a human-gated clean-host smoke, never run from this repository's CI.
+  contract tests with fake executables: `tests/harness_adapters.rs` — the
+  shared fixture loop drives every official adapter (hermes, claude-code,
+  codex, pi) plus the argv fake; public CI and fork PRs need no harness
+  credentials. Real harness parity is a human-gated clean-host smoke,
+  never run from this repository's CI (the issue #33 lane ran one local
+  pi live smoke outside CI as sandbox evidence; see `.report-33.md`).
 
 ## Control-plane mutations (#8, link not duplicate)
 
@@ -232,6 +239,24 @@ Hermes (or any agent harness) may appear in this repository only as a
 clearly labeled *adapter example* of the harness-neutral design — never as
 a required invocation path, profile layout, or core dependency. This skill
 is usable with any harness or with none.
+
+## Making this skill available to Pi lanes (issue #33 A1)
+
+Hermes lanes read this skill from the profile skill directory. Pi lanes
+(the pi harness adapter, issue #33) load the same operating knowledge
+through pi's native skills discovery (pi `docs/skills.md`; this directory
+is a standard skill: `SKILL.md` + freeform files):
+
+- Global: symlink (keeps the relative `docs/...` links working) or copy
+  this directory to `~/.pi/agent/skills/herdr-fleet/`.
+- Project: `cp -r skills/herdr-fleet <worktree>/.pi/skills/` (project
+  skills load once the project is trusted).
+- One-shot/CLI: `pi --skill <repo>/skills/herdr-fleet ...` (repeatable,
+  additive even with `--no-skills`).
+
+Verified 2026-09-08 (issue #33 A1): a real pi session loaded this skill
+and answered a herdr-fleet usage question from the skill content alone —
+redacted Q/A evidence in `.report-33.md`.
 
 ## Repository rules that bind work here
 
