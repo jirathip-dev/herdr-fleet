@@ -55,6 +55,28 @@ integration branch.
   forbidden on both long-lived branches by repository rulesets; only PR
   squash merges are allowed, with linear history.
 
+> **WARNING — promotion PRs carry the integration branch as their HEAD.**
+> A promotion PR's head branch *is* `staging`. GitHub's automatic
+> head-branch deletion on merge (`delete_branch_on_merge`, "automatically
+> delete head branches") therefore deletes the integration branch when the
+> promotion PR merges. This happened after promotion PR
+> [#28](https://github.com/jirathip-dev/herdr-fleet/pull/28): `staging` was
+> silently deleted, later landing was blocked until a maintainer recreated
+> it by hand, and the repository setting is now off. The setting must stay
+> **off** while promotion PRs exist.
+>
+> After **any** promotion merge, verify the integration branch still
+> exists before continuing:
+>
+> ```console
+> $ git ls-remote origin refs/heads/staging
+> ```
+>
+> Empty output means `staging` is missing — restore it immediately
+> ([OPERATIONS.md](OPERATIONS.md) section 8.1) and re-check the
+> auto-delete setting. The CI `policy` job enforces this on every run via
+> its "Integration branch exists (staging guard)" step.
+
 ### Hotfix exception (narrow, fail-closed)
 
 An incident/security fix may target `main` directly from a `hotfix/*`
