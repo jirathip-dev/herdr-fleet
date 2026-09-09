@@ -145,6 +145,20 @@ release process activates (docs/RELEASING.md), then semver applies.
 - Active in-repo release/version policy with release execution
   human-gated (`docs/RELEASING.md`).
 
+### Added (issue #35 — Herdr 0.9 compatibility)
+
+- Portable contract coverage for Herdr 0.9.0 event bootstrap ordering and
+  live-only subscriptions, explicit workspace-group close, prompt wait
+  activity, unscrolled recent pane reads, and issue #9's lack of an upstream
+  retained-event dependency.
+- Measured compatibility matrix: same-version 0.9.0/protocol 22 passed in an
+  isolated scratch server; both 0.8.2/protocol-20 mixed directions refused
+  normal API calls with `protocol_mismatch`, consistent with upstream's
+  endpoint-generation boundary.
+- The doctor minimum remains 0.8.2 because the required mixed-version matrix
+  is red; documentation distinguishes that CLI floor from server protocol
+  compatibility rather than claiming or working around interoperability.
+
 ### Changed
 
 - Documentation polish (issue #12, PR #13): security recipe doc line fix

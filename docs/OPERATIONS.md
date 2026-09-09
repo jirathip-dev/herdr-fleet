@@ -129,6 +129,14 @@ $ ./target/release/herdr-fleet doctor --json              # exit 0
  "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
 ```
 
+The Herdr row is a CLI-version gate only. Issue #35 measured that 0.8.2
+(protocol 20) and 0.9.0 (protocol 22) clients/servers reject both mixed
+pairings with `protocol_mismatch`; see
+[compatibility.md](contracts/compatibility.md). During a Herdr update, use
+Herdr's own status/handoff workflow and update both endpoints rather than
+reading the 0.8.2 doctor floor as mixed-version support. herdr-fleet never
+restarts either endpoint.
+
 Declared read capabilities (static; no negotiation, no shell guessing):
 
 ```console
@@ -176,7 +184,7 @@ Failure → remedy:
 
 ### 3.1 Monitoring a lane on an unrecognized harness (jcode example)
 
-herdr 0.8.2 recognizes a closed list of agent kinds at spawn ([ARCHITECTURE.md](ARCHITECTURE.md)
+herdr 0.9.0 recognizes a closed list of agent kinds at spawn ([ARCHITECTURE.md](ARCHITECTURE.md)
 "Layer responsibilities"). A harness outside that list — jcode today, a
 herdr-fleet first-class adapter (issue #37) but not a herdr agent kind —
 runs fine in a pane but never appears as a herdr agent-kind row, so
@@ -199,19 +207,21 @@ herdr-fleet state and the pane rows instead:
    transcripts are never persisted (AC8; trust model T5) — the journal
    records the step and its outcome, not the conversation. The live pane
    terminal stays available as the working transcript: `herdr pane read
-   <pane>` reads it back at any time (no agent kind required).
+   <pane>` reads it back at any time (no agent kind required). Herdr 0.9.0
+   also returns recent output that is still in the unscrolled viewport; the
+   issue #35 live and portable probes pin that behavior.
 3. **Semantic lifecycle (adapter-side sideband).** When the pi/jcode
    profile operation runs inside a herdr pane (`HERDR_ENV=1` +
    `HERDR_PANE_ID` in the allowlisted environment), the adapter reports the
    lane through `herdr pane report-agent <pane> --source
    custom:herdr-fleet-pi|custom:herdr-fleet-jcode --agent pi|jcode
-   --state ...`: start → `working`; a terminal prompt result → `idle`
-   (herdr's agent list renders a custom-reported terminal `idle` as
-   `agent_status: done` while `herdr agent explain` reports the semantic
-   `idle`); `refusal.credentials` → `blocked` with the static message
-   `harness credentials required`. Releasing the reporting source's
-   authority (`herdr pane release-agent`, same `--source`/`--agent`) is the
-   lane owner's pane-closeout row.
+   --state ...`: start → `working`; a terminal prompt result → `idle`;
+   `refusal.credentials` → `blocked` with the static message `harness
+   credentials required`. `pane report-agent` has no `done` input, although
+   Herdr may derive `done` for unseen settled agents; consumers accept both
+   `idle` and `done`. Releasing the reporting source's authority (`herdr pane
+   release-agent`, with the same `--source`/`--agent`) is the lane owner's
+   pane-closeout row.
 
 Truthful limits today: the pane rows come from the harness adapter inside
 the pane — no herdr-fleet daemon caller drives or consumes them yet in this

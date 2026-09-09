@@ -36,7 +36,9 @@ use crate::value::{Val, bool_, integer, null, object, string};
 pub const ADAPTER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum concurrent repository observers (worker threads).
 pub const MAX_CONCURRENT_OBSERVERS: usize = 4;
-/// Declared minimum Herdr version (docs/contracts/compatibility.md).
+/// Declared minimum Herdr CLI version (docs/contracts/compatibility.md).
+/// Issue #35 retained this floor because protocol 20/22 mixed pairs are red;
+/// the value is not a mixed-server compatibility claim.
 pub const HERDR_MINIMUM: (u64, u64, u64) = (0, 8, 2);
 /// Declared minimum `gh` major.minor floor.
 pub const GH_MINIMUM: (u64, u64, u64) = (2, 0, 0);

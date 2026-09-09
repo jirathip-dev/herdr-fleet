@@ -1,6 +1,7 @@
 # Spec: lifecycle semantics — schedules, admission, cleanup archive, remote transport, cold-boot recovery
 
-Refs #9 (lifecycle slice). Family: `hf-schedule/v1` (fixtures under
+Refs #9, #35 (lifecycle slice plus Herdr 0.9 compatibility audit). Family:
+`hf-schedule/v1` (fixtures under
 [`schedule/schedule.valid.json`](../../schemas/fixtures/schedule/schedule.valid.json)).
 Rust: `src/lifecycle.rs`,
 `src/remote.rs`, state migration `m0004_schedules_lifecycle_v4`.
@@ -45,7 +46,9 @@ anchored, coalesced, single-flight, and never replay a backlog:
   and atomically advances `next_run_at` to the next window — a second
   tick in the same window is idle (persisted-window single flight).
 - Missed windows are never replayed: after a long sleep/reboot exactly
-  ONE fresh evaluation fires and the window jumps ahead of `now`.
+  ONE fresh evaluation fires and the window jumps ahead of `now`. This is
+  internal schedule-window state, not retained events from Herdr; the #9
+  runtime never subscribes to Herdr's event stream.
 - Clock movement backward makes ticks idle until the window catches up
   (never a double fire).
 - Refused evaluations **park the schedule** (`enabled:false`) with a

@@ -48,7 +48,10 @@ and the renderer provenance note live in
 Prerequisites: Rust 1.97.1 (pinned by `rust-toolchain.toml`; see
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for install commands), `git`, and —
 for the read probes that need them — `herdr` >= 0.8.2 and authenticated `gh`.
-Read-only commands never install any of those tools; they only check them.
+Read-only commands never install any of those tools; they only check them. The
+0.8.2 floor is not mixed-version support: the issue #35 matrix found protocol
+20/22 client/server pairings incompatible in both directions, while same-version
+0.9.0 passed. See [the compatibility policy](docs/contracts/compatibility.md).
 
 ```console
 $ git clone https://github.com/jirathip-dev/herdr-fleet.git

@@ -1021,7 +1021,7 @@ fn workspace_args(op: Op, session_id: &str) -> Vec<String> {
 // Official one-shot adapter lane lifecycle reporting under Herdr (issues
 // #33 A2, #37)
 //
-// Herdr's custom-integration contract (docs/integrations, herdr 0.8.2):
+// Herdr's custom-integration contract (verified at 0.8.2 and 0.9.0):
 // an agent running in a Herdr pane inherits `HERDR_ENV`/`HERDR_PANE_ID`/
 // `HERDR_BIN_PATH`/`HERDR_SOCKET_PATH`; integrations report semantic state
 // through `pane report-agent <pane> --source <id> --agent <label>
@@ -1074,10 +1074,10 @@ pub fn herdr_pane_context(env: &BTreeMap<String, String>) -> Option<&str> {
 }
 
 /// The herdr lifecycle report after a typed pi/jcode operation result
-/// (issues #33 A2 / #37). Herdr has no `done` state, so a terminal one-shot
-/// `prompt` reports `idle`; `refusal.credentials` reports `blocked` (a
-/// user decision is required — the provider key — with a static message
-/// that never carries credential text). `start` reports `working` while
+/// (issues #33 A2 / #37). `pane report-agent` has no `done` input state, so a
+/// terminal one-shot `prompt` reports `idle`; `refusal.credentials` reports
+/// `blocked` (a user decision is required — the provider key — with a static
+/// message that never carries credential text). `start` reports `working` while
 /// the lane is active. Returns `(state, message)` or `None` when no
 /// report applies.
 fn herdr_lifecycle_report(result: &OpResult) -> Option<(&'static str, Option<&'static str>)> {

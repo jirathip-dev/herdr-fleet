@@ -1,7 +1,7 @@
 ---
 name: herdr-fleet
 description: "Use when working with or on the herdr-fleet repository or CLI. Read-only CLI core (config/doctor/status/plan/capabilities), single-writer daemon (run/status), service unit plans, and grant-gated mutations via the daemon apply RPC; no live harness runs."
-version: 1.10.0
+version: 1.11.0
 author: herdr-fleet contributors
 license: Apache-2.0 OR MIT
 platforms: [macos, linux]
@@ -34,7 +34,10 @@ release provenance; clean-host verification; measured baselines; in-repo
 release policy). The daemon never starts/stops Herdr, the CLI never mutates
 repositories or fleet state directly, and no live workflow execution,
 release execution, or real harness session runs from public CI (those are
-human-gated).
+human-gated). Issue #35 verifies Herdr 0.9.0's current behavior with isolated
+live probes and portable contract tests: same-version protocol 22 is green,
+while both 0.8.2/protocol-20 mixed directions fail closed. The doctor minimum
+therefore remains 0.8.2 and is not a mixed-server compatibility claim.
 
 ## When to use
 
@@ -229,6 +232,19 @@ renderings until an authorized grant + daemon `apply` executes them.
   `docs/contracts/baseline-linux-x86_64.csv`,
   `docs/contracts/benchmarks.md`): never a CI gate.
 - Compatibility probe mapping: `docs/contracts/compatibility.md`.
+
+## Herdr 0.9 compatibility (#35 — pointers)
+
+- Canonical matrix and evidence classes:
+  `docs/contracts/compatibility.md` (same-version 0.9.0 green; both
+  0.8.2/0.9.0 mixed protocol directions red and fail closed).
+- Portable discriminating tests: `tests/herdr_compatibility.rs` (subscribe
+  before snapshot, no retained replay, explicit group close, prompt activity
+  gate, unscrolled recent reads, and the #9 no-dependency guard).
+- `HERDR_MINIMUM` remains 0.8.2 because the mixed matrix is red. Treat it as
+  the supported CLI floor, never as permission to operate mismatched
+  protocol-20/protocol-22 endpoints; update Herdr endpoints together through
+  Herdr's own workflow, never from herdr-fleet.
 
 ## Safety direction (plan/apply gates)
 
