@@ -28,7 +28,7 @@ in this category starts a workflow:
 
 - `config init` / `config validate` / `config show` — print the annotated
   template, validate a config file and its policy overlay, inspect the
-  effective configuration. The CLI never writes files.
+  effective configuration. These three commands write nothing.
 - `doctor` — diagnose prerequisites (`git`, `herdr` >= 0.8.2, authenticated
   `gh`); never installs or starts anything.
 - `status` — observe configured repositories from their local checkouts,
@@ -41,6 +41,9 @@ in this category starts a workflow:
   the daemon environment and render per-user launchd/systemd unit text and
   steps; no host service manager is touched.
 - `daemon run` / `daemon status` — run and probe the local state daemon.
+  `daemon run` writes its per-user local runtime state (SQLite state,
+  audit/event journals, lock, log, socket) under XDG paths, but starting it
+  starts no workflow (category 3).
 
 Sources: [docs/OPERATIONS.md](docs/OPERATIONS.md) sections 2-5 and
 [docs/contracts/spec-cli.md](docs/contracts/spec-cli.md).
@@ -100,7 +103,9 @@ every command.
 [![herdr-fleet v0.1.0 as shipped: operator -> CLI -> daemon -> workflow engine -> adapters -> git/github/harnesses, with plans/grants state below](docs/architecture/herdr-fleet.as-shipped.architecture.preview.light.png)](docs/architecture/herdr-fleet.as-shipped.architecture.html)
 
 That picture is the **as-shipped** architecture of the v0.1.0 release — not the
-long-term target. Reading left to right: you drive the read-only CLI
+long-term target; the mutation path it shows is the implemented primitive
+categorized in [Readiness today](#readiness-today), not a supported
+end-to-end workflow. Reading left to right: you drive the read-only CLI
 (`config`, `doctor`, `status`, `plan`, `capabilities`, `service *-plan`); the
 CLI probes the local checkout, `gh`, and Herdr directly, and talks to the local
 daemon only to run it or ask its status. Mutations are the guarded path at the
@@ -150,7 +155,8 @@ wording predates the daemon work and is being corrected in
 [#55](https://github.com/jirathip-dev/herdr-fleet/issues/55) — the daemon
 itself is implemented, as [Readiness today](#readiness-today) describes.
 
-Configure — the template prints to stdout; the CLI never writes files:
+Configure — `config init` prints the template to stdout and writes nothing
+(you redirect the output yourself):
 
 ```console
 $ ./target/release/herdr-fleet config init > ~/.config/herdr-fleet/config.toml
@@ -234,8 +240,8 @@ Outputs above are trimmed from real runs and host paths are redacted (`.../`,
 
 **Target story, not a supported end-to-end workflow today** (see
 [Readiness today](#readiness-today)). Steps 1-3 are exercised read-only
-commands; step 4 describes the daemon's grant/apply primitives, which no
-supported operator path drives yet.
+commands; steps 4-5 describe the daemon's grant/apply primitives and their
+journal read-back, which no supported operator path drives yet.
 
 You are the operator. It is Monday; `widgets` (issue #7) needs work from one of
 your agent fleets, and you want that work planned, reviewed, and merged without
