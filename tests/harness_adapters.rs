@@ -1202,7 +1202,7 @@ fn harness_prompt_runs_confined_to_the_assigned_worktree() {
 // ---------------------------------------------------------------------------
 // Issue #33 A2: herdr lifecycle reporting rows (pi adapter under herdr)
 //
-// herdr's custom-integration contract (herdr 0.8.2 docs/integrations): an
+// herdr's custom-integration contract (verified at 0.8.2 and 0.9.0): an
 // agent running in a herdr pane inherits HERDR_ENV/HERDR_PANE_ID; reports
 // go through `pane report-agent <pane> --source <id> --agent <label>
 // --state <state>`; the source must be stable and unique; reporting is a

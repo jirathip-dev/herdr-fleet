@@ -283,6 +283,38 @@ fn doctor_all_ok_with_fake_herdr_and_gh() {
 }
 
 #[test]
+fn doctor_accepts_current_herdr_090_while_retaining_the_measured_floor() {
+    let sandbox = Sandbox::new("doctor-herdr-090");
+    let home = home_dir(&sandbox);
+    write_valid_config(&sandbox);
+    let path = fakebin(&sandbox);
+    sandbox.write(
+        "fakebin/herdr",
+        "#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo 'herdr 0.9.0' && exit 0\nexit 1\n",
+    );
+    sandbox.chmod_x("fakebin/herdr");
+
+    let out = run_cli(&sandbox, &["doctor", "--json"], &path, Some(&home), None);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let doc = assert_envelope_valid("doctor", &out);
+    let Val::Arr(checks) = doc
+        .get("data")
+        .and_then(|data| data.get("checks"))
+        .expect("doctor checks")
+    else {
+        panic!("checks array")
+    };
+    let detail = checks
+        .iter()
+        .find(|check| check.get("name").and_then(Val::as_str) == Some("herdr"))
+        .and_then(|check| check.get("detail"))
+        .and_then(Val::as_str)
+        .expect("herdr detail");
+    assert!(detail.contains("herdr 0.9.0"), "{detail}");
+    assert!(detail.contains("declared minimum 0.8.2"), "{detail}");
+}
+
+#[test]
 fn doctor_reports_missing_prerequisites_as_partial() {
     let sandbox = Sandbox::new("doctor-missing");
     let home = home_dir(&sandbox);

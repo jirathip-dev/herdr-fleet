@@ -117,6 +117,13 @@ daemon answers with the ok response, then pushes `hf-event/v1` lines:
 - A subscribe connection is push-only after the response: the client never
   sends again on it.
 
+This is the **herdr-fleet daemon's** event contract, not Herdr's workspace
+socket contract. Herdr 0.9.0 changed its own new subscriptions to live-only;
+that does not remove this cursor-based replay/resnapshot surface. Issue #9's
+schedule lifecycle writes this daemon-owned journal and never consumes
+upstream Herdr `events.subscribe`, so it has no retained-history dependency
+(guarded by `tests/herdr_compatibility.rs`).
+
 ## Read-only independence
 
 `doctor`, `status`, and `plan` never require the daemon to be running

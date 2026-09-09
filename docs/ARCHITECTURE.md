@@ -119,8 +119,8 @@ Each product owns one layer of a fleet lane's life:
   herdr-fleet status for lanes Herdr cannot classify is an open idea —
   [Corral#443](https://github.com/jirathip-dev/corral/issues/443).
 
-**Recognized vs unrecognized harnesses.** Herdr 0.8.2 spawns from a closed
-list of recognized agent kinds — 22 kinds in the 0.8.2 measured for this
+**Recognized vs unrecognized harnesses.** Herdr 0.9.0 spawns from a closed
+list of recognized agent kinds — 23 kinds in the 0.9.0 measured for this
 revision (`herdr agent start --help`, 2026-09-09; the list grows as Herdr
 adds agents). jcode is a first-class herdr-fleet adapter (issue #37) but
 **not** a Herdr agent kind — by design, Herdr's owner declined an upstream

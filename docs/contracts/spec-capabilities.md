@@ -116,7 +116,8 @@ can run with **no harness credentials** (AC7).
   lane through the workspace executable's `pane report-agent` row
   (pi: `--source custom:herdr-fleet-pi --agent pi`; jcode:
   `--source custom:herdr-fleet-jcode --agent jcode`), per Herdr's
-  custom-integration contract (herdr 0.8.2). Typed-result mapping:
+  custom-integration contract (verified unchanged at Herdr 0.9.0). Typed-result
+  mapping:
 
   | Typed result | Herdr report |
   | --- | --- |
@@ -124,14 +125,14 @@ can run with **no harness credentials** (AC7).
   | terminal `prompt` — succeeded / failed / refused / ambiguous (timeout, process death, plain exit) | `idle` |
   | terminal `prompt` with `refusal.credentials` | `blocked` + static message `harness credentials required` (a provider key decision is needed; the message never carries credential text) |
 
-  Herdr has no `done` state (semantic states are `idle`/`working`/
-  `blocked`), so terminal lanes report `idle`; on the live herdr 0.8.2
-  daemon the agent-list API renders a custom-reported terminal `idle` as
-  `agent_status: done` while `agent explain` reports the semantic `idle`
-  (verified 2026-09-08 on an isolated scratch pane — `.report-33.md`).
-  Reporting is
-  a best-effort sideband that never changes the typed op result and is a
-  no-op outside Herdr (no `HERDR_ENV=1`). `herdr agent start --kind pi` is
+  The `pane report-agent` input accepts `idle`/`working`/`blocked`/`unknown`,
+  not the derived `done` status, so terminal one-shots report `idle`. A live
+  0.9.0 scratch row read back as `idle`; consumers must accept both `idle` and
+  `done` as settled because visibility/seen state may derive `done`. The older
+  0.8.2 scratch evidence rendered an unseen custom-reported idle row as
+  `done` while `agent explain` reported semantic `idle` (`.report-33.md`).
+  Reporting is a best-effort sideband that never changes the typed op result
+  and is a no-op outside Herdr (no `HERDR_ENV=1`). `herdr agent start --kind pi` is
   the substrate/orchestrator path for *interactive* pi panes (it requires
   a pane at an interactive shell prompt and is not drivable by a headless
   library adapter); headless adapter runs report through the pane rows
