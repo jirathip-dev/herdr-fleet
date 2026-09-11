@@ -1,6 +1,6 @@
 # Spec: XDG TOML configuration and policy overlay
 
-Refs #3. Family: `hf-config/v1` (config), `hf-policy/v1` (overlay). Fixtures:
+Refs #3, #80. Family: `hf-config/v1` (config), `hf-policy/v1` (overlay). Fixtures:
 [`config/`](../../schemas/fixtures/config/config.valid.toml), [`policy/`](../../schemas/fixtures/policy/policy.valid.toml),
 manifest rows in [`schemas/fixtures/manifest.jsonl`](../../schemas/fixtures/manifest.jsonl).
 Design commitment (locked spec: "One canonical XDG TOML config plus one
@@ -31,7 +31,7 @@ stack").
 | `daemon.socket` | string | no | explicit socket path override; default derives from the XDG runtime dir — portable default only |
 | `policy.overlay` | string | no | explicit relative/absolute path of the optional policy overlay; no implicit discovery |
 | `repository.<key>` | table | no | one configured repository per key (slug); `origin` (string URL) required; `branch`, `enabled` optional |
-| `harness.<key>` | table | no | adapter profile per configured harness: `kind` (string; e.g. `argv`), `executable` (name resolved via PATH, never an absolute path), `env_allow` (array of environment variable names — the explicit allowlist) |
+| `harness.<key>` | table | no | adapter profile per configured harness: `kind` (string; e.g. `argv`), `executable` (name resolved via PATH, never an absolute path), `env_allow` (array of environment variable names — the explicit allowlist), and the optional `provider`/`model` binding pair: bare tokens, declared together, used by the official prompt rows that carry the pair on argv (`pi`, `jcode`). Without the binding the terminal prompt refuses (`refusal.binding.missing`) — there is no default and no substitution |
 | `workflow.<key>` | table | no | pinned workflow selection: `id` + `hash` (64-hex sha256 over the canonical workflow document) |
 | `role.<key>` | table | no | custom roles only, explicit and hash-pinned: `hash` (64-hex) |
 
@@ -63,6 +63,13 @@ error, not a no-op).
 
 ## Compatibility and refusal
 
+- A declared `harness.<key>.provider`/`model` binding must be a bare-token
+  pair: non-empty, no whitespace, no path separators. Malformed, blank, or
+  half-declared values are refused at load (`config.invalid`, naming the
+  `config.harness.<key>.<field>` path — issue #80). An absent binding is
+  not a config error; the terminal prompt refuses instead
+  (`refusal.binding.missing`, [spec-capabilities.md](spec-capabilities.md)) —
+  no default and no fallback model are inferred.
 - Exact version match required: `hf-config/v2` or any other version is
   refused (`REFUSE_VERSION`), as is a missing/foreign `schema`
   (`REFUSE_SCHEMA`).

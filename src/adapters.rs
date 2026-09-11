@@ -46,9 +46,12 @@
 //!   `--source custom:herdr-fleet-pi --agent pi`; jcode reports
 //!   `--source custom:herdr-fleet-jcode --agent jcode`). `start` reports
 //!   `working`; a terminal `prompt` reports
-//!   `idle` (Herdr has no done state), except `refusal.credentials` which
-//!   reports `blocked` (a user decision — provider key — is required; the
-//!   message is static and never carries credential detail). Reporting is
+//!   `idle` (Herdr has no done state), except `refusal.credentials` (a user
+//!   decision — the provider key — is required) and
+//!   `refusal.binding.missing` (the profile declares no provider/model
+//!   binding, so a user decision — declare the binding — is required),
+//!   which report `blocked` with static messages that never carry
+//!   credential or binding detail. Reporting is
 //!   best-effort and never changes the typed op result, and is a no-op
 //!   outside Herdr. `herdr agent start --kind pi` remains the
 //!   substrate/orchestrator path for interactive pi panes (requires a pane
@@ -114,6 +117,11 @@ pub const CODE_UNAVAILABLE: &str = "refusal.unavailable.harness";
 /// classification of an already-failed invocation; never capability
 /// inference from prose).
 pub const CODE_CREDENTIALS: &str = "refusal.credentials";
+/// The harness profile declares no explicit provider/model binding; the
+/// terminal prompt is refused and nothing is substituted (issue #80). The
+/// Herdr lifecycle mapping reports this refusal as `blocked` — declaring
+/// the binding is a user decision.
+pub const CODE_BINDING: &str = "refusal.binding.missing";
 /// Structured output could not be parsed or validated.
 pub const CODE_MALFORMED: &str = "refusal.malformed.output";
 /// The identity read-back does not match the bound session identity.
@@ -495,11 +503,13 @@ impl OpResult {
 }
 
 /// A declarative adapter profile: kind, bare executable name, stable actor
-/// id, explicit capability set, and (for the `argv` kind) the explicit
-/// per-operation static argv prefixes. Config v1 (`harness.<key>`) carries
-/// kind/executable/env_allow; the env allowlist is applied by the caller
-/// when it builds the environment map ([`Profile::from_config`] documents
-/// the argv-capability consequence).
+/// id, explicit capability set, an explicit provider/model binding for the
+/// prompt rows that carry the pair on argv (Pi, Jcode — issue #80), and
+/// (for the `argv` kind) the explicit per-operation static argv prefixes.
+/// Config v1 (`harness.<key>`) carries kind/executable/env_allow plus the
+/// optional provider/model binding; the env allowlist is applied by the
+/// caller when it builds the environment map ([`Profile::from_config`]
+/// documents the argv-capability consequence).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Profile {
     /// Config/profile key (slug).
@@ -515,6 +525,14 @@ pub struct Profile {
     pub capabilities: Vec<String>,
     /// Declared version range (official adapters only).
     pub declared_range: Option<VersionRange>,
+    /// Explicit provider/model binding for the official prompt rows that
+    /// carry the pair on argv (Pi, Jcode; issue #80). `None` means unbound:
+    /// the terminal prompt refuses with `refusal.binding.missing` — there
+    /// is no default, no inference, and no substitution. Never persisted,
+    /// never on a wire.
+    pub provider: Option<String>,
+    /// See [`Profile::provider`].
+    pub model: Option<String>,
     /// Explicit per-operation static argv prefixes for the `argv` kind
     /// (op name -> prefix; the prompt payload is appended as one final
     /// element). Ignored for official kinds, which use their documented
@@ -536,6 +554,8 @@ impl Profile {
             actor: spec.actor.to_string(),
             capabilities: spec.capabilities.iter().map(|s| s.to_string()).collect(),
             declared_range: Some(spec.range),
+            provider: None,
+            model: None,
             op_args: BTreeMap::new(),
         })
     }
@@ -604,6 +624,8 @@ impl Profile {
             actor,
             capabilities: capabilities.iter().map(|s| s.to_string()).collect(),
             declared_range: None,
+            provider: None,
+            model: None,
             op_args,
         })
     }
@@ -615,7 +637,10 @@ impl Profile {
     /// field), so config-declared argv profiles support discovery and
     /// probing only — any operation is refused with `unknown.capability`
     /// until an explicit capability declaration is wired from a profile
-    /// source (documented in spec-config.md/spec-capabilities.md).
+    /// source (documented in spec-config.md/spec-capabilities.md). The
+    /// optional provider/model binding pair is carried when the config
+    /// declares both tokens; the Pi/Jcode prompt rows refuse without it
+    /// (issue #80).
     pub fn from_config(harness: &crate::config::Harness) -> Result<Profile, AdapterError> {
         let kind = HarnessKind::parse(&harness.kind).ok_or_else(|| {
             AdapterError::refusal(
@@ -640,15 +665,33 @@ impl Profile {
             ),
             None => (harness.key.clone(), Vec::new(), None),
         };
-        Ok(Profile {
+        let mut profile = Profile {
             key: harness.key.clone(),
             kind,
             executable: harness.executable.clone(),
             actor,
             capabilities,
             declared_range,
+            provider: None,
+            model: None,
             op_args: BTreeMap::new(),
-        })
+        };
+        // The explicit provider/model binding pair (issue #80): carried
+        // only when both tokens are declared; a half pair is refused
+        // rather than carried.
+        match (&harness.provider, &harness.model) {
+            (None, None) => {}
+            (Some(provider), Some(model)) => {
+                profile = profile.with_binding(provider, model)?;
+            }
+            _ => {
+                return Err(AdapterError::refusal(
+                    CODE_BAD_REQUEST,
+                    "the harness provider/model binding must declare both tokens or neither",
+                ));
+            }
+        }
+        Ok(profile)
     }
 
     /// Whether the profile declares a capability.
@@ -676,6 +719,44 @@ impl Profile {
             ));
         }
         Ok(doc)
+    }
+
+    /// Attach the explicit provider/model binding the Pi/Jcode prompt rows
+    /// build their `--provider`/`--model` argv from (issue #80). Both
+    /// tokens are validated as bare tokens: non-empty, no whitespace, no
+    /// path separators, no NUL (bare tokens are never paths and never
+    /// shell text; the pair travels as argv data only).
+    pub fn with_binding(mut self, provider: &str, model: &str) -> Result<Profile, AdapterError> {
+        Self::validate_binding_token("provider", provider)?;
+        Self::validate_binding_token("model", model)?;
+        self.provider = Some(provider.to_string());
+        self.model = Some(model.to_string());
+        Ok(self)
+    }
+
+    /// The explicit provider/model binding this profile declares, or a
+    /// typed refusal (`refusal.binding.missing`) when it declares none —
+    /// no default is inferred and no fallback is substituted (issue #80).
+    fn prompt_binding(&self) -> Result<(&str, &str), AdapterError> {
+        match (self.provider.as_deref(), self.model.as_deref()) {
+            (Some(provider), Some(model)) => Ok((provider, model)),
+            _ => Err(AdapterError::refusal(
+                CODE_BINDING,
+                "the harness profile declares no provider/model binding; the prompt is refused (no default is inferred)",
+            )),
+        }
+    }
+
+    fn validate_binding_token(field: &str, value: &str) -> Result<(), AdapterError> {
+        if crate::config::is_bare_token(value) {
+            return Ok(());
+        }
+        Err(AdapterError::refusal(
+            CODE_BAD_REQUEST,
+            format!(
+                "binding {field} must be a non-empty bare token (no whitespace or path separators)"
+            ),
+        ))
     }
 
     fn validate_bare_executable(executable: &str) -> Result<(), AdapterError> {
@@ -961,41 +1042,53 @@ fn prompt_args(profile: &Profile) -> Result<Vec<String>, AdapterError> {
         HarnessKind::ClaudeCode => Ok(vec!["-p".to_string()]),
         HarnessKind::Codex => Ok(vec!["exec".to_string()]),
         // One-shot `--print` row (issue #33, measured against pi v0.85.1 on
-        // 2026-09-08). Provider/model are opaque adapter metadata carried as
-        // argv flags (never persisted, never on a wire); credentials arrive
+        // 2026-09-08). The provider/model pair is the explicit profile
+        // binding (issue #80) — a profile without it refuses here with
+        // `refusal.binding.missing`; there is no default and nothing is
+        // substituted. The pair is opaque adapter metadata carried as argv
+        // flags (never persisted, never on a wire); credentials arrive
         // only through the allowlisted environment. The trailing `--` is
         // pi's documented end-of-options guard, so a data-last payload that
         // begins with `-` can never be parsed as an option.
-        HarnessKind::Pi => Ok(vec![
-            "--provider".to_string(),
-            "deepseek".to_string(),
-            "--model".to_string(),
-            "deepseek-chat".to_string(),
-            "--print".to_string(),
-            "--".to_string(),
-        ]),
+        HarnessKind::Pi => {
+            let (provider, model) = profile.prompt_binding()?;
+            Ok(vec![
+                "--provider".to_string(),
+                provider.to_string(),
+                "--model".to_string(),
+                model.to_string(),
+                "--print".to_string(),
+                "--".to_string(),
+            ])
+        }
         // One-shot `jcode run` row (issue #37, measured against jcode
-        // v0.84.0 on 2026-09-08: `run --provider deepseek --model
-        // deepseek-chat --json -- <message>` exits 1 with the measured
-        // missing-key text when no provider key is present, and the `--`
-        // end-of-options guard is accepted, keeping the data-last payload
-        // safe). `--json` makes the real binary emit a machine-readable
-        // envelope on stdout (top-level object with a `text` field,
-        // verified 2026-09-08); the adapter parses that envelope back into
-        // the transcript and falls back to raw stdout when the output is
-        // not an envelope (defensive against non-envelope stdout). The
-        // provider/model pair is opaque adapter metadata in argv — never
-        // persisted, never on a wire; credentials arrive only through the
-        // allowlisted environment.
-        HarnessKind::Jcode => Ok(vec![
-            "run".to_string(),
-            "--provider".to_string(),
-            "deepseek".to_string(),
-            "--model".to_string(),
-            "deepseek-chat".to_string(),
-            "--json".to_string(),
-            "--".to_string(),
-        ]),
+        // v0.84.0 on 2026-09-08: the documented row exits 1 with the
+        // measured missing-key text when no provider key is present, and
+        // the `--` end-of-options guard is accepted, keeping the data-last
+        // payload safe). The provider/model pair is the explicit profile
+        // binding (issue #80) — a profile without it refuses here with
+        // `refusal.binding.missing`; there is no default and nothing is
+        // substituted. `--json` makes the real binary emit a
+        // machine-readable envelope on stdout (top-level object carrying
+        // `text` plus the returned `provider`/`model`; verified
+        // 2026-09-08); the adapter parses that envelope back into the
+        // transcript and surfaces the returned identity, falling back to
+        // raw stdout when the output is not an envelope (defensive against
+        // non-envelope stdout). The pair is opaque adapter metadata in argv
+        // — never persisted, never on a wire; credentials arrive only
+        // through the allowlisted environment.
+        HarnessKind::Jcode => {
+            let (provider, model) = profile.prompt_binding()?;
+            Ok(vec![
+                "run".to_string(),
+                "--provider".to_string(),
+                provider.to_string(),
+                "--model".to_string(),
+                model.to_string(),
+                "--json".to_string(),
+                "--".to_string(),
+            ])
+        }
         HarnessKind::Argv => Ok(profile.op_args.get("prompt").cloned().unwrap_or_default()),
     }
 }
@@ -1074,10 +1167,12 @@ pub fn herdr_pane_context(env: &BTreeMap<String, String>) -> Option<&str> {
 }
 
 /// The herdr lifecycle report after a typed pi/jcode operation result
-/// (issues #33 A2 / #37). `pane report-agent` has no `done` input state, so a
-/// terminal one-shot `prompt` reports `idle`; `refusal.credentials` reports
-/// `blocked` (a user decision is required — the provider key — with a static
-/// message that never carries credential text). `start` reports `working` while
+/// (issues #33 A2 / #37 / #80). `pane report-agent` has no `done` input
+/// state, so a terminal one-shot `prompt` reports `idle`;
+/// `refusal.credentials` (a user decision is required — the provider key)
+/// and `refusal.binding.missing` (a user decision is required — declare
+/// the provider/model binding) report `blocked` with static messages that
+/// never carry credential or binding text. `start` reports `working` while
 /// the lane is active. Returns `(state, message)` or `None` when no
 /// report applies.
 fn herdr_lifecycle_report(result: &OpResult) -> Option<(&'static str, Option<&'static str>)> {
@@ -1085,6 +1180,9 @@ fn herdr_lifecycle_report(result: &OpResult) -> Option<(&'static str, Option<&'s
         Op::Start if result.status == "succeeded" => Some(("working", None)),
         Op::Prompt => match result.code {
             Some(CODE_CREDENTIALS) => Some(("blocked", Some("harness credentials required"))),
+            Some(CODE_BINDING) => {
+                Some(("blocked", Some("harness provider/model binding required")))
+            }
             _ => Some(("idle", None)),
         },
         _ => None,
@@ -1260,24 +1358,14 @@ fn execute_op_inner(
             let out = run_typed(&profile.executable, &args, request.timeout, env, cwd);
             match out {
                 ProcessOutcome::Ok(text) => {
-                    // jcode's `--json` row makes the real binary emit a
-                    // machine-readable envelope on stdout; parse the
-                    // transcript out of it when the output has that shape
-                    // (issue #37; shape verified against jcode v0.84.0 on
-                    // 2026-09-08). Anything else is kept as raw stdout so a
-                    // non-envelope output never loses the transcript.
-                    let transcript = if profile.kind == HarnessKind::Jcode {
-                        jcode_envelope_text(&text).unwrap_or(text)
-                    } else {
-                        text
-                    };
+                    let payload = prompt_result_payload(profile, text);
                     op_result(
                         profile,
                         request,
                         "succeeded",
                         None,
                         None,
-                        Some(object(vec![("transcript", string(&transcript))])),
+                        Some(payload),
                         None,
                         started,
                     )
@@ -1644,10 +1732,9 @@ fn run_typed(
 /// classification of nonzero exits only — never capability inference from
 /// prose (ADR-0003), and the matched text never becomes a record.
 /// `no api key found` is the measured missing-credentials stderr of pi
-/// v0.85.1 (`pi --provider deepseek ... --print ...`, 2026-09-08);
-/// `api_key not found in environment` is the measured missing-credentials
-/// stderr of jcode v0.84.0 (`jcode run --provider deepseek ... --json ...`,
-/// 2026-09-08: `Error: DEEPSEEK_API_KEY not found in environment or
+/// v0.85.1 (2026-09-08); `api_key not found in environment` is the
+/// measured missing-credentials stderr of jcode v0.84.0 (2026-09-08:
+/// `Error: DEEPSEEK_API_KEY not found in environment or
 /// <home>/.config/jcode/deepseek.env`, exit 1).
 const AUTH_MARKERS: [&str; 10] = [
     "authentication failed",
@@ -1724,17 +1811,99 @@ fn diagnostics(text: &str) -> String {
     out
 }
 
-/// The transcript text of a jcode `--json` envelope (issue #37). jcode's
-/// `run --json` row prints one JSON object on stdout whose `text` field
-/// carries the model's final answer (shape verified against jcode v0.84.0
-/// on 2026-09-08). `None` when stdout is not such an envelope — the raw
-/// stdout is kept as the transcript instead, so a non-envelope output
-/// never loses content.
-fn jcode_envelope_text(stdout: &str) -> Option<String> {
+/// The parsed jcode `--json` envelope (issues #37/#80): the transcript
+/// text plus the identity the harness actually used. `provider`/`model`
+/// are `None` when the envelope does not carry them — the returned
+/// identity is never inferred from, or coerced to, the requested binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JcodeEnvelope {
+    /// The model's final answer (the `text` field).
+    text: String,
+    /// The provider the harness reports having used.
+    provider: Option<String>,
+    /// The model the harness reports having used.
+    model: Option<String>,
+}
+
+/// Parse the jcode `--json` envelope (issue #37). jcode's `run --json` row
+/// prints one JSON object on stdout whose `text` field carries the model's
+/// final answer (shape verified against jcode v0.84.0 on 2026-09-08); the
+/// same object carries the returned `provider`/`model` (issue #80). `None`
+/// when stdout is not such an envelope — the raw stdout is kept as the
+/// transcript instead, so a non-envelope output never loses content.
+fn jcode_envelope(stdout: &str) -> Option<JcodeEnvelope> {
     let doc = Val::parse_json(stdout).ok()?;
-    doc.get("text")
-        .and_then(Val::as_str)
-        .map(|text| text.to_string())
+    let text = doc.get("text").and_then(Val::as_str)?;
+    Some(JcodeEnvelope {
+        text: text.to_string(),
+        provider: doc
+            .get("provider")
+            .and_then(Val::as_str)
+            .map(str::to_string),
+        model: doc.get("model").and_then(Val::as_str).map(str::to_string),
+    })
+}
+
+/// The success payload of the prompt operation. For jcode (whose `--json`
+/// row emits an envelope) the payload carries the transcript plus the
+/// requested/returned identity pair (issue #80); for every other kind it
+/// is the transcript alone.
+fn prompt_result_payload(profile: &Profile, text: String) -> Val {
+    // jcode's `--json` row makes the real binary emit a machine-readable
+    // envelope on stdout; parse the transcript and the returned identity
+    // out of it when the output has that shape (issues #37/#80; shape
+    // verified against jcode v0.84.0 on 2026-09-08). Anything else is kept
+    // as raw stdout so a non-envelope output never loses the transcript.
+    let envelope = if profile.kind == HarnessKind::Jcode {
+        jcode_envelope(&text)
+    } else {
+        None
+    };
+    let transcript = envelope
+        .as_ref()
+        .map(|envelope| envelope.text.clone())
+        .unwrap_or(text);
+    let mut fields = vec![("transcript", string(&transcript))];
+    if profile.kind == HarnessKind::Jcode {
+        // Requested-versus-returned identity is observable and never
+        // silently coerced (issue #80): the requested pair is the profile
+        // binding; the returned pair is exactly what the envelope reported
+        // (`null` when it reported no identity).
+        if let (Some(provider), Some(model)) =
+            (profile.provider.as_deref(), profile.model.as_deref())
+        {
+            fields.push((
+                "requested",
+                object(vec![
+                    ("provider", string(provider)),
+                    ("model", string(model)),
+                ]),
+            ));
+        }
+        fields.push((
+            "returned",
+            envelope
+                .as_ref()
+                .map(|envelope| {
+                    object(vec![
+                        (
+                            "provider",
+                            envelope
+                                .provider
+                                .as_deref()
+                                .map(string)
+                                .unwrap_or_else(null),
+                        ),
+                        (
+                            "model",
+                            envelope.model.as_deref().map(string).unwrap_or_else(null),
+                        ),
+                    ])
+                })
+                .unwrap_or_else(null),
+        ));
+    }
+    object(fields)
 }
 
 #[cfg(test)]
@@ -1820,6 +1989,8 @@ mod tests {
             kind: "codex".to_string(),
             executable: "codex".to_string(),
             env_allow: vec!["PATH".to_string()],
+            provider: None,
+            model: None,
         };
         let profile = Profile::from_config(&harness).expect("profile");
         assert_eq!(profile.kind, HarnessKind::Codex);
@@ -1831,6 +2002,8 @@ mod tests {
             kind: "teleport".to_string(),
             executable: "wat".to_string(),
             env_allow: vec![],
+            provider: None,
+            model: None,
         };
         let err = Profile::from_config(&unknown).expect_err("refused");
         assert_eq!(err.code, CODE_UNKNOWN_HARNESS);
@@ -1840,6 +2013,8 @@ mod tests {
             kind: "argv".to_string(),
             executable: "hf-cli".to_string(),
             env_allow: vec!["PATH".to_string()],
+            provider: None,
+            model: None,
         };
         let profile = Profile::from_config(&argv).expect("profile");
         assert_eq!(profile.kind, HarnessKind::Argv);
@@ -1939,6 +2114,8 @@ mod tests {
             kind: "argv".to_string(),
             executable: "hf-cli".to_string(),
             env_allow: vec![],
+            provider: None,
+            model: None,
         };
         let profile = Profile::from_config(&harness).expect("profile");
         let session = sample_session();
@@ -2056,26 +2233,116 @@ mod tests {
     }
 
     #[test]
-    fn jcode_envelope_text_extracts_the_transcript_field() {
+    fn jcode_envelope_extracts_the_transcript_and_the_returned_identity() {
         // The measured jcode v0.84.0 `--json` envelope shape (2026-09-08):
-        // one top-level object whose `text` field carries the final answer.
+        // one top-level object whose `text` field carries the final answer
+        // and whose `provider`/`model` fields carry the identity the
+        // harness actually used (issue #80).
         let envelope = r#"{
   "session_id": "session_kangaroo_1788883711941_a3cc1cf55178c963",
-  "provider": "deepseek",
-  "model": "deepseek-chat",
+  "provider": "example-provider",
+  "model": "example-model",
   "text": "implemented the ini parser; 12 tests pass",
   "usage": {"input_tokens": 123, "output_tokens": 45,
             "cache_read_input_tokens": null, "cache_creation_input_tokens": null}
 }"#;
-        assert_eq!(
-            jcode_envelope_text(envelope).as_deref(),
-            Some("implemented the ini parser; 12 tests pass")
-        );
+        let parsed = jcode_envelope(envelope).expect("envelope");
+        assert_eq!(parsed.text, "implemented the ini parser; 12 tests pass");
+        assert_eq!(parsed.provider.as_deref(), Some("example-provider"));
+        assert_eq!(parsed.model.as_deref(), Some("example-model"));
+        // An envelope without identity fields keeps them absent — the
+        // returned identity is never inferred from the requested binding.
+        let bare = jcode_envelope(r#"{"text":"no identity reported"}"#).expect("envelope");
+        assert_eq!(bare.text, "no identity reported");
+        assert_eq!(bare.provider, None);
+        assert_eq!(bare.model, None);
         // Non-envelope stdout (plain text) and JSON without `text` fall
         // back to raw stdout (never lose the transcript).
-        assert_eq!(jcode_envelope_text("plain model output"), None);
-        assert_eq!(jcode_envelope_text(r#"{"session_id":"s1"}"#), None);
-        assert_eq!(jcode_envelope_text(""), None);
+        assert_eq!(jcode_envelope("plain model output"), None);
+        assert_eq!(jcode_envelope(r#"{"session_id":"s1"}"#), None);
+        assert_eq!(jcode_envelope(""), None);
+    }
+
+    #[test]
+    fn prompt_rows_consume_the_declared_binding_and_refuse_without_one() {
+        // AC1/AC3 (issue #80): the Pi/Jcode rows build the pair from the
+        // profile binding; no binding is a typed refusal, never a literal.
+        let pi = Profile::official(HarnessKind::Pi, "pi")
+            .expect("profile")
+            .with_binding("example-provider", "example-model")
+            .expect("binding");
+        assert_eq!(
+            prompt_args(&pi).expect("args"),
+            vec![
+                "--provider".to_string(),
+                "example-provider".to_string(),
+                "--model".to_string(),
+                "example-model".to_string(),
+                "--print".to_string(),
+                "--".to_string(),
+            ]
+        );
+        let jcode = Profile::official(HarnessKind::Jcode, "jcode")
+            .expect("profile")
+            .with_binding("example-provider", "example-model")
+            .expect("binding");
+        assert_eq!(
+            prompt_args(&jcode).expect("args"),
+            vec![
+                "run".to_string(),
+                "--provider".to_string(),
+                "example-provider".to_string(),
+                "--model".to_string(),
+                "example-model".to_string(),
+                "--json".to_string(),
+                "--".to_string(),
+            ]
+        );
+        for kind in [HarnessKind::Pi, HarnessKind::Jcode] {
+            let bare = Profile::official(kind, kind.name()).expect("profile");
+            let err = prompt_args(&bare).expect_err("unbound prompt refused");
+            assert_eq!(err.code, CODE_BINDING, "{}", kind.name());
+            assert!(!err.retryable);
+        }
+        // Binding tokens are validated at construction: never paths, never
+        // shell-shaped text, never blank.
+        for (provider, model) in [
+            ("provider/../x", "example-model"),
+            ("example-provider", "  "),
+            ("", "example-model"),
+        ] {
+            let err = Profile::official(HarnessKind::Pi, "pi")
+                .expect("profile")
+                .with_binding(provider, model)
+                .expect_err("invalid binding refused");
+            assert_eq!(err.code, CODE_BAD_REQUEST, "{provider:?}");
+        }
+    }
+
+    #[test]
+    fn config_binding_is_carried_and_a_half_pair_is_refused() {
+        let harness = crate::config::Harness {
+            key: "pi-a".to_string(),
+            kind: "pi".to_string(),
+            executable: "pi".to_string(),
+            env_allow: vec!["PATH".to_string()],
+            provider: Some("example-provider".to_string()),
+            model: Some("example-model".to_string()),
+        };
+        let profile = Profile::from_config(&harness).expect("profile");
+        assert_eq!(profile.provider.as_deref(), Some("example-provider"));
+        assert_eq!(profile.model.as_deref(), Some("example-model"));
+
+        let half = crate::config::Harness {
+            key: "pi-b".to_string(),
+            kind: "pi".to_string(),
+            executable: "pi".to_string(),
+            env_allow: vec!["PATH".to_string()],
+            provider: Some("example-provider".to_string()),
+            model: None,
+        };
+        let err = Profile::from_config(&half).expect_err("half pair refused");
+        assert_eq!(err.code, CODE_BAD_REQUEST);
     }
 
     #[test]
@@ -2117,7 +2384,8 @@ mod tests {
             )
         };
         // start succeeded -> working; terminal prompts -> idle except
-        // credentials -> blocked; workspace ops -> no report.
+        // credentials / missing provider-model binding -> blocked;
+        // workspace ops -> no report.
         assert_eq!(
             herdr_lifecycle_report(&result_for(Op::Start, "succeeded", None)),
             Some(("working", None))
@@ -2137,6 +2405,10 @@ mod tests {
         assert_eq!(
             herdr_lifecycle_report(&result_for(Op::Prompt, "refused", Some(CODE_CREDENTIALS))),
             Some(("blocked", Some("harness credentials required")))
+        );
+        assert_eq!(
+            herdr_lifecycle_report(&result_for(Op::Prompt, "refused", Some(CODE_BINDING))),
+            Some(("blocked", Some("harness provider/model binding required")))
         );
         assert_eq!(
             herdr_lifecycle_report(&result_for(Op::Prompt, "failed", Some(CODE_EXIT))),
