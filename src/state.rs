@@ -30,7 +30,7 @@ use crate::time;
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The schema version this binary understands (also `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Bounded-retention defaults (rows kept besides the chain genesis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -439,6 +439,126 @@ struct RetirementRecheck {
     active: bool,
 }
 
+/// One durable lane successor record (issue #76): the ONE successor owner a
+/// replacement's startup nonce binds. The row is committed BEFORE any spawn
+/// (the `retired` → `starting` boundary commits with it in one
+/// transaction), so a simultaneous or replayed start can never create a
+/// second successor, and a crash always leaves either no row (no spawn was
+/// ever issued) or the exact bound identity the adapter observed. The
+/// adapter-observed process, the verification evidence, the preserved
+/// worker/reviewer orchestration and the consumed completion events are
+/// durable on the row; restart reconciliation re-derives from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneSuccessorRow {
+    /// Successor id (`su_` + 16 hex; deterministic per replacement).
+    pub successor_id: String,
+    /// The replacement record this successor continues (`UNIQUE`).
+    pub replacement_id: String,
+    /// Logical lane identity (slug).
+    pub lane_id: String,
+    /// Successor generation slot (the record's `successor_generation`).
+    pub generation: i64,
+    /// Doctrine role the successor runs (the record's role).
+    pub role: String,
+    /// Repository-relative worktree reference (the record's worktree).
+    pub worktree: String,
+    /// The successor session identity bound by the start request.
+    pub session: String,
+    /// Adapter-observed backend process identity ('' until observed).
+    pub process: String,
+    /// The ONE startup nonce that owns this successor (bounded printable).
+    pub nonce: String,
+    /// Harness profile key the spawn/read-back ran under.
+    pub profile_key: String,
+    /// Harness profile kind the spawn/read-back ran under.
+    pub profile_kind: String,
+    /// sha256 of the kickoff receipt the read-back must echo.
+    pub kickoff_receipt: String,
+    /// Delivery marker (`none` before a confirmed spawn, `delivered` after).
+    pub delivery: String,
+    /// Bounded spawn attempts issued for this successor (1..=max).
+    pub attempts: i64,
+    /// Canonical start-verification evidence ('' until verified).
+    pub evidence: String,
+    /// sha256 over the evidence bytes ('' until verified).
+    pub evidence_digest: String,
+    /// Canonical preserved orchestration block ('' outside orchestrator
+    /// replacements): workers/reviewers/pending completion events.
+    pub orchestration: String,
+    /// Canonical consumed completion events ('' until the successor is an
+    /// adopted orchestrator; `[]` before the first consumption).
+    pub consumed: String,
+    /// Adoption time ('' until adopted).
+    pub adopted_at: String,
+    /// Canonical adoption evidence document ('' until adopted).
+    pub adoption_evidence: String,
+    /// sha256 over the adoption evidence bytes ('' until adopted).
+    pub adoption_digest: String,
+    /// Row creation time (RFC3339 UTC).
+    pub created_at: String,
+    /// Last row write time (RFC3339 UTC).
+    pub updated_at: String,
+}
+
+/// One validated successor-start plan (issue #76): the durable binding a
+/// start effect may act on. `begin_lane_successor` produces it read-only
+/// BEFORE any effect and BEFORE the claim; the effect executor must not act
+/// on anything the plan does not name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneSuccessorPlan {
+    /// The pending `retired` replacement record being continued.
+    pub record: LaneReplacementRow,
+    /// The committed checkpoint whose integrity the binding re-verified.
+    pub checkpoint: LaneCheckpointRow,
+    /// The bound startup nonce (the ONE owner of this successor).
+    pub nonce: String,
+    /// The bound fresh successor session identity.
+    pub session: String,
+    /// The bound kickoff receipt the adapter read-back must echo.
+    pub kickoff_receipt: String,
+    /// The already-committed successor row when this is a bounded retry of
+    /// the same nonce (None for a first start).
+    pub existing: Option<LaneSuccessorRow>,
+}
+
+/// One validated adoption plan (issue #76): the successor boundary, the
+/// committed checkpoint, and the fresh re-query compared against it. A
+/// non-empty `differences` list is the RECONCILIATION verdict — the
+/// adoption must not commit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LaneAdoptionPlan {
+    /// The pending `adopting` replacement record being adopted.
+    pub record: LaneReplacementRow,
+    /// The committed checkpoint the adoption evidence is compared to.
+    pub checkpoint: LaneCheckpointRow,
+    /// The committed successor row being adopted.
+    pub successor: LaneSuccessorRow,
+    /// The canonical validated re-query comparison document.
+    pub observation: Val,
+    /// Compared fields whose values differ from the checkpoint snapshot
+    /// (empty = the lane is the same logical task on the same worktree).
+    pub differences: Vec<String>,
+}
+
+/// The validated successor binding presented with one start request (the
+/// grant-style document: lane generation, committed checkpoint digest, the
+/// ONE startup nonce).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SuccessorBinding {
+    generation: i64,
+    checkpoint_digest: String,
+    nonce: String,
+}
+
+/// The validated adoption binding presented with one adoption request (the
+/// committed successor identity the adoption acts on).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdoptionBinding {
+    generation: i64,
+    successor_id: String,
+    session: String,
+}
+
 /// The daemon-owned state handle. All methods serialize on an internal
 /// mutex (one writer); a failed write poisons the handle (fail closed).
 pub struct State {
@@ -555,6 +675,10 @@ impl State {
         if user_version == M0006_APPLIES_FROM {
             run_m0006(&mut conn)?;
             user_version = M0006_APPLIES_TO;
+        }
+        if user_version == M0007_APPLIES_FROM {
+            run_m0007(&mut conn)?;
+            user_version = M0007_APPLIES_TO;
         }
         match user_version {
             v if v == SCHEMA_VERSION => {
@@ -3164,6 +3288,1613 @@ impl State {
     }
 
     // ---------------------------------------------------------------------
+    // Lane successors (issue #76): the ONE daemon-coordinated start/adopt
+    // transition — a fresh successor session on the SAME worktree/logical
+    // task, bound by one generation + startup nonce, never a transcript
+    // replay.
+    // ---------------------------------------------------------------------
+
+    /// Validate one successor start request read-only, BEFORE any effect and
+    /// BEFORE the claim. The record must have committed its verified
+    /// retirement (`retired`, pending) and its committed checkpoint digest
+    /// must match the binding; the ONE startup nonce owns the successor
+    /// slot. A same-nonce retry of a start whose boundary has not completed
+    /// is returned as the existing row (bounded retry); every other path to
+    /// a second successor refuses (`refusal.successor.exists` /
+    /// `refusal.successor.nonce`). Read-only: no state is written.
+    pub fn begin_lane_successor(&self, params: &Val) -> Result<LaneSuccessorPlan, StateError> {
+        let replacement_id = match params.get("replacement_id").and_then(Val::as_str) {
+            Some(text) if crate::formats::is_replacement_id(text) => text.to_string(),
+            _ => {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    "a successor start requires params.replacement_id (rp_ + 16 hex)",
+                ));
+            }
+        };
+        let binding = successor_binding(params)?;
+        let successor = match params.get("successor") {
+            Some(Val::Obj(map)) => map,
+            _ => {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    "a successor start requires params.successor (object: session, \
+                     kickoff_receipt)",
+                ));
+            }
+        };
+        let session = match successor.get("session").and_then(Val::as_str) {
+            Some(text) if crate::formats::is_actor(text) => text.to_string(),
+            _ => {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    "a successor start requires params.successor.session (session identity)",
+                ));
+            }
+        };
+        let kickoff_receipt = match successor.get("kickoff_receipt").and_then(Val::as_str) {
+            Some(text) if crate::formats::is_hex64(text) => text.to_string(),
+            _ => {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    "a successor start requires params.successor.kickoff_receipt (64-hex \
+                     sha256 receipt the adapter read-back must echo)",
+                ));
+            }
+        };
+        let conn = self.lock("begin_lane_successor")?;
+        let record: Option<LaneReplacementRow> = conn
+            .query_row(
+                "SELECT replacement_id, lane_id, generation, successor_generation,
+                        phase, outcome, outcome_reason, source_session, source_process,
+                        role, worktree, reason, created_at, updated_at
+                   FROM lane_replacements WHERE replacement_id = ?1",
+                params![replacement_id.as_str()],
+                lane_replacement_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("begin_lane_successor: lookup", err))?;
+        let Some(record) = record else {
+            return Err(state_error(
+                "state.not_found",
+                format!("no lane replacement {replacement_id:?}"),
+            ));
+        };
+        match record.outcome.as_str() {
+            "pending" => {}
+            "held" => {
+                let reason = if record.outcome_reason.is_empty() {
+                    "no reason recorded"
+                } else {
+                    record.outcome_reason.as_str()
+                };
+                return Err(state_error(
+                    replacement_code::HELD,
+                    format!(
+                        "replacement {} is held (paused): {reason}",
+                        record.replacement_id
+                    ),
+                ));
+            }
+            "ambiguous" => {
+                return Err(state_error(
+                    replacement_code::AMBIGUOUS,
+                    format!(
+                        "replacement {} was left ambiguous by an interrupted transition; \
+                         external reconciliation is required before it can start a successor",
+                        record.replacement_id
+                    ),
+                ));
+            }
+            _ => {
+                return Err(state_error(
+                    replacement_code::INVALIDATED,
+                    format!(
+                        "replacement {} was cancelled (invalidated); it can never start a \
+                         successor",
+                        record.replacement_id
+                    ),
+                ));
+            }
+        }
+        // The committed successor boundary is checked BEFORE the phase
+        // fence: one generation/nonce owns startup, so any start after the
+        // boundary committed refuses as a duplicate (or a foreign nonce),
+        // never as a generic phase error.
+        let existing: Option<LaneSuccessorRow> = conn
+            .query_row(
+                "SELECT successor_id, replacement_id, lane_id, generation, role, worktree,
+                        session, process, nonce, profile_key, profile_kind, kickoff_receipt,
+                        delivery, attempts, evidence, evidence_digest, orchestration,
+                        consumed, adopted_at, adoption_evidence, adoption_digest, created_at,
+                        updated_at
+                   FROM lane_successors WHERE replacement_id = ?1",
+                params![replacement_id.as_str()],
+                lane_successor_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("begin_lane_successor: successor", err))?;
+        if let Some(existing) = existing {
+            if existing.nonce != binding.nonce {
+                return Err(state_error(
+                    successor_code::NONCE,
+                    format!(
+                        "successor {} is already owned by another startup nonce; one \
+                         generation/nonce owns startup and a second nonce cannot take over \
+                         a started successor",
+                        existing.successor_id
+                    ),
+                ));
+            }
+            if existing.session != session {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    format!(
+                        "successor {} is bound to session {:?}, not the presented {:?}",
+                        existing.successor_id, existing.session, session
+                    ),
+                ));
+            }
+            if record.phase != "starting" {
+                return Err(state_error(
+                    successor_code::EXISTS,
+                    format!(
+                        "successor {} is already committed at replacement phase {:?}; the \
+                         adoption path continues it (a second successor cannot be created)",
+                        existing.successor_id, record.phase
+                    ),
+                ));
+            }
+            return Ok(LaneSuccessorPlan {
+                record,
+                checkpoint: match conn.query_row(
+                    "SELECT checkpoint_id, replacement_id, lane_id, generation, role,
+                            observation_digest, reobservation_digest, snapshot, digest,
+                            brief_digest, created_at
+                       FROM lane_checkpoints WHERE replacement_id = ?1",
+                    params![replacement_id.as_str()],
+                    lane_checkpoint_row_from,
+                ) {
+                    Ok(checkpoint) => checkpoint,
+                    Err(err) => {
+                        return Err(StateError::from_sqlite(
+                            "begin_lane_successor: checkpoint",
+                            err,
+                        ));
+                    }
+                },
+                nonce: binding.nonce,
+                session,
+                kickoff_receipt,
+                existing: Some(existing),
+            });
+        }
+        if record.phase != "retired" {
+            return Err(state_error(
+                replacement_code::ORDER,
+                format!(
+                    "starting a successor requires the verified `retired` boundary (retire \
+                     the source session first); replacement {} is at {:?}",
+                    record.replacement_id, record.phase
+                ),
+            ));
+        }
+        if binding.generation != record.generation {
+            return Err(state_error(
+                successor_code::BINDING,
+                format!(
+                    "the successor binding generation {} does not match replacement {} \
+                     generation {}",
+                    binding.generation, record.replacement_id, record.generation
+                ),
+            ));
+        }
+        let checkpoint: Option<LaneCheckpointRow> = conn
+            .query_row(
+                "SELECT checkpoint_id, replacement_id, lane_id, generation, role,
+                        observation_digest, reobservation_digest, snapshot, digest,
+                        brief_digest, created_at
+                   FROM lane_checkpoints WHERE replacement_id = ?1",
+                params![replacement_id.as_str()],
+                lane_checkpoint_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("begin_lane_successor: checkpoint", err))?;
+        let Some(checkpoint) = checkpoint else {
+            return Err(state_error(
+                successor_code::BINDING,
+                format!(
+                    "replacement {} has no committed checkpoint; checkpoint integrity cannot \
+                     be verified (external reconciliation is required)",
+                    record.replacement_id
+                ),
+            ));
+        };
+        if checkpoint.generation != record.generation
+            || checkpoint.digest != binding.checkpoint_digest
+        {
+            return Err(state_error(
+                successor_code::BINDING,
+                format!(
+                    "the successor binding checkpoint digest {} does not match the committed \
+                     checkpoint {} for replacement {} (digest {}); changed evidence refuses \
+                     before any effect",
+                    binding.checkpoint_digest,
+                    checkpoint.checkpoint_id,
+                    record.replacement_id,
+                    checkpoint.digest
+                ),
+            ));
+        }
+        Ok(LaneSuccessorPlan {
+            record,
+            checkpoint,
+            nonce: binding.nonce,
+            session,
+            kickoff_receipt,
+            existing: None,
+        })
+    }
+
+    /// Commit the ONE successor owner boundary (issue #76) BEFORE any spawn:
+    /// the successor row and the record's `retired` → `starting` transition
+    /// commit in ONE transaction, fenced on the exact generation/phase/
+    /// outcome and on the committed checkpoint. A simultaneous or replayed
+    /// start loses the UNIQUE fence and refuses `refusal.successor.exists`
+    /// with nothing spawned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_lane_successor_start(
+        &self,
+        replacement_id: &str,
+        generation: i64,
+        checkpoint_digest: &str,
+        nonce: &str,
+        session: &str,
+        kickoff_receipt: &str,
+        profile_key: &str,
+        profile_kind: &str,
+        at: &str,
+    ) -> Result<(LaneSuccessorRow, LaneReplacementRow), StateError> {
+        let outcome = self.commit_lane_successor_start_inner(
+            replacement_id,
+            generation,
+            checkpoint_digest,
+            nonce,
+            session,
+            kickoff_receipt,
+            profile_key,
+            profile_kind,
+            at,
+        );
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_lane_successor_start_inner(
+        &self,
+        replacement_id: &str,
+        generation: i64,
+        checkpoint_digest: &str,
+        nonce: &str,
+        session: &str,
+        kickoff_receipt: &str,
+        profile_key: &str,
+        profile_kind: &str,
+        at: &str,
+    ) -> Result<(LaneSuccessorRow, LaneReplacementRow), StateError> {
+        if !printable_bounded(nonce, SUCCESSOR_NONCE_MAX) {
+            return Err(state_error(
+                successor_code::BINDING,
+                format!("the startup nonce must be 1-{SUCCESSOR_NONCE_MAX} printable characters"),
+            ));
+        }
+        self.ensure_writable()?;
+        let successor_id = successor_id_for(replacement_id);
+        {
+            let mut conn = self.lock("commit_lane_successor_start")?;
+            let tx = conn.transaction().map_err(|err| {
+                StateError::from_sqlite("commit_lane_successor_start: begin", err)
+            })?;
+            let row: Option<LaneReplacementRow> = tx
+                .query_row(
+                    "SELECT replacement_id, lane_id, generation, successor_generation,
+                            phase, outcome, outcome_reason, source_session, source_process,
+                            role, worktree, reason, created_at, updated_at
+                       FROM lane_replacements WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_replacement_row_from,
+                )
+                .optional()
+                .map_err(|err| {
+                    StateError::from_sqlite("commit_lane_successor_start: lookup", err)
+                })?;
+            let Some(row) = row else {
+                return Err(state_error(
+                    "state.not_found",
+                    format!("no lane replacement {replacement_id:?}"),
+                ));
+            };
+            if row.phase != "retired" || row.outcome != "pending" || row.generation != generation {
+                return Err(lane_replacement_transition_refusal(
+                    Some(&row),
+                    replacement_id,
+                    "retired",
+                    generation,
+                ));
+            }
+            let recorded: Option<String> = tx
+                .query_row(
+                    "SELECT digest FROM lane_checkpoints WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|err| {
+                    StateError::from_sqlite("commit_lane_successor_start: checkpoint", err)
+                })?;
+            match recorded {
+                Some(digest) if digest == checkpoint_digest => {}
+                Some(digest) => {
+                    return Err(state_error(
+                        successor_code::BINDING,
+                        format!(
+                            "the successor start checkpoint digest {checkpoint_digest} does \
+                             not match the committed checkpoint digest {digest} for \
+                             replacement {replacement_id}"
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(state_error(
+                        successor_code::BINDING,
+                        format!(
+                            "replacement {replacement_id} has no committed checkpoint; the \
+                             successor start refuses (external reconciliation is required)"
+                        ),
+                    ));
+                }
+            }
+            let inserted = tx.execute(
+                "INSERT INTO lane_successors (successor_id, replacement_id, lane_id, generation,
+                    role, worktree, session, process, nonce, profile_key, profile_kind,
+                    kickoff_receipt, delivery, attempts, evidence, evidence_digest,
+                    orchestration, consumed, adopted_at, adoption_evidence, adoption_digest,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', ?8, ?9, ?10, ?11, 'none', 1, '', '',
+                    '', '', '', '', '', ?12, ?12)",
+                params![
+                    successor_id,
+                    replacement_id,
+                    row.lane_id,
+                    row.successor_generation,
+                    row.role,
+                    row.worktree,
+                    session,
+                    nonce,
+                    profile_key,
+                    profile_kind,
+                    kickoff_receipt,
+                    at
+                ],
+            );
+            if let Err(err) = inserted {
+                if err.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                    return Err(state_error(
+                        successor_code::EXISTS,
+                        format!(
+                            "replacement {replacement_id} already has a successor \
+                             ({successor_id}); one generation/nonce owns startup and a \
+                             second successor cannot be created"
+                        ),
+                    ));
+                }
+                return Err(StateError::from_sqlite(
+                    "commit_lane_successor_start: insert",
+                    err,
+                ));
+            }
+            let affected = tx
+                .execute(
+                    "UPDATE lane_replacements
+                        SET phase = 'starting', updated_at = ?1
+                      WHERE replacement_id = ?2 AND phase = 'retired'
+                            AND generation = ?3 AND outcome = 'pending'",
+                    params![at, replacement_id, generation],
+                )
+                .map_err(|err| {
+                    StateError::from_sqlite("commit_lane_successor_start: update", err)
+                })?;
+            if affected != 1 {
+                return Err(state_error(
+                    "state.conflict",
+                    format!(
+                        "the successor start lost its compare-and-set fence on {replacement_id}"
+                    ),
+                ));
+            }
+            append_lane_replacement_event(
+                &tx,
+                replacement_id,
+                Some("retired"),
+                "starting",
+                Some("pending"),
+                "pending",
+                nonce,
+                at,
+            )?;
+            let successor: LaneSuccessorRow = tx
+                .query_row(
+                    "SELECT successor_id, replacement_id, lane_id, generation, role, worktree,
+                            session, process, nonce, profile_key, profile_kind, kickoff_receipt,
+                            delivery, attempts, evidence, evidence_digest, orchestration,
+                            consumed, adopted_at, adoption_evidence, adoption_digest, created_at,
+                            updated_at
+                       FROM lane_successors WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_successor_row_from,
+                )
+                .map_err(|err| {
+                    StateError::from_sqlite("commit_lane_successor_start: reread", err)
+                })?;
+            let updated: LaneReplacementRow = tx
+                .query_row(
+                    "SELECT replacement_id, lane_id, generation, successor_generation,
+                            phase, outcome, outcome_reason, source_session, source_process,
+                            role, worktree, reason, created_at, updated_at
+                       FROM lane_replacements WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_replacement_row_from,
+                )
+                .map_err(|err| {
+                    StateError::from_sqlite("commit_lane_successor_start: record", err)
+                })?;
+            tx.commit().map_err(|err| {
+                StateError::from_sqlite("commit_lane_successor_start: commit", err)
+            })?;
+            Ok((successor, updated))
+        }
+    }
+
+    /// Count one bounded re-spawn attempt of an undelivered successor start
+    /// (bounded retry policy: at most [`SUCCESSOR_ATTEMPTS_MAX`] spawn
+    /// attempts per successor). Only an undelivered boundary may retry a
+    /// spawn; a delivered one can only re-verify.
+    pub fn note_lane_successor_attempt(
+        &self,
+        replacement_id: &str,
+        nonce: &str,
+        at: &str,
+    ) -> Result<LaneSuccessorRow, StateError> {
+        let outcome = self.note_lane_successor_attempt_inner(replacement_id, nonce, at);
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn note_lane_successor_attempt_inner(
+        &self,
+        replacement_id: &str,
+        nonce: &str,
+        at: &str,
+    ) -> Result<LaneSuccessorRow, StateError> {
+        self.ensure_writable()?;
+        {
+            let mut conn = self.lock("note_lane_successor_attempt")?;
+            let tx = conn.transaction().map_err(|err| {
+                StateError::from_sqlite("note_lane_successor_attempt: begin", err)
+            })?;
+            let row: Option<LaneSuccessorRow> = tx
+                .query_row(
+                    "SELECT successor_id, replacement_id, lane_id, generation, role, worktree,
+                            session, process, nonce, profile_key, profile_kind, kickoff_receipt,
+                            delivery, attempts, evidence, evidence_digest, orchestration,
+                            consumed, adopted_at, adoption_evidence, adoption_digest, created_at,
+                            updated_at
+                       FROM lane_successors WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_successor_row_from,
+                )
+                .optional()
+                .map_err(|err| {
+                    StateError::from_sqlite("note_lane_successor_attempt: lookup", err)
+                })?;
+            let Some(row) = row else {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    format!("replacement {replacement_id} has no successor boundary"),
+                ));
+            };
+            if row.nonce != nonce {
+                return Err(state_error(
+                    successor_code::NONCE,
+                    format!(
+                        "successor {} is owned by another startup nonce; a second nonce \
+                         cannot take over a started successor",
+                        row.successor_id
+                    ),
+                ));
+            }
+            if row.delivery != "none" {
+                return Err(state_error(
+                    successor_code::HELD,
+                    format!(
+                        "successor {} already delivered a spawn; only an undelivered boundary \
+                         may retry a spawn (a delivered successor re-verifies instead)",
+                        row.successor_id
+                    ),
+                ));
+            }
+            if row.attempts >= SUCCESSOR_ATTEMPTS_MAX {
+                return Err(state_error(
+                    successor_code::ATTEMPTS,
+                    format!(
+                        "successor {} exhausted its bounded spawn-attempt budget \
+                         ({SUCCESSOR_ATTEMPTS_MAX}); external reconciliation is required",
+                        row.successor_id
+                    ),
+                ));
+            }
+            tx.execute(
+                "UPDATE lane_successors SET attempts = attempts + 1, updated_at = ?1
+                  WHERE successor_id = ?2 AND nonce = ?3 AND delivery = 'none'",
+                params![at, row.successor_id, nonce],
+            )
+            .map_err(|err| StateError::from_sqlite("note_lane_successor_attempt: update", err))?;
+            tx.commit().map_err(|err| {
+                StateError::from_sqlite("note_lane_successor_attempt: commit", err)
+            })?;
+        }
+        self.lane_successor_by_replacement(replacement_id)?
+            .ok_or_else(|| state_error("state.not_found", "successor vanished after attempt"))
+    }
+
+    /// Mark the successor spawn delivered (the workspace accepted the start
+    /// row). Idempotent: a replayed marker keeps `delivered`. Only a
+    /// `delivered` successor may complete verification; an undelivered one
+    /// can retry (bounded) or be parked by the caller.
+    pub fn mark_lane_successor_delivered(
+        &self,
+        replacement_id: &str,
+        nonce: &str,
+        at: &str,
+    ) -> Result<LaneSuccessorRow, StateError> {
+        let outcome = self.mark_lane_successor_delivered_inner(replacement_id, nonce, at);
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn mark_lane_successor_delivered_inner(
+        &self,
+        replacement_id: &str,
+        nonce: &str,
+        at: &str,
+    ) -> Result<LaneSuccessorRow, StateError> {
+        self.ensure_writable()?;
+        {
+            let mut conn = self.lock("mark_lane_successor_delivered")?;
+            let tx = conn.transaction().map_err(|err| {
+                StateError::from_sqlite("mark_lane_successor_delivered: begin", err)
+            })?;
+            let row: Option<LaneSuccessorRow> = tx
+                .query_row(
+                    "SELECT successor_id, replacement_id, lane_id, generation, role, worktree,
+                            session, process, nonce, profile_key, profile_kind, kickoff_receipt,
+                            delivery, attempts, evidence, evidence_digest, orchestration,
+                            consumed, adopted_at, adoption_evidence, adoption_digest, created_at,
+                            updated_at
+                       FROM lane_successors WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_successor_row_from,
+                )
+                .optional()
+                .map_err(|err| {
+                    StateError::from_sqlite("mark_lane_successor_delivered: lookup", err)
+                })?;
+            let Some(row) = row else {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    format!("replacement {replacement_id} has no successor boundary"),
+                ));
+            };
+            if row.nonce != nonce {
+                return Err(state_error(
+                    successor_code::NONCE,
+                    format!(
+                        "successor {} is owned by another startup nonce",
+                        row.successor_id
+                    ),
+                ));
+            }
+            if row.delivery == "none" {
+                tx.execute(
+                    "UPDATE lane_successors SET delivery = 'delivered', updated_at = ?1
+                      WHERE successor_id = ?2 AND delivery = 'none'",
+                    params![at, row.successor_id],
+                )
+                .map_err(|err| {
+                    StateError::from_sqlite("mark_lane_successor_delivered: update", err)
+                })?;
+            }
+            tx.commit().map_err(|err| {
+                StateError::from_sqlite("mark_lane_successor_delivered: commit", err)
+            })?;
+        }
+        self.lane_successor_by_replacement(replacement_id)?
+            .ok_or_else(|| state_error("state.not_found", "successor vanished after delivery"))
+    }
+
+    /// Commit the verified successor boundary (issue #76): the successor
+    /// row's adapter-observed process + verification evidence and the
+    /// record's `starting` → `adopting` transition commit in ONE
+    /// transaction, fenced on the exact generation/`starting`/pending state
+    /// and on the owning nonce. A spawned process alone never reaches this
+    /// commit: the caller only calls it with a closed adapter verdict.
+    pub fn commit_lane_successor_verified(
+        &self,
+        replacement_id: &str,
+        nonce: &str,
+        process: &str,
+        readiness: &str,
+        reason: &str,
+        at: &str,
+    ) -> Result<(LaneSuccessorRow, LaneReplacementRow), StateError> {
+        let outcome = self.commit_lane_successor_verified_inner(
+            replacement_id,
+            nonce,
+            process,
+            readiness,
+            reason,
+            at,
+        );
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn commit_lane_successor_verified_inner(
+        &self,
+        replacement_id: &str,
+        nonce: &str,
+        process: &str,
+        readiness: &str,
+        reason: &str,
+        at: &str,
+    ) -> Result<(LaneSuccessorRow, LaneReplacementRow), StateError> {
+        if !crate::formats::is_actor(process) {
+            return Err(state_error(
+                successor_code::BINDING,
+                "the verified successor process must be a process identity",
+            ));
+        }
+        if !printable_bounded(readiness, 32) {
+            return Err(state_error(
+                successor_code::BINDING,
+                "the verified successor readiness must be a bounded state",
+            ));
+        }
+        if !printable_bounded(reason, RETIREMENT_REASON_MAX) {
+            return Err(state_error(
+                successor_code::BINDING,
+                format!(
+                    "the successor verification reason must be 1-{RETIREMENT_REASON_MAX} \
+                     printable characters (the durable evidence summary is never truncated)"
+                ),
+            ));
+        }
+        self.ensure_writable()?;
+        {
+            let mut conn = self.lock("commit_lane_successor_verified")?;
+            let tx = conn.transaction().map_err(|err| {
+                StateError::from_sqlite("commit_lane_successor_verified: begin", err)
+            })?;
+            let record: Option<LaneReplacementRow> = tx
+                .query_row(
+                    "SELECT replacement_id, lane_id, generation, successor_generation,
+                            phase, outcome, outcome_reason, source_session, source_process,
+                            role, worktree, reason, created_at, updated_at
+                       FROM lane_replacements WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_replacement_row_from,
+                )
+                .optional()
+                .map_err(|err| {
+                    StateError::from_sqlite("commit_lane_successor_verified: record", err)
+                })?;
+            let Some(record) = record else {
+                return Err(state_error(
+                    "state.not_found",
+                    format!("no lane replacement {replacement_id:?}"),
+                ));
+            };
+            if record.phase != "starting" || record.outcome != "pending" {
+                return Err(lane_replacement_transition_refusal(
+                    Some(&record),
+                    replacement_id,
+                    "starting",
+                    record.generation,
+                ));
+            }
+            let successor: Option<LaneSuccessorRow> = tx
+                .query_row(
+                    "SELECT successor_id, replacement_id, lane_id, generation, role, worktree,
+                            session, process, nonce, profile_key, profile_kind, kickoff_receipt,
+                            delivery, attempts, evidence, evidence_digest, orchestration,
+                            consumed, adopted_at, adoption_evidence, adoption_digest, created_at,
+                            updated_at
+                       FROM lane_successors WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_successor_row_from,
+                )
+                .optional()
+                .map_err(|err| {
+                    StateError::from_sqlite("commit_lane_successor_verified: successor", err)
+                })?;
+            let Some(successor) = successor else {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    format!("replacement {replacement_id} has no committed successor boundary"),
+                ));
+            };
+            if successor.nonce != nonce {
+                return Err(state_error(
+                    successor_code::NONCE,
+                    format!(
+                        "successor {} is owned by another startup nonce",
+                        successor.successor_id
+                    ),
+                ));
+            }
+            let evidence = object(vec![
+                ("schema", string("hf-lane-successor/v1")),
+                ("successor_id", string(&successor.successor_id)),
+                ("replacement_id", string(replacement_id)),
+                ("lane_id", string(&successor.lane_id)),
+                ("generation", integer(successor.generation)),
+                ("role", string(&successor.role)),
+                ("worktree", string(&successor.worktree)),
+                ("session", string(&successor.session)),
+                ("process", string(process)),
+                (
+                    "profile",
+                    object(vec![
+                        ("key", string(&successor.profile_key)),
+                        ("kind", string(&successor.profile_kind)),
+                    ]),
+                ),
+                ("kickoff_receipt", string(&successor.kickoff_receipt)),
+                ("readiness", string(readiness)),
+                ("observed_at", string(at)),
+            ]);
+            let evidence_text = canonical_text(&evidence);
+            let evidence_digest = sha256_hex(&canonical_bytes(&evidence));
+            let affected = tx
+                .execute(
+                    "UPDATE lane_successors
+                        SET process = ?1, evidence = ?2, evidence_digest = ?3,
+                            delivery = 'delivered', updated_at = ?4
+                      WHERE successor_id = ?5 AND nonce = ?6",
+                    params![
+                        process,
+                        evidence_text,
+                        evidence_digest,
+                        at,
+                        successor.successor_id,
+                        nonce
+                    ],
+                )
+                .map_err(|err| {
+                    StateError::from_sqlite("commit_lane_successor_verified: successor update", err)
+                })?;
+            if affected != 1 {
+                return Err(state_error(
+                    "state.conflict",
+                    format!("the successor verification lost its nonce fence on {replacement_id}"),
+                ));
+            }
+            let advanced = tx
+                .execute(
+                    "UPDATE lane_replacements
+                        SET phase = 'adopting', updated_at = ?1
+                      WHERE replacement_id = ?2 AND phase = 'starting'
+                            AND generation = ?3 AND outcome = 'pending'",
+                    params![at, replacement_id, record.generation],
+                )
+                .map_err(|err| {
+                    StateError::from_sqlite("commit_lane_successor_verified: transition", err)
+                })?;
+            if advanced != 1 {
+                return Err(state_error(
+                    "state.conflict",
+                    format!(
+                        "the successor verification lost its compare-and-set fence on \
+                         {replacement_id}"
+                    ),
+                ));
+            }
+            append_lane_replacement_event(
+                &tx,
+                replacement_id,
+                Some("starting"),
+                "adopting",
+                Some("pending"),
+                "pending",
+                reason,
+                at,
+            )?;
+            let successor: LaneSuccessorRow = tx
+                .query_row(
+                    "SELECT successor_id, replacement_id, lane_id, generation, role, worktree,
+                            session, process, nonce, profile_key, profile_kind, kickoff_receipt,
+                            delivery, attempts, evidence, evidence_digest, orchestration,
+                            consumed, adopted_at, adoption_evidence, adoption_digest, created_at,
+                            updated_at
+                       FROM lane_successors WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_successor_row_from,
+                )
+                .map_err(|err| {
+                    StateError::from_sqlite("commit_lane_successor_verified: reread", err)
+                })?;
+            let updated: LaneReplacementRow = tx
+                .query_row(
+                    "SELECT replacement_id, lane_id, generation, successor_generation,
+                            phase, outcome, outcome_reason, source_session, source_process,
+                            role, worktree, reason, created_at, updated_at
+                       FROM lane_replacements WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_replacement_row_from,
+                )
+                .map_err(|err| {
+                    StateError::from_sqlite("commit_lane_successor_verified: record reread", err)
+                })?;
+            tx.commit().map_err(|err| {
+                StateError::from_sqlite("commit_lane_successor_verified: commit", err)
+            })?;
+            Ok((successor, updated))
+        }
+    }
+
+    /// One lane successor by replacement id (read-only).
+    pub fn lane_successor_by_replacement(
+        &self,
+        replacement_id: &str,
+    ) -> Result<Option<LaneSuccessorRow>, StateError> {
+        let conn = self.lock("lane_successor_by_replacement")?;
+        conn.query_row(
+            "SELECT successor_id, replacement_id, lane_id, generation, role, worktree,
+                    session, process, nonce, profile_key, profile_kind, kickoff_receipt,
+                    delivery, attempts, evidence, evidence_digest, orchestration,
+                    consumed, adopted_at, adoption_evidence, adoption_digest, created_at,
+                    updated_at
+               FROM lane_successors WHERE replacement_id = ?1",
+            params![replacement_id],
+            lane_successor_row_from,
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("lane_successor_by_replacement: query", err))
+    }
+
+    /// Validate one adoption re-query read-only, BEFORE any effect (issue
+    /// #76 AC5). The record must be at the pending `adopting` boundary with
+    /// its committed successor; the presented observation and reobservation
+    /// must be canonically identical and satisfy the closed observation
+    /// contract; the fresh re-query is compared against the committed
+    /// checkpoint's recorded handoff state. A non-empty difference list is
+    /// the RECONCILIATION verdict (the adoption must not commit). Read-only:
+    /// no state is written.
+    pub fn begin_lane_adoption(&self, params: &Val) -> Result<LaneAdoptionPlan, StateError> {
+        let replacement_id = match params.get("replacement_id").and_then(Val::as_str) {
+            Some(text) if crate::formats::is_replacement_id(text) => text.to_string(),
+            _ => {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    "an adoption requires params.replacement_id (rp_ + 16 hex)",
+                ));
+            }
+        };
+        let binding = adoption_binding(params)?;
+        let observation = match params.get("observation") {
+            Some(value @ Val::Obj(_)) => value,
+            _ => {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    "an adoption requires params.observation (the fresh re-query of the lane)",
+                ));
+            }
+        };
+        let reobservation = match params.get("reobservation") {
+            Some(value @ Val::Obj(_)) => value,
+            _ => {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    "an adoption requires params.reobservation (the second fresh re-query of \
+                     the same window)",
+                ));
+            }
+        };
+        if canonical_text(observation) != canonical_text(reobservation) {
+            return Err(state_error(
+                successor_code::BINDING,
+                "the two adoption re-queries differ: the lane changed during the re-query; \
+                 the adoption refuses to commit either view (no state is changed)",
+            ));
+        }
+        let conn = self.lock("begin_lane_adoption")?;
+        let record: Option<LaneReplacementRow> = conn
+            .query_row(
+                "SELECT replacement_id, lane_id, generation, successor_generation,
+                        phase, outcome, outcome_reason, source_session, source_process,
+                        role, worktree, reason, created_at, updated_at
+                   FROM lane_replacements WHERE replacement_id = ?1",
+                params![replacement_id.as_str()],
+                lane_replacement_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("begin_lane_adoption: lookup", err))?;
+        let Some(record) = record else {
+            return Err(state_error(
+                "state.not_found",
+                format!("no lane replacement {replacement_id:?}"),
+            ));
+        };
+        match record.outcome.as_str() {
+            "pending" => {}
+            "held" => {
+                let reason = if record.outcome_reason.is_empty() {
+                    "no reason recorded"
+                } else {
+                    record.outcome_reason.as_str()
+                };
+                return Err(state_error(
+                    replacement_code::HELD,
+                    format!(
+                        "replacement {} is held (paused): {reason}; a booted successor stays \
+                         fenced and the adoption (activation) is prevented",
+                        record.replacement_id
+                    ),
+                ));
+            }
+            "ambiguous" => {
+                return Err(state_error(
+                    replacement_code::AMBIGUOUS,
+                    format!(
+                        "replacement {} was left ambiguous by an interrupted transition; \
+                         external reconciliation is required before it can be adopted",
+                        record.replacement_id
+                    ),
+                ));
+            }
+            _ => {
+                return Err(state_error(
+                    replacement_code::INVALIDATED,
+                    format!(
+                        "replacement {} was cancelled (invalidated); it can never be adopted",
+                        record.replacement_id
+                    ),
+                ));
+            }
+        }
+        if record.phase != "adopting" {
+            return Err(state_error(
+                replacement_code::ORDER,
+                format!(
+                    "adoption requires the `adopting` boundary (start and verify the \
+                     successor first); replacement {} is at {:?}",
+                    record.replacement_id, record.phase
+                ),
+            ));
+        }
+        if binding.generation != record.generation {
+            return Err(state_error(
+                successor_code::BINDING,
+                format!(
+                    "the adoption binding generation {} does not match replacement {} \
+                     generation {}",
+                    binding.generation, record.replacement_id, record.generation
+                ),
+            ));
+        }
+        let successor: Option<LaneSuccessorRow> = conn
+            .query_row(
+                "SELECT successor_id, replacement_id, lane_id, generation, role, worktree,
+                        session, process, nonce, profile_key, profile_kind, kickoff_receipt,
+                        delivery, attempts, evidence, evidence_digest, orchestration,
+                        consumed, adopted_at, adoption_evidence, adoption_digest, created_at,
+                        updated_at
+                   FROM lane_successors WHERE replacement_id = ?1",
+                params![replacement_id.as_str()],
+                lane_successor_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("begin_lane_adoption: successor", err))?;
+        let Some(successor) = successor else {
+            return Err(state_error(
+                successor_code::BINDING,
+                format!(
+                    "replacement {} has no committed successor boundary; the adoption refuses \
+                     (a successor that was never started cannot be adopted)",
+                    record.replacement_id
+                ),
+            ));
+        };
+        if successor.successor_id != binding.successor_id || successor.session != binding.session {
+            return Err(state_error(
+                successor_code::BINDING,
+                format!(
+                    "the adoption binding (successor {}, session {:?}) does not match the \
+                     committed successor {} session {:?}",
+                    binding.successor_id,
+                    binding.session,
+                    successor.successor_id,
+                    successor.session
+                ),
+            ));
+        }
+        let checkpoint: Option<LaneCheckpointRow> = conn
+            .query_row(
+                "SELECT checkpoint_id, replacement_id, lane_id, generation, role,
+                        observation_digest, reobservation_digest, snapshot, digest,
+                        brief_digest, created_at
+                   FROM lane_checkpoints WHERE replacement_id = ?1",
+                params![replacement_id.as_str()],
+                lane_checkpoint_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("begin_lane_adoption: checkpoint", err))?;
+        let Some(checkpoint) = checkpoint else {
+            return Err(state_error(
+                successor_code::BINDING,
+                format!(
+                    "replacement {} has no committed checkpoint to compare the adoption \
+                     re-query against (external reconciliation is required)",
+                    record.replacement_id
+                ),
+            ));
+        };
+        let observed = adoption_observation_val(&record, observation)?;
+        let differences = adoption_differences(&checkpoint.snapshot, &observed);
+        Ok(LaneAdoptionPlan {
+            record,
+            checkpoint,
+            successor,
+            observation: observed,
+            differences,
+        })
+    }
+
+    /// Commit one adoption (issue #76): the record's `adopting` → `adopted`
+    /// transition, the successor row's adoption evidence and (for
+    /// orchestrator replacements) the preserved worker/reviewer
+    /// orchestration block commit in ONE transaction, fenced on the exact
+    /// generation/phase/outcome and on the committed successor identity. A
+    /// non-empty difference list refuses here too, so reconciliation can
+    /// never be skipped by a racing caller.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_lane_adoption(
+        &self,
+        replacement_id: &str,
+        generation: i64,
+        successor_id: &str,
+        session: &str,
+        observation: &Val,
+        differences: &[String],
+        reason: &str,
+        at: &str,
+    ) -> Result<(LaneSuccessorRow, LaneReplacementRow), StateError> {
+        let outcome = self.commit_lane_adoption_inner(
+            replacement_id,
+            generation,
+            successor_id,
+            session,
+            observation,
+            differences,
+            reason,
+            at,
+        );
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_lane_adoption_inner(
+        &self,
+        replacement_id: &str,
+        generation: i64,
+        successor_id: &str,
+        session: &str,
+        observation: &Val,
+        differences: &[String],
+        reason: &str,
+        at: &str,
+    ) -> Result<(LaneSuccessorRow, LaneReplacementRow), StateError> {
+        if !printable_bounded(reason, RETIREMENT_REASON_MAX) {
+            return Err(state_error(
+                successor_code::BINDING,
+                format!(
+                    "the adoption reason must be 1-{RETIREMENT_REASON_MAX} printable \
+                     characters (the durable evidence summary is never truncated)"
+                ),
+            ));
+        }
+        if !differences.is_empty() {
+            return Err(state_error(
+                successor_code::DIFFERS,
+                format!(
+                    "the adoption re-query differs from the recorded handoff state in {}; \
+                     reconciliation is required (a blind replay or a stale PASS is never \
+                     adopted)",
+                    differences.join(", ")
+                ),
+            ));
+        }
+        self.ensure_writable()?;
+        {
+            let mut conn = self.lock("commit_lane_adoption")?;
+            let tx = conn
+                .transaction()
+                .map_err(|err| StateError::from_sqlite("commit_lane_adoption: begin", err))?;
+            let record: Option<LaneReplacementRow> = tx
+                .query_row(
+                    "SELECT replacement_id, lane_id, generation, successor_generation,
+                            phase, outcome, outcome_reason, source_session, source_process,
+                            role, worktree, reason, created_at, updated_at
+                       FROM lane_replacements WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_replacement_row_from,
+                )
+                .optional()
+                .map_err(|err| StateError::from_sqlite("commit_lane_adoption: record", err))?;
+            let Some(record) = record else {
+                return Err(state_error(
+                    "state.not_found",
+                    format!("no lane replacement {replacement_id:?}"),
+                ));
+            };
+            if record.phase != "adopting"
+                || record.outcome != "pending"
+                || record.generation != generation
+            {
+                return Err(lane_replacement_transition_refusal(
+                    Some(&record),
+                    replacement_id,
+                    "adopting",
+                    generation,
+                ));
+            }
+            let successor: Option<LaneSuccessorRow> = tx
+                .query_row(
+                    "SELECT successor_id, replacement_id, lane_id, generation, role, worktree,
+                            session, process, nonce, profile_key, profile_kind, kickoff_receipt,
+                            delivery, attempts, evidence, evidence_digest, orchestration,
+                            consumed, adopted_at, adoption_evidence, adoption_digest, created_at,
+                            updated_at
+                       FROM lane_successors WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_successor_row_from,
+                )
+                .optional()
+                .map_err(|err| StateError::from_sqlite("commit_lane_adoption: successor", err))?;
+            let Some(successor) = successor else {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    format!("replacement {replacement_id} has no committed successor boundary"),
+                ));
+            };
+            if successor.successor_id != successor_id || successor.session != session {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    format!(
+                        "the adoption does not match the committed successor {} (session \
+                         {:?})",
+                        successor.successor_id, successor.session
+                    ),
+                ));
+            }
+            let checkpoint: Option<LaneCheckpointRow> = tx
+                .query_row(
+                    "SELECT checkpoint_id, replacement_id, lane_id, generation, role,
+                            observation_digest, reobservation_digest, snapshot, digest,
+                            brief_digest, created_at
+                       FROM lane_checkpoints WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_checkpoint_row_from,
+                )
+                .optional()
+                .map_err(|err| StateError::from_sqlite("commit_lane_adoption: checkpoint", err))?;
+            let Some(checkpoint) = checkpoint else {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    format!(
+                        "replacement {replacement_id} has no committed checkpoint to bind the \
+                         adoption evidence to"
+                    ),
+                ));
+            };
+            // The re-query is compared against the DURABLE snapshot, not the
+            // caller's claim: a difference committed by a racing caller
+            // refuses here as well. The presented document is the reduced
+            // comparison contract `begin_lane_adoption` produced from the
+            // validated re-query.
+            let fresh_differences = adoption_differences(&checkpoint.snapshot, observation);
+            if !fresh_differences.is_empty() {
+                return Err(state_error(
+                    successor_code::DIFFERS,
+                    format!(
+                        "the adoption re-query differs from the recorded handoff state in {}; \
+                         reconciliation is required",
+                        fresh_differences.join(", ")
+                    ),
+                ));
+            }
+            let observation_digest = sha256_hex(&canonical_bytes(observation));
+            let preserved = if successor.role == "orchestrator" {
+                checkpoint_orchestration_of(&checkpoint.snapshot)
+            } else {
+                None
+            };
+            let adoption = object(vec![
+                ("schema", string("hf-lane-adoption/v1")),
+                ("successor_id", string(&successor.successor_id)),
+                ("replacement_id", string(replacement_id)),
+                ("lane_id", string(&successor.lane_id)),
+                ("generation", integer(successor.generation)),
+                ("role", string(&successor.role)),
+                ("worktree", string(&successor.worktree)),
+                ("session", string(&successor.session)),
+                ("process", string(&successor.process)),
+                ("checkpoint_id", string(&checkpoint.checkpoint_id)),
+                ("checkpoint_digest", string(&checkpoint.digest)),
+                ("observation_digest", string(&observation_digest)),
+                ("differences", Val::Arr(Vec::new())),
+                ("adopted_at", string(at)),
+            ]);
+            let adoption_text = canonical_text(&adoption);
+            let adoption_digest = sha256_hex(&canonical_bytes(&adoption));
+            let orchestration_text = preserved.as_ref().map(canonical_text).unwrap_or_default();
+            let consumed_text = if preserved.is_some() {
+                canonical_text(&Val::Arr(Vec::new()))
+            } else {
+                String::new()
+            };
+            let affected = tx.execute(
+                "UPDATE lane_successors
+                    SET adoption_evidence = ?1, adoption_digest = ?2, adopted_at = ?3,
+                        orchestration = ?4, consumed = ?5, updated_at = ?3
+                  WHERE successor_id = ?6",
+                params![
+                    adoption_text,
+                    adoption_digest,
+                    at,
+                    orchestration_text,
+                    consumed_text,
+                    successor.successor_id
+                ],
+            );
+            match affected {
+                Ok(1) => {}
+                Ok(_) => {
+                    return Err(state_error(
+                        "state.conflict",
+                        format!("the adoption lost its successor fence on {replacement_id}"),
+                    ));
+                }
+                Err(err) => {
+                    return Err(StateError::from_sqlite(
+                        "commit_lane_adoption: successor update",
+                        err,
+                    ));
+                }
+            }
+            let advanced = tx.execute(
+                "UPDATE lane_replacements
+                    SET phase = 'adopted', updated_at = ?1
+                  WHERE replacement_id = ?2 AND phase = 'adopting'
+                        AND generation = ?3 AND outcome = 'pending'",
+                params![at, replacement_id, generation],
+            );
+            match advanced {
+                Ok(1) => {}
+                Ok(_) => {
+                    return Err(state_error(
+                        "state.conflict",
+                        format!("the adoption lost its compare-and-set fence on {replacement_id}"),
+                    ));
+                }
+                Err(err) => {
+                    return Err(StateError::from_sqlite(
+                        "commit_lane_adoption: transition",
+                        err,
+                    ));
+                }
+            }
+            append_lane_replacement_event(
+                &tx,
+                replacement_id,
+                Some("adopting"),
+                "adopted",
+                Some("pending"),
+                "pending",
+                reason,
+                at,
+            )?;
+            let successor: LaneSuccessorRow = tx
+                .query_row(
+                    "SELECT successor_id, replacement_id, lane_id, generation, role, worktree,
+                            session, process, nonce, profile_key, profile_kind, kickoff_receipt,
+                            delivery, attempts, evidence, evidence_digest, orchestration,
+                            consumed, adopted_at, adoption_evidence, adoption_digest, created_at,
+                            updated_at
+                       FROM lane_successors WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_successor_row_from,
+                )
+                .map_err(|err| StateError::from_sqlite("commit_lane_adoption: reread", err))?;
+            let updated: LaneReplacementRow = tx
+                .query_row(
+                    "SELECT replacement_id, lane_id, generation, successor_generation,
+                            phase, outcome, outcome_reason, source_session, source_process,
+                            role, worktree, reason, created_at, updated_at
+                       FROM lane_replacements WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_replacement_row_from,
+                )
+                .map_err(|err| {
+                    StateError::from_sqlite("commit_lane_adoption: record reread", err)
+                })?;
+            tx.commit()
+                .map_err(|err| StateError::from_sqlite("commit_lane_adoption: commit", err))?;
+            Ok((successor, updated))
+        }
+    }
+
+    /// Consume recorded worker completions EXACTLY ONCE after adoption
+    /// (issue #76 AC6). `completions` are (event, worker) pairs; every event
+    /// must be a recorded pending completion of the replacement's
+    /// orchestrator checkpoint and every worker a referenced worker lane;
+    /// an event consumed twice refuses, so no duplicate reviewer dispatch
+    /// can ever be produced from this surface. The consumed set is durable
+    /// on the successor row (a restart re-derives it). This path records;
+    /// it never dispatches, spawns, or signals anything.
+    pub fn consume_lane_successor_completions(
+        &self,
+        replacement_id: &str,
+        successor_id: &str,
+        completions: &[(String, String)],
+        at: &str,
+    ) -> Result<(LaneSuccessorRow, Vec<String>), StateError> {
+        let outcome = self.consume_lane_successor_completions_inner(
+            replacement_id,
+            successor_id,
+            completions,
+            at,
+        );
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn consume_lane_successor_completions_inner(
+        &self,
+        replacement_id: &str,
+        successor_id: &str,
+        completions: &[(String, String)],
+        at: &str,
+    ) -> Result<(LaneSuccessorRow, Vec<String>), StateError> {
+        if completions.is_empty() || completions.len() > SUCCESSOR_COMPLETIONS_MAX {
+            return Err(state_error(
+                successor_code::EVENT,
+                format!(
+                    "one consumption request carries 1-{SUCCESSOR_COMPLETIONS_MAX} completion \
+                     events"
+                ),
+            ));
+        }
+        for (event, worker) in completions {
+            if !printable_bounded(event, 120) {
+                return Err(state_error(
+                    successor_code::EVENT,
+                    "each completion event must be a bounded printable token",
+                ));
+            }
+            if !crate::formats::is_replacement_id(worker) {
+                return Err(state_error(
+                    successor_code::EVENT,
+                    format!(
+                        "completion worker {worker:?} is not a lane replacement id \
+                         (rp_ + 16 hex)"
+                    ),
+                ));
+            }
+        }
+        self.ensure_writable()?;
+        let consumed_events: Vec<String>;
+        {
+            let mut conn = self.lock("consume_lane_successor_completions")?;
+            let tx = conn.transaction().map_err(|err| {
+                StateError::from_sqlite("consume_lane_successor_completions: begin", err)
+            })?;
+            let record: Option<LaneReplacementRow> = tx
+                .query_row(
+                    "SELECT replacement_id, lane_id, generation, successor_generation,
+                            phase, outcome, outcome_reason, source_session, source_process,
+                            role, worktree, reason, created_at, updated_at
+                       FROM lane_replacements WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_replacement_row_from,
+                )
+                .optional()
+                .map_err(|err| {
+                    StateError::from_sqlite("consume_lane_successor_completions: record", err)
+                })?;
+            let Some(record) = record else {
+                return Err(state_error(
+                    "state.not_found",
+                    format!("no lane replacement {replacement_id:?}"),
+                ));
+            };
+            if record.phase != "adopted" || record.outcome != "pending" {
+                return Err(state_error(
+                    replacement_code::ORDER,
+                    format!(
+                        "completions are consumed AFTER adoption; replacement {} is at {:?}/{}",
+                        record.replacement_id, record.phase, record.outcome
+                    ),
+                ));
+            }
+            let successor: Option<LaneSuccessorRow> = tx
+                .query_row(
+                    "SELECT successor_id, replacement_id, lane_id, generation, role, worktree,
+                            session, process, nonce, profile_key, profile_kind, kickoff_receipt,
+                            delivery, attempts, evidence, evidence_digest, orchestration,
+                            consumed, adopted_at, adoption_evidence, adoption_digest, created_at,
+                            updated_at
+                       FROM lane_successors WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_successor_row_from,
+                )
+                .optional()
+                .map_err(|err| {
+                    StateError::from_sqlite("consume_lane_successor_completions: successor", err)
+                })?;
+            let Some(successor) = successor else {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    format!("replacement {replacement_id} has no committed successor boundary"),
+                ));
+            };
+            if successor.successor_id != successor_id {
+                return Err(state_error(
+                    successor_code::BINDING,
+                    format!(
+                        "the consumption does not match the committed successor {}",
+                        successor.successor_id
+                    ),
+                ));
+            }
+            let orchestration: Val = Val::parse_json(&successor.orchestration).map_err(|_| {
+                state_error(
+                    successor_code::EVENT,
+                    format!(
+                        "successor {} is not an orchestrator successor; worker completions are \
+                         never consumed outside an orchestrator replacement",
+                        successor.successor_id
+                    ),
+                )
+            })?;
+            let pending: Vec<String> = orchestration
+                .get("pending_events")
+                .and_then(Val::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Val::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let workers: Vec<String> = orchestration
+                .get("workers")
+                .and_then(Val::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Val::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut consumed: Vec<String> = if successor.consumed.is_empty() {
+                Vec::new()
+            } else {
+                Val::parse_json(&successor.consumed)
+                    .ok()
+                    .and_then(|value| {
+                        value.as_array().map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Val::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                    })
+                    .unwrap_or_default()
+            };
+            for (event, worker) in completions {
+                if !pending.contains(event) {
+                    return Err(state_error(
+                        successor_code::EVENT,
+                        format!(
+                            "completion event {event:?} is not a recorded pending completion \
+                             of replacement {replacement_id} (a completion that was never \
+                             recorded is never consumed)"
+                        ),
+                    ));
+                }
+                if !workers.contains(worker) {
+                    return Err(state_error(
+                        successor_code::EVENT,
+                        format!(
+                            "completion worker {worker} is not a referenced worker lane of \
+                             replacement {replacement_id}"
+                        ),
+                    ));
+                }
+                if consumed.contains(event) {
+                    return Err(state_error(
+                        successor_code::EVENT_CONSUMED,
+                        format!(
+                            "completion event {event:?} was already consumed; consumption is \
+                             exactly once (a duplicate reviewer dispatch can never be produced)"
+                        ),
+                    ));
+                }
+                consumed.push(event.clone());
+            }
+            let consumed_text = canonical_text(&Val::Arr(
+                consumed.iter().map(|event| string(event)).collect(),
+            ));
+            let affected = tx.execute(
+                "UPDATE lane_successors SET consumed = ?1, updated_at = ?2
+                  WHERE successor_id = ?3",
+                params![consumed_text, at, successor.successor_id],
+            );
+            match affected {
+                Ok(1) => {}
+                Ok(_) => {
+                    return Err(state_error(
+                        "state.conflict",
+                        format!("the consumption lost its successor fence on {replacement_id}"),
+                    ));
+                }
+                Err(err) => {
+                    return Err(StateError::from_sqlite(
+                        "consume_lane_successor_completions: update",
+                        err,
+                    ));
+                }
+            }
+            tx.commit().map_err(|err| {
+                StateError::from_sqlite("consume_lane_successor_completions: commit", err)
+            })?;
+            consumed_events = consumed;
+        }
+        let row = self
+            .lane_successor_by_replacement(replacement_id)?
+            .ok_or_else(|| state_error("state.not_found", "successor vanished after consume"))?;
+        Ok((row, consumed_events))
+    }
+
+    // ---------------------------------------------------------------------
     // Journal reads (hash-chain verified)
     // ---------------------------------------------------------------------
 
@@ -5212,24 +6943,36 @@ const M0006_ID: &str = "m0006_lane_checkpoints_v6";
 const M0006_APPLIES_FROM: i64 = 5;
 const M0006_APPLIES_TO: i64 = 6;
 
+/// m0007 adds the lane successor table (issue #76): the ONE successor
+/// owner a replacement's startup nonce binds. The row commits with the
+/// `retired` → `starting` boundary BEFORE any spawn, so a simultaneous or
+/// replayed start can never create a second successor; the adapter-observed
+/// process, the verification evidence, the preserved orchestration block
+/// and the consumed completion events are durable on the row.
+const M0007_ID: &str = "m0007_lane_successors_v7";
+const M0007_APPLIES_FROM: i64 = 6;
+const M0007_APPLIES_TO: i64 = 7;
+
 /// Ordered migration chain (id, applies_from, applies_to). The runner in
 /// [`State::open`] applies every pending migration before serving.
-const MIGRATIONS: [(&str, i64, i64); 6] = [
+const MIGRATIONS: [(&str, i64, i64); 7] = [
     (M0001_ID, M0001_APPLIES_FROM, M0001_APPLIES_TO),
     (M0002_ID, M0002_APPLIES_FROM, M0002_APPLIES_TO),
     (M0003_ID, M0003_APPLIES_FROM, M0003_APPLIES_TO),
     (M0004_ID, M0004_APPLIES_FROM, M0004_APPLIES_TO),
     (M0005_ID, M0005_APPLIES_FROM, M0005_APPLIES_TO),
     (M0006_ID, M0006_APPLIES_FROM, M0006_APPLIES_TO),
+    (M0007_ID, M0007_APPLIES_FROM, M0007_APPLIES_TO),
 ];
 
-/// Ordered migration-chain identifiers (`m0001`..`m0006`), exposed for the
+/// Ordered migration-chain identifiers (`m0001`..`m0007`), exposed for the
 /// release provenance chain (issue #10): `herdr-fleet --version` prints
 /// them so a release archive's provenance record can bind the exact
 /// state-schema migration chain of the binary it ships.
 pub fn migration_chain_ids() -> &'static [&'static str] {
-    const IDS: [&str; MIGRATIONS.len()] =
-        [M0001_ID, M0002_ID, M0003_ID, M0004_ID, M0005_ID, M0006_ID];
+    const IDS: [&str; MIGRATIONS.len()] = [
+        M0001_ID, M0002_ID, M0003_ID, M0004_ID, M0005_ID, M0006_ID, M0007_ID,
+    ];
     &IDS
 }
 
@@ -5313,6 +7056,42 @@ CREATE TABLE lane_checkpoints (
     digest TEXT NOT NULL,
     brief_digest TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+";
+
+/// m0007 lane successor table (issue #76). One successor per replacement
+/// record (`UNIQUE (replacement_id)` — the durable one-generation/one-nonce
+/// owner fence: a second start can never create a duplicate successor). The
+/// row commits with the `retired` → `starting` boundary BEFORE any spawn;
+/// `delivery`/`attempts` carry the bounded retry state, `process`/`evidence`
+/// the adapter-observed verification, `orchestration`/`consumed` the
+/// preserved worker/reviewer identity and the exactly-once consumed
+/// completions.
+const M0007_SQL: &str = "\
+CREATE TABLE lane_successors (
+    successor_id TEXT PRIMARY KEY,
+    replacement_id TEXT NOT NULL UNIQUE,
+    lane_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    worktree TEXT NOT NULL,
+    session TEXT NOT NULL,
+    process TEXT NOT NULL DEFAULT '',
+    nonce TEXT NOT NULL,
+    profile_key TEXT NOT NULL,
+    profile_kind TEXT NOT NULL,
+    kickoff_receipt TEXT NOT NULL,
+    delivery TEXT NOT NULL DEFAULT 'none',
+    attempts INTEGER NOT NULL DEFAULT 1,
+    evidence TEXT NOT NULL DEFAULT '',
+    evidence_digest TEXT NOT NULL DEFAULT '',
+    orchestration TEXT NOT NULL DEFAULT '',
+    consumed TEXT NOT NULL DEFAULT '',
+    adopted_at TEXT NOT NULL DEFAULT '',
+    adoption_evidence TEXT NOT NULL DEFAULT '',
+    adoption_digest TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 ";
 
@@ -5424,6 +7203,58 @@ pub mod retirement_code {
     pub const REUSED: &str = "refusal.retirement.reused";
 }
 
+/// Typed refusal codes for lane successors (issue #76). Same dotted
+/// `refusal.*` vocabulary as the replacement/checkpoint/retirement codes;
+/// produced by this layer so RPC responses carry them unchanged.
+pub mod successor_code {
+    /// A successor already exists for this replacement (one generation/nonce
+    /// owns startup; no second successor can be created).
+    pub const EXISTS: &str = "refusal.successor.exists";
+    /// The presented binding does not match the durable record, its
+    /// committed checkpoint, the committed successor row, or the closed
+    /// observation contract: a changed generation, checkpoint digest,
+    /// successor identity or missing evidence refuses BEFORE any effect.
+    pub const BINDING: &str = "refusal.successor.binding";
+    /// The presented startup nonce is not the nonce that owns this
+    /// successor (a second nonce can never take over a started successor).
+    pub const NONCE: &str = "refusal.successor.nonce";
+    /// A hold: the spawn delivery, the adapter-observed readiness, or the
+    /// successor evidence cannot prove the boundary. Nothing further is
+    /// attempted; the successor stays fenced and a bounded same-nonce retry
+    /// can re-verify (never re-spawn blindly).
+    pub const HELD: &str = "refusal.successor.held";
+    /// The adapter evidence contradicts the start/adoption with a reused or
+    /// wrong identity (a different session/process/role/profile/worktree,
+    /// or the retired source process answering): fail closed.
+    pub const REUSED: &str = "refusal.successor.reused";
+    /// The source session is still present (or its absence cannot be
+    /// proven) while the successor boundary is being advanced: both live or
+    /// ambiguous blocks advancement (nothing is signalled).
+    pub const SOURCE_LIVE: &str = "refusal.successor.source_live";
+    /// The adoption re-query differs from the recorded handoff state:
+    /// RECONCILIATION is required (never a blind replay or a stale PASS
+    /// reuse); the record is parked for external reconciliation.
+    pub const DIFFERS: &str = "refusal.successor.differs";
+    /// The bounded spawn-attempt budget for this successor is exhausted.
+    pub const ATTEMPTS: &str = "refusal.successor.attempts";
+    /// A completion event does not name a recorded pending completion of
+    /// the replacement's orchestrator checkpoint (a completion that was
+    /// never recorded is never consumed).
+    pub const EVENT: &str = "refusal.successor.event";
+    /// The completion event was already consumed (consumption is exactly
+    /// once; a duplicate dispatch can never be produced).
+    pub const EVENT_CONSUMED: &str = "refusal.successor.event_consumed";
+}
+
+/// Content bounds for one successor start/adoption. Every bound is enforced
+/// up front; required evidence is never silently truncated.
+/// Enforced character bound of one startup nonce.
+pub const SUCCESSOR_NONCE_MAX: usize = 64;
+/// Maximum spawn attempts issued for one successor (bounded retry policy).
+pub const SUCCESSOR_ATTEMPTS_MAX: i64 = 3;
+/// Maximum completion events consumed by one successor consumption request.
+pub const SUCCESSOR_COMPLETIONS_MAX: usize = 8;
+
 /// Content bounds for one retirement request. The binding is bounded like
 /// every other lane contract; the transition reason is bounded so a durable
 /// evidence summary is never silently truncated.
@@ -5486,6 +7317,457 @@ pub fn replacement_id_for(lane_id: &str, generation: i64) -> String {
 pub fn checkpoint_id_for(replacement_id: &str) -> String {
     let digest = sha256_hex(format!("hf-lane-checkpoint/v1|{replacement_id}").as_bytes());
     format!("ck_{}", &digest[..16])
+}
+
+/// The deterministic successor id for one replacement record: `su_` + 16
+/// hex of sha256 over `hf-lane-successor/v1|<replacement_id>`. Same
+/// replacement → same successor identity, so a crash-then-retry, a restart
+/// and a bounded same-nonce retry all address the identical successor.
+pub fn successor_id_for(replacement_id: &str) -> String {
+    let digest = sha256_hex(format!("hf-lane-successor/v1|{replacement_id}").as_bytes());
+    format!("su_{}", &digest[..16])
+}
+
+/// Parse the successor binding of one start request (the grant-style
+/// document: lane generation, committed checkpoint digest, the ONE startup
+/// nonce). Missing or invalid fields refuse typed — never inferred.
+fn successor_binding(params: &Val) -> Result<SuccessorBinding, StateError> {
+    let binding = match params.get("binding") {
+        Some(Val::Obj(map)) => map,
+        _ => {
+            return Err(state_error(
+                successor_code::BINDING,
+                "a successor start requires params.binding (object: generation, \
+                 checkpoint_digest, nonce)",
+            ));
+        }
+    };
+    let generation = match binding.get("generation").and_then(Val::as_int) {
+        Some(generation) if generation >= 1 => generation,
+        _ => {
+            return Err(state_error(
+                successor_code::BINDING,
+                "the successor binding generation must be a positive integer",
+            ));
+        }
+    };
+    let checkpoint_digest = match binding.get("checkpoint_digest").and_then(Val::as_str) {
+        Some(text) if crate::formats::is_hex64(text) => text.to_string(),
+        _ => {
+            return Err(state_error(
+                successor_code::BINDING,
+                "the successor binding checkpoint_digest must be a 64-hex sha256 digest \
+                 (checkpoint integrity evidence)",
+            ));
+        }
+    };
+    let nonce = match binding.get("nonce").and_then(Val::as_str) {
+        Some(text) if printable_bounded(text, SUCCESSOR_NONCE_MAX) => text.to_string(),
+        _ => {
+            return Err(state_error(
+                successor_code::BINDING,
+                format!(
+                    "the successor binding nonce must be 1-{SUCCESSOR_NONCE_MAX} printable \
+                     characters (one generation/nonce owns startup)"
+                ),
+            ));
+        }
+    };
+    Ok(SuccessorBinding {
+        generation,
+        checkpoint_digest,
+        nonce,
+    })
+}
+
+/// Parse the adoption binding of one adoption request (the committed
+/// successor identity the adoption acts on). Missing or invalid fields
+/// refuse typed — never inferred.
+fn adoption_binding(params: &Val) -> Result<AdoptionBinding, StateError> {
+    let binding = match params.get("binding") {
+        Some(Val::Obj(map)) => map,
+        _ => {
+            return Err(state_error(
+                successor_code::BINDING,
+                "an adoption requires params.binding (object: generation, successor_id, \
+                 session)",
+            ));
+        }
+    };
+    let generation = match binding.get("generation").and_then(Val::as_int) {
+        Some(generation) if generation >= 1 => generation,
+        _ => {
+            return Err(state_error(
+                successor_code::BINDING,
+                "the adoption binding generation must be a positive integer",
+            ));
+        }
+    };
+    let successor_id = match binding.get("successor_id").and_then(Val::as_str) {
+        Some(text) if crate::formats::is_successor_id(text) => text.to_string(),
+        _ => {
+            return Err(state_error(
+                successor_code::BINDING,
+                "the adoption binding successor_id must be a su_ successor id",
+            ));
+        }
+    };
+    let session = match binding.get("session").and_then(Val::as_str) {
+        Some(text) if crate::formats::is_actor(text) => text.to_string(),
+        _ => {
+            return Err(state_error(
+                successor_code::BINDING,
+                "the adoption binding session must be a session identity",
+            ));
+        }
+    };
+    Ok(AdoptionBinding {
+        generation,
+        successor_id,
+        session,
+    })
+}
+
+/// Map one SQLite row onto [`LaneSuccessorRow`] (column order of the
+/// lane_successors SELECTs).
+fn lane_successor_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneSuccessorRow> {
+    Ok(LaneSuccessorRow {
+        successor_id: row.get(0)?,
+        replacement_id: row.get(1)?,
+        lane_id: row.get(2)?,
+        generation: row.get(3)?,
+        role: row.get(4)?,
+        worktree: row.get(5)?,
+        session: row.get(6)?,
+        process: row.get(7)?,
+        nonce: row.get(8)?,
+        profile_key: row.get(9)?,
+        profile_kind: row.get(10)?,
+        kickoff_receipt: row.get(11)?,
+        delivery: row.get(12)?,
+        attempts: row.get(13)?,
+        evidence: row.get(14)?,
+        evidence_digest: row.get(15)?,
+        orchestration: row.get(16)?,
+        consumed: row.get(17)?,
+        adopted_at: row.get(18)?,
+        adoption_evidence: row.get(19)?,
+        adoption_digest: row.get(20)?,
+        created_at: row.get(21)?,
+        updated_at: row.get(22)?,
+    })
+}
+
+/// One lane successor row as an `hf-rpc`-facing value (the durable record a
+/// start/adoption/consumption response carries; the evidence documents are
+/// parsed when present, null otherwise).
+pub fn lane_successor_val(row: &LaneSuccessorRow) -> Val {
+    let optional_doc = |text: &str| -> Val {
+        if text.is_empty() {
+            null()
+        } else {
+            Val::parse_json(text).unwrap_or_else(|_| null())
+        }
+    };
+    object(vec![
+        ("successor_id", string(&row.successor_id)),
+        ("replacement_id", string(&row.replacement_id)),
+        ("lane_id", string(&row.lane_id)),
+        ("generation", integer(row.generation)),
+        ("role", string(&row.role)),
+        ("worktree", string(&row.worktree)),
+        ("session", string(&row.session)),
+        ("process", string(&row.process)),
+        ("nonce", string(&row.nonce)),
+        (
+            "profile",
+            object(vec![
+                ("key", string(&row.profile_key)),
+                ("kind", string(&row.profile_kind)),
+            ]),
+        ),
+        ("kickoff_receipt", string(&row.kickoff_receipt)),
+        ("delivery", string(&row.delivery)),
+        ("attempts", integer(row.attempts)),
+        ("evidence", optional_doc(&row.evidence)),
+        ("evidence_digest", string(&row.evidence_digest)),
+        ("orchestration", optional_doc(&row.orchestration)),
+        ("consumed", optional_doc(&row.consumed)),
+        ("adopted_at", string(&row.adopted_at)),
+        ("adoption_evidence", optional_doc(&row.adoption_evidence)),
+        ("adoption_digest", string(&row.adoption_digest)),
+        ("created_at", string(&row.created_at)),
+        ("updated_at", string(&row.updated_at)),
+    ])
+}
+
+/// Extract the preserved orchestration block from a committed checkpoint
+/// snapshot (orchestrator checkpoints only; None otherwise).
+fn checkpoint_orchestration_of(snapshot: &str) -> Option<Val> {
+    let parsed = Val::parse_json(snapshot).ok()?;
+    match parsed.get("orchestration") {
+        Some(value @ Val::Obj(_)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// Validate one adoption re-query and reduce it to the closed comparison
+/// document the adoption compares against the committed checkpoint. The
+/// contract mirrors the checkpoint observation (closed key set; required
+/// evidence is never silently omitted), minus the capture-only blocks.
+fn adoption_observation_val(
+    record: &LaneReplacementRow,
+    observation: &Val,
+) -> Result<Val, StateError> {
+    adoption_observation_inner(record, observation)
+        .map_err(|err| state_error(successor_code::BINDING, err.message))
+}
+
+fn adoption_observation_inner(
+    record: &LaneReplacementRow,
+    observation: &Val,
+) -> Result<Val, StateError> {
+    let Val::Obj(obs) = observation else {
+        return Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            "the adoption re-query must be an object",
+        ));
+    };
+    cp_closed(
+        obs,
+        &[
+            "role",
+            "task",
+            "worktree",
+            "branch",
+            "head",
+            "base",
+            "dirty",
+            "untracked",
+            "report",
+            "gates",
+            "children",
+        ],
+        &[],
+        "observation",
+    )?;
+    let role = cp_text(obs, "role", "observation", 64)?;
+    if role != record.role {
+        return Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!(
+                "observation.role {role:?} does not match the replacement record role {:?}",
+                record.role
+            ),
+        ));
+    }
+    let task = cp_text(obs, "task", "observation", 200)?;
+    let worktree = cp_text(obs, "worktree", "observation", 200)?;
+    if worktree != record.worktree || !crate::formats::is_worktree_ref(&worktree) {
+        return Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!(
+                "observation.worktree {worktree:?} does not match the replacement record \
+                 worktree {:?} (the successor continues the SAME worktree)",
+                record.worktree
+            ),
+        ));
+    }
+    let branch = cp_text(obs, "branch", "observation", 120)?;
+    if !is_branch_ref(&branch) {
+        return Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!("observation.branch {branch:?} is not a git-ref-shaped branch identity"),
+        ));
+    }
+    let head = cp_hex40(obs, "head", "observation")?;
+    let base = cp_hex40(obs, "base", "observation")?;
+    let dirty = cp_object(obs, "dirty", "observation")?;
+    cp_closed(dirty, &["count", "digest"], &[], "observation.dirty")?;
+    let dirty_count = cp_count(dirty, "count", "observation.dirty")?;
+    let dirty_digest = cp_hex64(dirty, "digest", "observation.dirty")?;
+    let untracked = cp_object(obs, "untracked", "observation")?;
+    cp_closed(
+        untracked,
+        &["count", "digest"],
+        &[],
+        "observation.untracked",
+    )?;
+    let untracked_count = cp_count(untracked, "count", "observation.untracked")?;
+    let untracked_digest = cp_hex64(untracked, "digest", "observation.untracked")?;
+    let report = cp_object(obs, "report", "observation")?;
+    cp_closed(
+        report,
+        &["round", "reviewed_sha"],
+        &[],
+        "observation.report",
+    )?;
+    let report_round = match report.get("round").and_then(Val::as_int) {
+        Some(value) if (1..=100_000).contains(&value) => value,
+        _ => {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                "observation.report.round must be a positive integer",
+            ));
+        }
+    };
+    let reviewed_sha = cp_hex40(report, "reviewed_sha", "observation.report")?;
+    let gates = cp_array(obs, "gates", "observation")?;
+    if gates.len() > CHECKPOINT_GATES_MAX {
+        return Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!("at most {CHECKPOINT_GATES_MAX} gate entries per adoption re-query"),
+        ));
+    }
+    let mut gate_vals: Vec<Val> = Vec::with_capacity(gates.len());
+    for (index, gate) in gates.iter().enumerate() {
+        let what = format!("observation.gates[{index}]");
+        let Val::Obj(gate_map) = gate else {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                format!("{what} must be an object"),
+            ));
+        };
+        cp_closed(gate_map, &["name", "status"], &[], &what)?;
+        let name = cp_text(gate_map, "name", &what, 80)?;
+        let status = cp_text(gate_map, "status", &what, 16)?;
+        if !CHECKPOINT_GATE_STATUSES.contains(&status.as_str()) {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                format!("{what}.status {status:?} is outside {CHECKPOINT_GATE_STATUSES:?}"),
+            ));
+        }
+        gate_vals.push(object(vec![
+            ("name", string(&name)),
+            ("status", string(&status)),
+        ]));
+    }
+    let children = cp_array(obs, "children", "observation")?;
+    if children.len() > CHECKPOINT_CHILDREN_MAX {
+        return Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!("at most {CHECKPOINT_CHILDREN_MAX} observed child commands per re-query"),
+        ));
+    }
+    let mut child_vals: Vec<Val> = Vec::with_capacity(children.len());
+    for (index, child) in children.iter().enumerate() {
+        let what = format!("observation.children[{index}]");
+        let Val::Obj(child_map) = child else {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                format!("{what} must be an object"),
+            ));
+        };
+        cp_closed(child_map, &["command", "state"], &[], &what)?;
+        let command = cp_text(child_map, "command", &what, 160)?;
+        let state = cp_text(child_map, "state", &what, 16)?;
+        if !CHECKPOINT_CHILD_STATES.contains(&state.as_str()) {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                format!("{what}.state {state:?} is outside {CHECKPOINT_CHILD_STATES:?}"),
+            ));
+        }
+        child_vals.push(object(vec![
+            ("command", string(&command)),
+            ("state", string(&state)),
+        ]));
+    }
+    Ok(object(vec![
+        ("task", string(&task)),
+        ("worktree", string(&worktree)),
+        ("branch", string(&branch)),
+        ("head", string(&head)),
+        ("base", string(&base)),
+        (
+            "dirty",
+            object(vec![
+                ("count", integer(dirty_count)),
+                ("digest", string(&dirty_digest)),
+            ]),
+        ),
+        (
+            "untracked",
+            object(vec![
+                ("count", integer(untracked_count)),
+                ("digest", string(&untracked_digest)),
+            ]),
+        ),
+        (
+            "report",
+            object(vec![
+                ("round", integer(report_round)),
+                ("reviewed_sha", string(&reviewed_sha)),
+            ]),
+        ),
+        ("gates", Val::Arr(gate_vals)),
+        ("children", Val::Arr(child_vals)),
+    ]))
+}
+
+/// Compare one fresh adoption re-query against the recorded checkpoint
+/// snapshot's handoff state. Every worktree head/dirty-inventory/report/
+/// gate/child difference is returned by name: a non-empty list is the
+/// RECONCILIATION verdict (never a blind replay or a stale PASS reuse).
+fn adoption_differences(snapshot: &str, observed: &Val) -> Vec<String> {
+    let Ok(recorded) = Val::parse_json(snapshot) else {
+        return vec!["checkpoint.snapshot".to_string()];
+    };
+    let mut differences = Vec::new();
+    for key in ["task", "worktree", "branch", "head", "base"] {
+        let before = recorded.get(key).and_then(Val::as_str).unwrap_or("");
+        let after = observed.get(key).and_then(Val::as_str).unwrap_or("");
+        if before != after {
+            differences.push(key.to_string());
+        }
+    }
+    for key in ["dirty", "untracked"] {
+        let before = recorded.get(key).cloned().unwrap_or_else(null);
+        let after = observed.get(key).cloned().unwrap_or_else(null);
+        if canonical_text(&before) != canonical_text(&after) {
+            differences.push(key.to_string());
+        }
+    }
+    let before_report = recorded.get("report").cloned().unwrap_or_else(null);
+    let after_report = observed.get("report").cloned().unwrap_or_else(null);
+    if canonical_text(&before_report) != canonical_text(&after_report) {
+        differences.push("report".to_string());
+    }
+    let pairs = |value: &Val, key: &str, left: &str, right: &str| -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = value
+            .get(key)
+            .and_then(Val::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        (
+                            item.get(left)
+                                .and_then(Val::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            item.get(right)
+                                .and_then(Val::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        pairs.sort();
+        pairs
+    };
+    for (key, left, right) in [
+        ("gates", "name", "status"),
+        ("children", "command", "state"),
+    ] {
+        let before = pairs(&recorded, key, left, right);
+        let after = pairs(observed, key, left, right);
+        if before != after {
+            differences.push(key.to_string());
+        }
+    }
+    differences
 }
 
 /// m0005 lane replacement tables (issue #73). `lane_replacements` holds one
@@ -5824,6 +8106,36 @@ fn run_m0006(conn: &mut Connection) -> Result<(), StateError> {
         .map_err(|err| StateError::from_sqlite("migrate m0006: user_version", err))?;
     tx.commit()
         .map_err(|err| StateError::from_sqlite("migrate m0006: commit", err))?;
+    Ok(())
+}
+
+/// Run migration m0007 in one transaction: the lane successor table
+/// (issue #76). Purely additive — no existing table or row is touched, so
+/// stored replacement/checkpoint rows are never reinterpreted by the
+/// upgrade and the successor table starts empty.
+fn run_m0007(conn: &mut Connection) -> Result<(), StateError> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| StateError::from_sqlite("migrate m0007: begin", err))?;
+    let checksum = sha256_hex(M0007_SQL.as_bytes());
+    tx.execute_batch(M0007_SQL)
+        .map_err(|err| StateError::from_sqlite("migrate m0007", err))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (migration_id, applies_from, applies_to, checksum, applied_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            M0007_ID,
+            M0007_APPLIES_FROM,
+            M0007_APPLIES_TO,
+            checksum,
+            time::rfc3339_now()
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("migrate m0007: bookkeeping", err))?;
+    tx.pragma_update(None, "user_version", M0007_APPLIES_TO)
+        .map_err(|err| StateError::from_sqlite("migrate m0007: user_version", err))?;
+    tx.commit()
+        .map_err(|err| StateError::from_sqlite("migrate m0007: commit", err))?;
     Ok(())
 }
 
@@ -6685,10 +8997,12 @@ mod tests {
         assert_eq!(grant.status, "active");
         assert_eq!(grant.state_epoch, 1);
         assert_eq!(state.current_epoch().expect("epoch"), 1);
-        assert_eq!(SCHEMA_VERSION, 6);
+        assert_eq!(SCHEMA_VERSION, 7);
         {
-            let conn = state.lock("test: m0005/m0006 bookkeeping").expect("lock");
-            for migration_id in [M0005_ID, M0006_ID] {
+            let conn = state
+                .lock("test: m0005/m0006/m0007 bookkeeping")
+                .expect("lock");
+            for migration_id in [M0005_ID, M0006_ID, M0007_ID] {
                 let recorded: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
@@ -6701,7 +9015,7 @@ mod tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .expect("user_version");
-            assert_eq!(version, 6);
+            assert_eq!(version, 7);
         }
     }
 
@@ -7061,20 +9375,163 @@ mod tests {
             .advance_lane_replacement(&row.replacement_id, "quiescing", 1, "2026-09-12T01:00:00Z")
             .expect("advance after upgrade");
         assert_eq!(advanced.phase, "checkpointed");
+        assert_eq!(
+            state
+                .lane_successor_by_replacement(&row.replacement_id)
+                .expect("successor read"),
+            None,
+            "the new successor table starts empty"
+        );
         {
-            let conn = state.lock("test: m0006 bookkeeping").expect("lock");
-            let recorded: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
-                    params![M0006_ID],
-                    |row| row.get(0),
-                )
-                .expect("bookkeeping");
-            assert_eq!(recorded, 1, "m0006 recorded in schema_migrations");
+            let conn = state.lock("test: m0006/m0007 bookkeeping").expect("lock");
+            for migration_id in [M0006_ID, M0007_ID] {
+                let recorded: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                        params![migration_id],
+                        |row| row.get(0),
+                    )
+                    .expect("bookkeeping");
+                assert_eq!(recorded, 1, "{migration_id} recorded in schema_migrations");
+            }
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .expect("user_version");
-            assert_eq!(version, 6);
+            assert_eq!(version, 7);
+        }
+    }
+
+    #[test]
+    fn lane_successor_migration_preserves_checkpoint_rows() {
+        // Issue #76: the m0007 upgrade is purely additive. A database
+        // written at schema v6 (m0001..m0006) with a stored replacement
+        // record, its history and a committed checkpoint upgrades in place;
+        // every stored row and the next allowed transition are exactly what
+        // they were, and the new successor table starts empty.
+        let path = temp_db("successor-upgrade.db");
+        let replacement_id = replacement_id_for("lane-7", 1);
+        {
+            let mut conn = Connection::open(&path).expect("open raw");
+            run_initial_migration(&mut conn).expect("m0001");
+            run_m0002(&mut conn).expect("m0002");
+            run_m0003(&mut conn).expect("m0003");
+            run_m0004(&mut conn).expect("m0004");
+            run_m0005(&mut conn).expect("m0005");
+            run_m0006(&mut conn).expect("m0006");
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("user_version");
+            assert_eq!(version, 6, "raw fixture lands at schema v6");
+            conn.execute(
+                "INSERT INTO lane_replacements (replacement_id, lane_id, generation,
+                    successor_generation, phase, outcome, outcome_reason, source_session,
+                    source_process, role, worktree, reason, created_at, updated_at)
+                 VALUES (?1, 'lane-7', 1, 2, 'retired', 'pending', '', 'sess-0001',
+                    'proc-0001', 'implementer', 'worktrees/issues/76', 'host rotation window',
+                    '2026-09-12T00:00:00Z', '2026-09-12T00:00:00Z')",
+                params![replacement_id],
+            )
+            .expect("stored replacement insert");
+            conn.execute(
+                "INSERT INTO lane_replacements (replacement_id, lane_id, generation,
+                    successor_generation, phase, outcome, outcome_reason, source_session,
+                    source_process, role, worktree, reason, created_at, updated_at)
+                 VALUES (?1, 'lane-8', 1, 2, 'checkpointed', 'pending', '', 'sess-0002',
+                    'proc-0002', 'implementer', 'worktrees/issues/76', 'stored worker lane',
+                    '2026-09-12T00:00:00Z', '2026-09-12T00:00:00Z')",
+                params![replacement_id_for("lane-8", 1)],
+            )
+            .expect("stored worker insert");
+            conn.execute(
+                "INSERT INTO lane_replacement_events (seq, replacement_id, from_phase, to_phase,
+                    from_outcome, to_outcome, reason, at)
+                 VALUES (1, ?1, NULL, 'requested', NULL, 'pending', 'host rotation window',
+                    '2026-09-12T00:00:00Z')",
+                params![replacement_id],
+            )
+            .expect("stored event insert");
+            conn.execute(
+                "INSERT INTO lane_replacement_events (seq, replacement_id, from_phase, to_phase,
+                    from_outcome, to_outcome, reason, at)
+                 VALUES (2, ?1, 'requested', 'retired', 'pending', 'pending', 'stored',
+                    '2026-09-12T00:00:00Z')",
+                params![replacement_id],
+            )
+            .expect("stored event insert");
+            conn.execute(
+                "INSERT INTO lane_checkpoints (checkpoint_id, replacement_id, lane_id, generation,
+                    role, observation_digest, reobservation_digest, snapshot, digest,
+                    brief_digest, created_at)
+                 VALUES ('ck_0123456789abcdef', ?1, 'lane-7', 1, 'implementer',
+                    '0', '0', '{}', ?2, '0', '2026-09-12T00:00:00Z')",
+                params![replacement_id, "d".repeat(64)],
+            )
+            .expect("stored checkpoint insert");
+        }
+        let state = State::open(&path, Retention::default()).expect("upgrade open");
+        let row = state
+            .lane_replacement_by_id(&replacement_id)
+            .expect("read")
+            .expect("the stored replacement survives the upgrade");
+        assert_eq!(row.phase, "retired");
+        assert_eq!(row.outcome, "pending");
+        let checkpoint = state
+            .lane_checkpoint_by_replacement(&replacement_id)
+            .expect("checkpoint read")
+            .expect("the stored checkpoint survives the upgrade");
+        assert_eq!(checkpoint.checkpoint_id, "ck_0123456789abcdef");
+        assert_eq!(
+            state
+                .lane_replacement_events(&replacement_id)
+                .expect("history")
+                .len(),
+            2,
+            "the stored history is preserved"
+        );
+        assert_eq!(
+            state
+                .lane_successor_by_replacement(&replacement_id)
+                .expect("successor read"),
+            None,
+            "the new successor table starts empty"
+        );
+        // The preserved next transition still works after the upgrade: the
+        // stored `retired` boundary admits the successor start.
+        let plan = state
+            .begin_lane_successor(&object(vec![
+                ("replacement_id", string(&replacement_id)),
+                (
+                    "binding",
+                    object(vec![
+                        ("generation", integer(1)),
+                        ("checkpoint_digest", string(&"d".repeat(64))),
+                        ("nonce", string("nonce-upgrade-0001")),
+                    ]),
+                ),
+                (
+                    "successor",
+                    object(vec![
+                        ("session", string("sess-0002")),
+                        ("kickoff_receipt", string(&"a".repeat(64))),
+                    ]),
+                ),
+            ]))
+            .expect("the stored retirement boundary admits a start after the upgrade");
+        assert_eq!(plan.record.phase, "retired");
+        {
+            let conn = state.lock("test: m0007 bookkeeping").expect("lock");
+            let recorded: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                    params![M0007_ID],
+                    |row| row.get(0),
+                )
+                .expect("bookkeeping");
+            assert_eq!(recorded, 1, "m0007 recorded in schema_migrations");
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("user_version");
+            assert_eq!(version, 7);
         }
     }
 

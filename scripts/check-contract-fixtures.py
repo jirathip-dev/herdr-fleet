@@ -96,6 +96,7 @@ RPC_METHODS = frozenset(
      "lane.replacement.status",
      "lane.checkpoint.create", "lane.checkpoint.status",
      "lane.retire",
+     "lane.start", "lane.adopt", "lane.successor.consume",
      "state.epoch", "backup.create", "restore.begin", "journal.tail",
      "events.subscribe"}
 )

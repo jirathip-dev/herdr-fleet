@@ -77,7 +77,7 @@ release process activates (docs/RELEASING.md), then semver applies.
   per-user launchd/systemd environment checks and unit-plan rendering —
   plans only, never installing/starting/stopping/querying the host service
   manager.
-- State layer: SQLite migrations m0001-m0006, audit/event JSONL journals
+- State layer: SQLite migrations m0001-m0007, audit/event JSONL journals
   with mirror rebuild, backup/restore hooks, per-user path resolution.
 - Socket RPC: `hf-rpc-request/v1`/`hf-rpc-response/v1` closed method set,
   typed refusal codes, `events.subscribe` stream.
@@ -240,6 +240,42 @@ release process activates (docs/RELEASING.md), then semver applies.
   reconciles exact absence without ever repeating a signal — never against a
   reused identity. Excluded, as the issue requires: successor start,
   process-tree cleanup, whole-fleet restart and real deployment activation.
+
+### Added (issue #76 — Bounded start, verification and adoption of one successor)
+
+- ONE bounded start of one successor for a retired replacement and its
+  single adoption (`lane.start` / `lane.adopt` RPCs, `lane_successors`
+  table via m0007/schema v7): the start commits exactly one successor owner
+  boundary (a deterministic `su_` successor id bound to the lane
+  generation, the startup nonce, the target session and the committed
+  checkpoint digest) BEFORE any spawn, and reuses the existing admission
+  gate and the workspace (Herdr) session adapter row
+  (`session start <session> --json`) — the same logical lane and worktree,
+  never a new infrastructure model.
+- A booted process alone is never a successor: adoption refuses whenever
+  the successor is not verifiably interactive/usable
+  (`refusal.successor.held`), a process observation without a usable
+  session parks `ambiguous`, and the adoption RE-QUERIES the lane and
+  compares the fresh observation against the durable checkpoint snapshot
+  (`refusal.successor.differs`) instead of replaying the recorded state as
+  success.
+- Adoption reconciles the orchestrator identity: the successor keeps the
+  retired session's role, the record's worker/reviewer references and its
+  pending completion events; the events are consumed at most once by a
+  logged consumer (`lane.successor.consume`) and a started successor is
+  fenced while the record is held (`refusal.replacement.held`) — a paused
+  lane cannot activate a booted successor.
+- Capacity remains the existing bounded admission path: a missing host
+  proof, a missing admission claim or an exhausted global/per-repository/
+  per-harness cap holds typed (`refusal.capacity.*`) with NO child, no
+  state change and a bounded fresh retry only.
+- A crash between the boundary commit and the spawn is reconciled on
+  restart (successor read-back before any retry; non-verifiable evidence
+  parks `ambiguous` and refuses the retry until reconciliation resolves
+  it), so a restart never silently writes off the boundary and never
+  spawns twice. Excluded, as the issue requires: scheduler-driven successor
+  work, automatic retries, process-tree cleanup and real deployment
+  activation.
 
 ### Changed
 
