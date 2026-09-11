@@ -1544,6 +1544,315 @@ pub fn execute_named(
     execute_op(profile, &request, env)
 }
 
+// ---------------------------------------------------------------------------
+// Session retirement (issue #75): the bounded graceful stop and the closed
+// confirmation evidence grammar
+// ---------------------------------------------------------------------------
+
+/// One retirement target: the source session the workspace (Herdr) session
+/// rows address and the backend process identity the confirmation compares
+/// against. Both parts are bound from the durable replacement record — never
+/// from request text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetirementTarget {
+    /// The source session identity (the `<session>` argument of the
+    /// workspace `session <verb> <session> --json` rows).
+    pub session: String,
+    /// The backend process identity of the source session.
+    pub process: String,
+}
+
+/// The closed verdict of one retirement confirmation read-back. The
+/// retirement is confirmed by BOTH backend evidence parts (the process is
+/// absent AND the ownership/registration is released for the bound session
+/// and generation); a read-back label (a `done`/`retired` state string, pane
+/// text) is never read, so a label alone can never confirm a retirement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetirementEvidence {
+    /// The retirement is confirmed: the backend process is absent and the
+    /// registration is released for the bound session and generation.
+    Retired,
+    /// The confirmation cannot prove absence (the session or process is
+    /// still present, or the evidence is unknown/unreadable): hold — no
+    /// further signal is attempted.
+    Held {
+        /// Bounded human detail (redacted).
+        detail: String,
+    },
+    /// Backend evidence contradicts the retirement with a reused identity (a
+    /// different process holds the bound session, or the registration
+    /// belongs to another session/generation): fail closed.
+    Reused {
+        /// Bounded human detail (redacted).
+        detail: String,
+    },
+}
+
+/// Run the retirement stop row — the ONE graceful bounded stop request this
+/// slice ever issues: `herdr session interrupt <session> --json` under
+/// [`WORKSPACE_EXECUTABLE`] with the caller's deadline. `succeeded` means
+/// the workspace accepted the stop request; a `refused` result means the
+/// request was never delivered, `failed`/`ambiguous` mean the delivery is
+/// unknown. Nothing here escalates: no SIGKILL, no process-group signal, no
+/// broad pattern and no retry — a stop that does not confirm simply holds.
+pub fn retirement_stop(
+    profile: &Profile,
+    target: &RetirementTarget,
+    env: &BTreeMap<String, String>,
+    timeout: Duration,
+) -> OpResult {
+    let started = std::time::Instant::now();
+    if !profile.supports(Op::Interrupt.capability()) {
+        return retirement_result(
+            profile,
+            target,
+            Op::Interrupt,
+            "refused",
+            Some(CODE_UNKNOWN_CAPABILITY),
+            Some(format!(
+                "harness profile {:?} does not declare the {:?} capability required to stop a \
+                 session; unsupported adapters are refused",
+                profile.key,
+                Op::Interrupt.capability()
+            )),
+            None,
+            None,
+            started,
+        );
+    }
+    let args = workspace_args(Op::Interrupt, &target.session);
+    match run_typed(WORKSPACE_EXECUTABLE, &args, timeout, env, None) {
+        ProcessOutcome::Ok(text) => match Val::parse_json(&text) {
+            Ok(_) => retirement_result(
+                profile,
+                target,
+                Op::Interrupt,
+                "succeeded",
+                None,
+                None,
+                Some(object(vec![("interrupted", bool_(true))])),
+                None,
+                started,
+            ),
+            Err(message) => retirement_result(
+                profile,
+                target,
+                Op::Interrupt,
+                "refused",
+                Some(CODE_MALFORMED),
+                Some("workspace stop row returned unparsable JSON".to_string()),
+                None,
+                Some(diagnostics(&format!("{message}: {text}"))),
+                started,
+            ),
+        },
+        ProcessOutcome::Failed(err) => retirement_result(
+            profile,
+            target,
+            Op::Interrupt,
+            err.status(),
+            Some(err.code),
+            Some(err.message),
+            None,
+            Some(err.detail),
+            started,
+        ),
+    }
+}
+
+/// Run the retirement confirmation read row and classify its closed evidence
+/// grammar: the workspace `session show <session> --json` row, read back
+/// AFTER the stop. A failure to read (unavailable/unparsable backend) is a
+/// typed adapter error — the caller holds; the classification itself returns
+/// the three closed verdicts (see [`RetirementEvidence`]).
+pub fn retirement_evidence(
+    profile: &Profile,
+    target: &RetirementTarget,
+    generation: i64,
+    env: &BTreeMap<String, String>,
+    timeout: Duration,
+) -> Result<RetirementEvidence, AdapterError> {
+    if !profile.supports(Op::Observe.capability()) {
+        return Err(AdapterError::refusal(
+            CODE_UNKNOWN_CAPABILITY,
+            format!(
+                "harness profile {:?} does not declare the {:?} capability required to confirm \
+                 a retirement; unsupported adapters are refused",
+                profile.key,
+                Op::Observe.capability()
+            ),
+        ));
+    }
+    let args = workspace_args(Op::Observe, &target.session);
+    let text = match run_typed(WORKSPACE_EXECUTABLE, &args, timeout, env, None) {
+        ProcessOutcome::Ok(text) => text,
+        ProcessOutcome::Failed(err) => {
+            let retryable = err.status() == "ambiguous";
+            return Err(AdapterError::failure(err.code, err.message, retryable));
+        }
+    };
+    let doc = Val::parse_json(&text).map_err(|message| {
+        AdapterError::refusal(
+            CODE_MALFORMED,
+            format!("retirement confirmation read-back returned unparsable JSON: {message}"),
+        )
+    })?;
+    classify_retirement_evidence(&doc, target, generation)
+}
+
+/// Classify one retirement confirmation read-back document against the bound
+/// target. The closed evidence grammar is:
+///
+/// ```json
+/// {"session_id": "<bound session>",
+///  "process": "<backend process identity>" | null,
+///  "registration": {"state": "active" | "released",
+///                   "session": "<bound session>", "generation": <generation>}}
+/// ```
+///
+/// Only the two backend evidence parts are read — the read-back can carry any
+/// other label, and no label confirms a retirement by itself. Missing or
+/// unknown evidence holds; a positive contradiction (a different process for
+/// the bound session, or a registration naming another session/generation) is
+/// a reused identity and fails closed.
+pub fn classify_retirement_evidence(
+    doc: &Val,
+    target: &RetirementTarget,
+    generation: i64,
+) -> Result<RetirementEvidence, AdapterError> {
+    match doc.get("session_id").and_then(Val::as_str) {
+        None => {
+            return Ok(RetirementEvidence::Held {
+                detail: "the confirmation read-back carries no session identity (an unknown \
+                         session identity holds)"
+                    .to_string(),
+            });
+        }
+        Some(session) if session != target.session => {
+            return Ok(RetirementEvidence::Reused {
+                detail: format!(
+                    "the confirmation read-back names session {session:?} for the bound session \
+                     {:?} (reused pane/session identity)",
+                    target.session
+                ),
+            });
+        }
+        Some(_) => {}
+    }
+    let process = match doc.get("process") {
+        None => {
+            return Ok(RetirementEvidence::Held {
+                detail: "the confirmation read-back carries no process evidence (an unknown \
+                         process identity holds)"
+                    .to_string(),
+            });
+        }
+        Some(Val::Null) => None,
+        Some(Val::Str(process)) if is_actor(process) => Some(process.as_str()),
+        Some(_) => {
+            return Ok(RetirementEvidence::Held {
+                detail: "the confirmation read-back process evidence is not a process identity \
+                         or null (an unknown process identity holds)"
+                    .to_string(),
+            });
+        }
+    };
+    let registration = match doc.get("registration") {
+        Some(Val::Obj(map)) => map,
+        _ => {
+            return Ok(RetirementEvidence::Held {
+                detail: "the confirmation read-back carries no ownership/registration evidence"
+                    .to_string(),
+            });
+        }
+    };
+    let Some(registered_state) = registration.get("state").and_then(Val::as_str) else {
+        return Ok(RetirementEvidence::Held {
+            detail: "the registration evidence carries no state".to_string(),
+        });
+    };
+    let Some(registered_session) = registration.get("session").and_then(Val::as_str) else {
+        return Ok(RetirementEvidence::Held {
+            detail: "the registration evidence carries no session identity".to_string(),
+        });
+    };
+    let Some(registered_generation) = registration.get("generation").and_then(Val::as_int) else {
+        return Ok(RetirementEvidence::Held {
+            detail: "the registration evidence carries no generation".to_string(),
+        });
+    };
+    if let Some(process) = process {
+        return Ok(if process == target.process {
+            RetirementEvidence::Held {
+                detail: format!(
+                    "the bound source process {process:?} is still present; the retirement \
+                     cannot be confirmed and nothing further is signalled"
+                ),
+            }
+        } else {
+            RetirementEvidence::Reused {
+                detail: format!(
+                    "a different process {process:?} holds the bound session {:?} (reused \
+                     process identity); the retirement cannot be confirmed",
+                    target.session
+                ),
+            }
+        });
+    }
+    if registered_session != target.session || registered_generation != generation {
+        return Ok(RetirementEvidence::Reused {
+            detail: format!(
+                "stale registration: session {registered_session:?} generation \
+                 {registered_generation} owns a registration, not the bound session {:?} \
+                 generation {generation}",
+                target.session
+            ),
+        });
+    }
+    Ok(match registered_state {
+        "active" => RetirementEvidence::Held {
+            detail: format!(
+                "the registration is still active for session {:?} generation {generation}; \
+                 the retirement cannot be confirmed",
+                target.session
+            ),
+        },
+        "released" => RetirementEvidence::Retired,
+        other => RetirementEvidence::Held {
+            detail: format!(
+                "unknown registration state {other:?}; the retirement cannot be \
+                             confirmed"
+            ),
+        },
+    })
+}
+
+/// Build a retirement result with the wall time already measured.
+#[allow(clippy::too_many_arguments)]
+fn retirement_result(
+    profile: &Profile,
+    target: &RetirementTarget,
+    op: Op,
+    status: &'static str,
+    code: Option<&'static str>,
+    message: Option<String>,
+    payload: Option<Val>,
+    detail: Option<String>,
+    started: std::time::Instant,
+) -> OpResult {
+    OpResult {
+        profile_key: profile.key.clone(),
+        session_id: target.session.clone(),
+        op,
+        status,
+        code,
+        message: message.map(|m| redact(&m)),
+        payload,
+        detail: detail.map(|d| redact(&d)),
+        elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+    }
+}
+
 /// The session-state payload fields the adapter contract reads back from
 /// the workspace (whitelisted; everything else in the read-back document is
 /// ignored).
@@ -2422,5 +2731,214 @@ mod tests {
             herdr_lifecycle_report(&result_for(Op::Identity, "succeeded", None)),
             None
         );
+    }
+
+    /// A temporary bin directory holding one fake `herdr` workspace
+    /// executable; removed on drop. The body is trusted test code (never
+    /// untrusted payload text).
+    struct FakeWorkspace {
+        dir: PathBuf,
+    }
+
+    impl FakeWorkspace {
+        fn new(name: &str, body: &str) -> FakeWorkspace {
+            let dir = std::env::temp_dir().join(format!("hf-ws-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create fake bin dir");
+            let path = dir.join(WORKSPACE_EXECUTABLE);
+            // The allowlisted environment carries only the fake bin dir on
+            // PATH, so the script sets its own utility PATH explicitly
+            // (shell builtins alone cannot wait).
+            std::fs::write(&path, format!("#!/bin/sh\nPATH=/usr/bin:/bin\n{body}\n"))
+                .expect("write fake executable");
+            let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                permissions.set_mode(0o755);
+            }
+            std::fs::set_permissions(&path, permissions).expect("chmod");
+            FakeWorkspace { dir }
+        }
+
+        fn env(&self) -> BTreeMap<String, String> {
+            env_with_path(&[self.dir.to_str().expect("utf-8 path")])
+        }
+    }
+
+    impl Drop for FakeWorkspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn retirement_target() -> RetirementTarget {
+        RetirementTarget {
+            session: "sess-0001".to_string(),
+            process: "proc-0001".to_string(),
+        }
+    }
+
+    fn evidence_doc(json: &str) -> Val {
+        Val::parse_json(json).expect("evidence doc")
+    }
+
+    #[test]
+    fn retirement_stop_requires_the_interrupt_capability_and_runs_the_stop_row() {
+        let fake = FakeWorkspace::new("stop-ok", "echo '{\"interrupted\":true}'");
+        let target = retirement_target();
+        let profile = Profile::official(HarnessKind::Pi, "pi").expect("profile");
+        let result = retirement_stop(&profile, &target, &fake.env(), ADAPTER_TIMEOUT);
+        assert_eq!(result.status, "succeeded", "{:?}", result.detail);
+        assert_eq!(result.op, Op::Interrupt);
+        assert_eq!(result.session_id, "sess-0001");
+        assert!(
+            result
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("interrupted"))
+                .and_then(Val::as_bool)
+                .unwrap_or(false)
+        );
+        let unsupported = Profile::argv(
+            "lane-a",
+            "hf-lane",
+            &[Op::Observe.capability()],
+            BTreeMap::new(),
+        )
+        .expect("argv profile");
+        let refused = retirement_stop(&unsupported, &target, &fake.env(), ADAPTER_TIMEOUT);
+        assert_eq!(refused.status, "refused");
+        assert_eq!(refused.code, Some(CODE_UNKNOWN_CAPABILITY));
+    }
+
+    #[test]
+    fn retirement_stop_is_bounded_and_reports_unknown_delivery_on_failure() {
+        let sleeper = FakeWorkspace::new("stop-sleep", "exec sleep 5");
+        let target = retirement_target();
+        let profile = Profile::official(HarnessKind::Pi, "pi").expect("profile");
+        let bounded = retirement_stop(
+            &profile,
+            &target,
+            &sleeper.env(),
+            Duration::from_millis(150),
+        );
+        assert_eq!(bounded.status, "ambiguous", "{:?}", bounded.detail);
+        assert_eq!(bounded.code, Some(CODE_TIMEOUT));
+        let failing = FakeWorkspace::new("stop-fail", "echo 'no' >&2; exit 3");
+        let failed = retirement_stop(&profile, &target, &failing.env(), ADAPTER_TIMEOUT);
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.code, Some(CODE_EXIT));
+    }
+
+    #[test]
+    fn retirement_evidence_classifies_the_closed_evidence_grammar() {
+        let target = retirement_target();
+        let retired = classify_retirement_evidence(
+            &evidence_doc(
+                "{\"session_id\":\"sess-0001\",\"state\":\"retired\",\"process\":null,\
+                 \"registration\":{\"state\":\"released\",\"session\":\"sess-0001\",\
+                 \"generation\":1}}",
+            ),
+            &target,
+            1,
+        )
+        .expect("classification");
+        assert_eq!(retired, RetirementEvidence::Retired);
+        // A read-back label (`done`) is never sufficient: the bound process is
+        // still present, so the retirement holds.
+        let labelled = classify_retirement_evidence(
+            &evidence_doc(
+                "{\"session_id\":\"sess-0001\",\"state\":\"done\",\"process\":\"proc-0001\",\
+                 \"registration\":{\"state\":\"released\",\"session\":\"sess-0001\",\
+                 \"generation\":1}}",
+            ),
+            &target,
+            1,
+        )
+        .expect("classification");
+        assert!(matches!(labelled, RetirementEvidence::Held { .. }));
+        // A different process under the bound session is a reused identity.
+        let reused_process = classify_retirement_evidence(
+            &evidence_doc(
+                "{\"session_id\":\"sess-0001\",\"process\":\"proc-9\",\
+                 \"registration\":{\"state\":\"released\",\"session\":\"sess-0001\",\
+                 \"generation\":1}}",
+            ),
+            &target,
+            1,
+        )
+        .expect("classification");
+        assert!(matches!(reused_process, RetirementEvidence::Reused { .. }));
+        // Unknown/missing evidence holds.
+        for doc in [
+            "{\"session_id\":\"sess-0001\",\"registration\":{\"state\":\"released\",\
+              \"session\":\"sess-0001\",\"generation\":1}}",
+            "{\"session_id\":\"sess-0001\",\"process\":7,\
+              \"registration\":{\"state\":\"released\",\"session\":\"sess-0001\",\
+              \"generation\":1}}",
+            "{\"session_id\":\"sess-0001\",\"process\":null}",
+            "{\"process\":null}",
+            "{\"session_id\":\"sess-0001\",\"process\":null,\
+              \"registration\":{\"state\":\"active\",\"session\":\"sess-0001\",\
+              \"generation\":1}}",
+            "{\"session_id\":\"sess-0001\",\"process\":null,\
+              \"registration\":{\"state\":\"quarantined\",\"session\":\"sess-0001\",\
+              \"generation\":1}}",
+        ] {
+            let verdict = classify_retirement_evidence(&evidence_doc(doc), &target, 1)
+                .expect("classification");
+            assert!(
+                matches!(verdict, RetirementEvidence::Held { .. }),
+                "{doc}: {verdict:?}"
+            );
+        }
+        // A stale registration (another session or generation) and a
+        // read-back naming another session fail closed as reused.
+        for doc in [
+            "{\"session_id\":\"sess-0001\",\"process\":null,\
+              \"registration\":{\"state\":\"released\",\"session\":\"sess-0002\",\
+              \"generation\":1}}",
+            "{\"session_id\":\"sess-0001\",\"process\":null,\
+              \"registration\":{\"state\":\"released\",\"session\":\"sess-0001\",\
+              \"generation\":2}}",
+            "{\"session_id\":\"sess-0002\",\"process\":null,\
+              \"registration\":{\"state\":\"released\",\"session\":\"sess-0002\",\
+              \"generation\":1}}",
+        ] {
+            let verdict = classify_retirement_evidence(&evidence_doc(doc), &target, 1)
+                .expect("classification");
+            assert!(
+                matches!(verdict, RetirementEvidence::Reused { .. }),
+                "{doc}: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retirement_evidence_reads_the_workspace_confirmation_row() {
+        let fake = FakeWorkspace::new(
+            "evidence-ok",
+            "printf '%s' '{\"session_id\":\"sess-0001\",\"process\":null,\"registration\":{\"state\":\"released\",\"session\":\"sess-0001\",\"generation\":1}}'",
+        );
+        let target = retirement_target();
+        let profile = Profile::official(HarnessKind::Pi, "pi").expect("profile");
+        let evidence = retirement_evidence(&profile, &target, 1, &fake.env(), ADAPTER_TIMEOUT)
+            .expect("evidence");
+        assert_eq!(evidence, RetirementEvidence::Retired);
+        let unsupported = Profile::argv(
+            "lane-a",
+            "hf-lane",
+            &[Op::Interrupt.capability()],
+            BTreeMap::new(),
+        )
+        .expect("argv profile");
+        let err = retirement_evidence(&unsupported, &target, 1, &fake.env(), ADAPTER_TIMEOUT)
+            .expect_err("unsupported profile refused");
+        assert_eq!(err.code, CODE_UNKNOWN_CAPABILITY);
+        let failing = FakeWorkspace::new("evidence-fail", "exit 4");
+        let err = retirement_evidence(&profile, &target, 1, &failing.env(), ADAPTER_TIMEOUT)
+            .expect_err("unavailable evidence holds");
+        assert_eq!(err.code, CODE_EXIT);
     }
 }

@@ -210,6 +210,37 @@ release process activates (docs/RELEASING.md), then semver applies.
   completion events without altering them. No spawn/kill/Git effect, no
   grant, no scheduler, and no automatic trigger exists on the surface.
 
+### Added (issue #75 — Guarded single-session retirement)
+
+- One guarded retirement of a single checkpointed source session
+  (`lane.retire` RPC, no schema change): the request binds the record's lane
+  generation, source session/process identity and the committed checkpoint
+  digest, and a changed identity, checkpoint or paused (`held`) state
+  refuses BEFORE any effect (`refusal.retirement.binding` — nothing is
+  signalled). The immediate pre-stop quiescence recheck must observe every
+  child `exited` and no active external execution; unknown child activity or
+  an unknown process identity holds (`refusal.retirement.held`), and a hold
+  writes nothing, kills nothing and never addresses a process group.
+- The graceful stop is ONE bounded request over the existing workspace
+  (Herdr) session adapter row (`session interrupt <session> --json`), with
+  no retry, no SIGKILL, no broad pattern, no process-group signal and no
+  authority escalation in the slice; a stop that never ran refuses
+  (`refusal.unavailable.harness`) and an unconfirmed delivery holds and
+  parks the record `ambiguous`. Adapter profiles that do not declare the
+  required `interrupt` + `observe` capabilities are unsupported and refuse
+  with `unknown.capability` before the claim.
+- The retirement is confirmed by backend evidence only — the process is
+  absent AND the ownership/registration is released for the bound session
+  and generation; a pane text or a `done` label is never read, a reused
+  process/pane or a stale registration fails closed
+  (`refusal.retirement.reused`), and child lanes, worker/reviewer records
+  and worktree bytes are never touched. The `checkpointed` → `retired`
+  transition commits atomically with its history row (the phase transition
+  is the commit marker), and restart reconciliation of an interrupted claim
+  reconciles exact absence without ever repeating a signal — never against a
+  reused identity. Excluded, as the issue requires: successor start,
+  process-tree cleanup, whole-fleet restart and real deployment activation.
+
 ### Changed
 
 - Documentation polish (issue #12, PR #13): security recipe doc line fix

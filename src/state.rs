@@ -400,6 +400,45 @@ pub struct LaneCheckpointRow {
     pub created_at: String,
 }
 
+/// One validated lane retirement plan (issue #75): the durable binding a
+/// retirement effect may act on. The plan is produced by validating the
+/// presented binding (lane generation, source session/process identity,
+/// committed checkpoint digest) and the immediate pre-stop quiescence
+/// recheck against the durable record in one read — BEFORE any effect. The
+/// effect executor must not act on anything the plan does not name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneRetirementPlan {
+    /// The pending `checkpointed` replacement record being retired.
+    pub record: LaneReplacementRow,
+    /// The committed checkpoint the binding's digest was verified against.
+    pub checkpoint: LaneCheckpointRow,
+    /// The instant the immediate pre-stop quiescence recheck observed the
+    /// lane (RFC3339 UTC, from the validated recheck).
+    pub recheck_observed_at: String,
+}
+
+/// The validated retirement binding presented with one retirement request
+/// (the grant-style document that binds the lane generation, the source
+/// session/process identities and the committed checkpoint digest).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetirementBinding {
+    generation: i64,
+    session: String,
+    process: String,
+    checkpoint_digest: String,
+}
+
+/// The validated immediate pre-stop quiescence recheck: the observed source
+/// identity, the observed child commands and the external-execution state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetirementRecheck {
+    observed_at: String,
+    session: String,
+    process: Option<String>,
+    children: Vec<(String, String)>,
+    active: bool,
+}
+
 /// The daemon-owned state handle. All methods serialize on an internal
 /// mutex (one writer); a failed write poisons the handle (fail closed).
 pub struct State {
@@ -2671,6 +2710,365 @@ impl State {
         .map_err(|err| StateError::from_sqlite("lane_checkpoint_by_replacement: query", err))
     }
 
+    /// Validate one lane retirement request (issue #75) BEFORE any effect.
+    ///
+    /// The presented binding (lane generation, source session/process
+    /// identity, committed checkpoint digest) must match the durable record
+    /// and the checkpoint that completes it; the record must be a pending
+    /// `checkpointed` handoff (a `held` record is the paused state and
+    /// refuses, as do cancelled and ambiguous records); and the immediate
+    /// pre-stop quiescence recheck must have observed every child exited, no
+    /// active external execution, and the bound process identity. A changed
+    /// identity or checkpoint refuses (`refusal.retirement.binding`); unknown
+    /// child activity or an unknown process identity is a typed hold
+    /// (`refusal.retirement.held`) — nothing is signalled, killed or cleaned
+    /// up to obtain quiescence. Read-only: no state is written.
+    pub fn begin_lane_retirement(&self, params: &Val) -> Result<LaneRetirementPlan, StateError> {
+        let request = retirement_request(params)?;
+        let conn = self.lock("begin_lane_retirement")?;
+        let record: Option<LaneReplacementRow> = conn
+            .query_row(
+                "SELECT replacement_id, lane_id, generation, successor_generation,
+                        phase, outcome, outcome_reason, source_session, source_process,
+                        role, worktree, reason, created_at, updated_at
+                   FROM lane_replacements WHERE replacement_id = ?1",
+                params![request.replacement_id.as_str()],
+                lane_replacement_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("begin_lane_retirement: lookup", err))?;
+        let Some(record) = record else {
+            return Err(state_error(
+                "state.not_found",
+                format!("no lane replacement {:?}", request.replacement_id),
+            ));
+        };
+        match record.outcome.as_str() {
+            "pending" => {}
+            "held" => {
+                let reason = if record.outcome_reason.is_empty() {
+                    "no reason recorded"
+                } else {
+                    record.outcome_reason.as_str()
+                };
+                return Err(state_error(
+                    replacement_code::HELD,
+                    format!(
+                        "replacement {} is held (paused): {reason}",
+                        record.replacement_id
+                    ),
+                ));
+            }
+            "ambiguous" => {
+                return Err(state_error(
+                    replacement_code::AMBIGUOUS,
+                    format!(
+                        "replacement {} was left ambiguous by an interrupted transition; \
+                         external reconciliation is required before it can be retired",
+                        record.replacement_id
+                    ),
+                ));
+            }
+            _ => {
+                return Err(state_error(
+                    replacement_code::INVALIDATED,
+                    format!(
+                        "replacement {} was cancelled (invalidated); it can never be retired",
+                        record.replacement_id
+                    ),
+                ));
+            }
+        }
+        if record.phase != "checkpointed" {
+            return Err(state_error(
+                replacement_code::ORDER,
+                format!(
+                    "retirement requires the `checkpointed` handoff boundary (capture the \
+                     checkpoint first); replacement {} is at {:?}",
+                    record.replacement_id, record.phase
+                ),
+            ));
+        }
+        if request.binding.generation != record.generation {
+            return Err(state_error(
+                retirement_code::BINDING,
+                format!(
+                    "the retirement binding generation {} does not match replacement {} \
+                     generation {}",
+                    request.binding.generation, record.replacement_id, record.generation
+                ),
+            ));
+        }
+        if request.binding.session != record.source_session {
+            return Err(state_error(
+                retirement_code::BINDING,
+                format!(
+                    "the retirement binding session {:?} does not match the source session {:?} \
+                     bound by replacement {} (a changed identity refuses before any effect)",
+                    request.binding.session, record.source_session, record.replacement_id
+                ),
+            ));
+        }
+        if request.binding.process != record.source_process {
+            return Err(state_error(
+                retirement_code::BINDING,
+                format!(
+                    "the retirement binding process {:?} does not match the source process {:?} \
+                     bound by replacement {} (a changed identity refuses before any effect)",
+                    request.binding.process, record.source_process, record.replacement_id
+                ),
+            ));
+        }
+        let checkpoint: Option<LaneCheckpointRow> = conn
+            .query_row(
+                "SELECT checkpoint_id, replacement_id, lane_id, generation, role,
+                        observation_digest, reobservation_digest, snapshot, digest,
+                        brief_digest, created_at
+                   FROM lane_checkpoints WHERE replacement_id = ?1",
+                params![request.replacement_id.as_str()],
+                lane_checkpoint_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("begin_lane_retirement: checkpoint", err))?;
+        let Some(checkpoint) = checkpoint else {
+            return Err(state_error(
+                "state.replacement_invalid",
+                format!(
+                    "replacement {} is checkpointed but no committed checkpoint records it; \
+                     external reconciliation is required",
+                    record.replacement_id
+                ),
+            ));
+        };
+        if checkpoint.generation != record.generation
+            || checkpoint.digest != request.binding.checkpoint_digest
+        {
+            return Err(state_error(
+                retirement_code::BINDING,
+                format!(
+                    "the retirement binding checkpoint digest {} does not match the committed \
+                     checkpoint {} for replacement {} (digest {}); changed evidence refuses \
+                     before any effect",
+                    request.binding.checkpoint_digest,
+                    checkpoint.checkpoint_id,
+                    record.replacement_id,
+                    checkpoint.digest
+                ),
+            ));
+        }
+        // The immediate pre-stop quiescence recheck (AC2). Unknown child
+        // activity or an unknown process identity HOLDS; a changed identity
+        // refuses as a binding mismatch; nothing is signalled, killed, or
+        // cleaned up to obtain quiescence and no broad process group is ever
+        // addressed.
+        if request.recheck.session != record.source_session {
+            return Err(state_error(
+                retirement_code::BINDING,
+                format!(
+                    "the pre-stop recheck observed session {:?}, not the source session {:?} \
+                     bound by replacement {} (a changed identity refuses before any effect)",
+                    request.recheck.session, record.source_session, record.replacement_id
+                ),
+            ));
+        }
+        let Some(observed_process) = request.recheck.process.as_deref() else {
+            return Err(state_error(
+                retirement_code::HELD,
+                format!(
+                    "the pre-stop recheck carries no process identity for session {:?} (an \
+                     unknown process identity holds; nothing is signalled)",
+                    record.source_session
+                ),
+            ));
+        };
+        if observed_process != record.source_process {
+            return Err(state_error(
+                retirement_code::BINDING,
+                format!(
+                    "the pre-stop recheck observed process {:?}, not the source process {:?} \
+                     bound by replacement {} (a changed identity refuses before any effect)",
+                    observed_process, record.source_process, record.replacement_id
+                ),
+            ));
+        }
+        if request.recheck.active {
+            return Err(state_error(
+                retirement_code::HELD,
+                format!(
+                    "the pre-stop recheck observed external harness execution still active for \
+                     session {:?}; retirement holds (nothing is signalled, killed, or cleaned up)",
+                    record.source_session
+                ),
+            ));
+        }
+        for (command, state) in &request.recheck.children {
+            if state != "exited" {
+                return Err(state_error(
+                    retirement_code::HELD,
+                    format!(
+                        "the pre-stop recheck observed child command {command:?} in state \
+                         {state:?}: unknown child activity holds retirement (nothing is \
+                         signalled, killed, or cleaned up)"
+                    ),
+                ));
+            }
+        }
+        Ok(LaneRetirementPlan {
+            record,
+            checkpoint,
+            recheck_observed_at: request.recheck.observed_at,
+        })
+    }
+
+    /// Commit one lane retirement (issue #75): the record's `checkpointed` →
+    /// `retired` transition and its transition-history row commit in ONE
+    /// transaction, fenced on the exact generation/phase/outcome and on the
+    /// committed checkpoint digest (a missed fence is classified typed and
+    /// changes nothing). `reason` is the bounded durable evidence summary —
+    /// never silently truncated.
+    pub fn commit_lane_retirement(
+        &self,
+        replacement_id: &str,
+        generation: i64,
+        checkpoint_digest: &str,
+        reason: &str,
+        at: &str,
+    ) -> Result<LaneReplacementRow, StateError> {
+        let outcome = self.commit_lane_retirement_inner(
+            replacement_id,
+            generation,
+            checkpoint_digest,
+            reason,
+            at,
+        );
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn commit_lane_retirement_inner(
+        &self,
+        replacement_id: &str,
+        generation: i64,
+        checkpoint_digest: &str,
+        reason: &str,
+        at: &str,
+    ) -> Result<LaneReplacementRow, StateError> {
+        if !printable_bounded(reason, RETIREMENT_REASON_MAX) {
+            return Err(state_error(
+                "state.replacement_invalid",
+                format!(
+                    "the retirement reason must be 1-{RETIREMENT_REASON_MAX} printable \
+                     characters (the durable evidence summary is never truncated)"
+                ),
+            ));
+        }
+        self.ensure_writable()?;
+        {
+            let mut conn = self.lock("commit_lane_retirement")?;
+            let tx = conn
+                .transaction()
+                .map_err(|err| StateError::from_sqlite("commit_lane_retirement: begin", err))?;
+            let row: Option<LaneReplacementRow> = tx
+                .query_row(
+                    "SELECT replacement_id, lane_id, generation, successor_generation,
+                            phase, outcome, outcome_reason, source_session, source_process,
+                            role, worktree, reason, created_at, updated_at
+                       FROM lane_replacements WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_replacement_row_from,
+                )
+                .optional()
+                .map_err(|err| StateError::from_sqlite("commit_lane_retirement: lookup", err))?;
+            let Some(row) = row else {
+                return Err(state_error(
+                    "state.not_found",
+                    format!("no lane replacement {replacement_id:?}"),
+                ));
+            };
+            if row.phase != "checkpointed"
+                || row.outcome != "pending"
+                || row.generation != generation
+            {
+                return Err(lane_replacement_transition_refusal(
+                    Some(&row),
+                    replacement_id,
+                    "checkpointed",
+                    generation,
+                ));
+            }
+            let recorded: Option<String> = tx
+                .query_row(
+                    "SELECT digest FROM lane_checkpoints WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|err| {
+                    StateError::from_sqlite("commit_lane_retirement: checkpoint", err)
+                })?;
+            match recorded {
+                Some(digest) if digest == checkpoint_digest => {}
+                Some(digest) => {
+                    return Err(state_error(
+                        retirement_code::BINDING,
+                        format!(
+                            "the retirement commit checkpoint digest {checkpoint_digest} does \
+                             not match the committed checkpoint digest {digest} for replacement \
+                             {replacement_id}"
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(state_error(
+                        "state.replacement_invalid",
+                        format!(
+                            "replacement {replacement_id} has no committed checkpoint; the \
+                             retirement commit refuses (external reconciliation is required)"
+                        ),
+                    ));
+                }
+            }
+            let affected = tx
+                .execute(
+                    "UPDATE lane_replacements
+                        SET phase = 'retired', updated_at = ?1
+                      WHERE replacement_id = ?2 AND phase = 'checkpointed'
+                            AND generation = ?3 AND outcome = 'pending'",
+                    params![at, replacement_id, generation],
+                )
+                .map_err(|err| StateError::from_sqlite("commit_lane_retirement: update", err))?;
+            if affected != 1 {
+                return Err(state_error(
+                    "state.replacement_invalid",
+                    format!(
+                        "the retirement commit lost its compare-and-set fence on \
+                         {replacement_id}; external reconciliation is required"
+                    ),
+                ));
+            }
+            append_lane_replacement_event(
+                &tx,
+                replacement_id,
+                Some("checkpointed"),
+                "retired",
+                Some("pending"),
+                "pending",
+                reason,
+                at,
+            )?;
+            tx.commit()
+                .map_err(|err| StateError::from_sqlite("commit_lane_retirement: commit", err))?;
+        }
+        self.lane_replacement_by_id(replacement_id)?.ok_or_else(|| {
+            state_error(
+                "state.not_found",
+                "replacement vanished after the retirement commit",
+            )
+        })
+    }
+
     /// Restart-reconciliation hook (issue #73 AC5/AC6): an interrupted
     /// lane-replacement claim marks its record `ambiguous` — the explicit
     /// "unknown, external reconciliation required" outcome — unless the
@@ -3342,6 +3740,230 @@ fn lane_replacement_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneRe
         reason: row.get(11)?,
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
+    })
+}
+
+/// The parsed retirement request: the record identity, the grant-style
+/// binding and the immediate pre-stop quiescence recheck.
+struct RetirementRequest {
+    replacement_id: String,
+    binding: RetirementBinding,
+    recheck: RetirementRecheck,
+}
+
+/// Parse one retirement request's params. Every bound value and every
+/// recheck field is required and bounded. The binding contract is closed: a
+/// missing, invalid or unknown binding field refuses
+/// (`refusal.retirement.binding`). The recheck contract is closed too, but
+/// its unknown/missing quiescence evidence is a typed HOLD
+/// (`refusal.retirement.held`) — an unknown child or process state is never
+/// inferred, and nothing is signalled to obtain quiescence.
+fn retirement_request(params: &Val) -> Result<RetirementRequest, StateError> {
+    let replacement_id = match params.get("replacement_id").and_then(Val::as_str) {
+        Some(text) if crate::formats::is_replacement_id(text) => text.to_string(),
+        _ => {
+            return Err(state_error(
+                retirement_code::BINDING,
+                "a retirement requires params.replacement_id (rp_ + 16 hex)",
+            ));
+        }
+    };
+    let binding = match params.get("binding") {
+        Some(Val::Obj(map)) => map,
+        _ => {
+            return Err(state_error(
+                retirement_code::BINDING,
+                "a retirement requires params.binding (object: generation, session, process, \
+                 checkpoint_digest)",
+            ));
+        }
+    };
+    for key in binding.keys() {
+        if !["generation", "session", "process", "checkpoint_digest"].contains(&key.as_str()) {
+            return Err(state_error(
+                retirement_code::BINDING,
+                format!("binding carries unknown field {key:?}; the binding contract is closed"),
+            ));
+        }
+    }
+    let generation = match binding.get("generation").and_then(Val::as_int) {
+        Some(generation) if generation >= 1 => generation,
+        _ => {
+            return Err(state_error(
+                retirement_code::BINDING,
+                "binding.generation must be a positive integer",
+            ));
+        }
+    };
+    let session = match binding.get("session").and_then(Val::as_str) {
+        Some(text) if crate::formats::is_actor(text) => text.to_string(),
+        _ => {
+            return Err(state_error(
+                retirement_code::BINDING,
+                "binding.session must be the source session identity (actor)",
+            ));
+        }
+    };
+    let process = match binding.get("process").and_then(Val::as_str) {
+        Some(text) if crate::formats::is_actor(text) => text.to_string(),
+        _ => {
+            return Err(state_error(
+                retirement_code::BINDING,
+                "binding.process must be the source process identity (actor)",
+            ));
+        }
+    };
+    let checkpoint_digest = match binding.get("checkpoint_digest").and_then(Val::as_str) {
+        Some(text) if crate::formats::is_hex64(text) => text.to_string(),
+        _ => {
+            return Err(state_error(
+                retirement_code::BINDING,
+                "binding.checkpoint_digest must be the committed checkpoint digest (64-hex \
+                 sha256)",
+            ));
+        }
+    };
+    let recheck = match params.get("recheck") {
+        Some(Val::Obj(map)) => map,
+        _ => {
+            return Err(state_error(
+                retirement_code::HELD,
+                "a retirement requires params.recheck (the immediate pre-stop quiescence \
+                 recheck)",
+            ));
+        }
+    };
+    for key in recheck.keys() {
+        if !["observed_at", "session", "process", "children", "active"].contains(&key.as_str()) {
+            return Err(state_error(
+                retirement_code::HELD,
+                format!(
+                    "the recheck carries unknown field {key:?}; the recheck contract is \
+                         closed"
+                ),
+            ));
+        }
+    }
+    let observed_at = match recheck.get("observed_at").and_then(Val::as_str) {
+        Some(text) if crate::formats::is_rfc3339_seconds_z(text) => text.to_string(),
+        _ => {
+            return Err(state_error(
+                retirement_code::HELD,
+                "recheck.observed_at must be an RFC3339 UTC (seconds, Z) timestamp (unknown \
+                 evidence holds)",
+            ));
+        }
+    };
+    let recheck_session = match recheck.get("session").and_then(Val::as_str) {
+        Some(text) if crate::formats::is_actor(text) => text.to_string(),
+        _ => {
+            return Err(state_error(
+                retirement_code::HELD,
+                "recheck.session must be the observed source session identity (unknown \
+                 evidence holds)",
+            ));
+        }
+    };
+    let recheck_process = match recheck.get("process") {
+        Some(Val::Null) => None,
+        Some(Val::Str(text)) if crate::formats::is_actor(text) => Some(text.to_string()),
+        _ => {
+            return Err(state_error(
+                retirement_code::HELD,
+                "recheck.process must be the observed process identity or null (an unknown \
+                 process identity holds; nothing is signalled)",
+            ));
+        }
+    };
+    let child_items = match recheck.get("children") {
+        Some(Val::Arr(items)) => items,
+        _ => {
+            return Err(state_error(
+                retirement_code::HELD,
+                "recheck.children must be an array of observed child commands (unknown \
+                 evidence holds)",
+            ));
+        }
+    };
+    if child_items.len() > RETIREMENT_RECHECK_CHILDREN_MAX {
+        return Err(state_error(
+            retirement_code::HELD,
+            format!(
+                "recheck.children carries {} entries; at most \
+                 {RETIREMENT_RECHECK_CHILDREN_MAX} are considered (unknown evidence holds)",
+                child_items.len()
+            ),
+        ));
+    }
+    let mut children = Vec::new();
+    for item in child_items {
+        let Val::Obj(entry) = item else {
+            return Err(state_error(
+                retirement_code::HELD,
+                "every recheck child entry must be an object (command, state)",
+            ));
+        };
+        for key in entry.keys() {
+            if !["command", "state"].contains(&key.as_str()) {
+                return Err(state_error(
+                    retirement_code::HELD,
+                    format!(
+                        "a recheck child entry carries unknown field {key:?}; the child \
+                             contract is closed"
+                    ),
+                ));
+            }
+        }
+        let command = match entry.get("command").and_then(Val::as_str) {
+            Some(text) if printable_bounded(text, RETIREMENT_CHILD_COMMAND_MAX) => text.to_string(),
+            _ => {
+                return Err(state_error(
+                    retirement_code::HELD,
+                    format!(
+                        "a recheck child command must be a non-empty printable string of at \
+                         most {RETIREMENT_CHILD_COMMAND_MAX} characters (unknown evidence holds)"
+                    ),
+                ));
+            }
+        };
+        let state = match entry.get("state").and_then(Val::as_str) {
+            Some(text) if CHECKPOINT_CHILD_STATES.contains(&text) => text.to_string(),
+            _ => {
+                return Err(state_error(
+                    retirement_code::HELD,
+                    format!(
+                        "a recheck child state must be one of {CHECKPOINT_CHILD_STATES:?} \
+                         (unknown child activity holds)"
+                    ),
+                ));
+            }
+        };
+        children.push((command, state));
+    }
+    let active = match recheck.get("active") {
+        Some(Val::Bool(active)) => *active,
+        _ => {
+            return Err(state_error(
+                retirement_code::HELD,
+                "recheck.active must be a boolean (unknown execution evidence holds)",
+            ));
+        }
+    };
+    Ok(RetirementRequest {
+        replacement_id,
+        binding: RetirementBinding {
+            generation,
+            session,
+            process,
+            checkpoint_digest,
+        },
+        recheck: RetirementRecheck {
+            observed_at,
+            session: recheck_session,
+            process: recheck_process,
+            children,
+            active,
+        },
     })
 }
 
@@ -4779,6 +5401,38 @@ pub mod checkpoint_code {
     /// checkpoint refuses.
     pub const INCOMPLETE: &str = "refusal.checkpoint.incomplete";
 }
+
+/// Typed refusal codes for lane retirement (issue #75). Same dotted
+/// `refusal.*` vocabulary as the replacement and checkpoint codes; produced
+/// by this layer so RPC responses carry them unchanged.
+pub mod retirement_code {
+    /// The retirement binding does not match the durable record or its
+    /// committed checkpoint: the lane generation, the source session/process
+    /// identity, or the checkpoint digest moved since the record was
+    /// written. Refused BEFORE any effect — nothing is signalled.
+    pub const BINDING: &str = "refusal.retirement.binding";
+    /// A hold: the immediate pre-stop recheck cannot establish quiescence
+    /// (unknown child activity or an unknown process identity), the bounded
+    /// graceful stop did not confirm delivery, or the confirmation cannot
+    /// prove absence. Nothing beyond the single bounded stop request is
+    /// attempted and no authority is escalated.
+    pub const HELD: &str = "refusal.retirement.held";
+    /// Backend evidence contradicts the retirement with a reused identity (a
+    /// different process holds the bound session, the read-back names
+    /// another session, or a stale registration owns the session): fail
+    /// closed — external reconciliation is required.
+    pub const REUSED: &str = "refusal.retirement.reused";
+}
+
+/// Content bounds for one retirement request. The binding is bounded like
+/// every other lane contract; the transition reason is bounded so a durable
+/// evidence summary is never silently truncated.
+/// Maximum recheck child entries considered by one retirement request.
+pub const RETIREMENT_RECHECK_CHILDREN_MAX: usize = 16;
+/// Enforced byte bound of one retirement transition reason.
+pub const RETIREMENT_REASON_MAX: usize = 300;
+/// Enforced byte bound of one recheck child command text.
+pub const RETIREMENT_CHILD_COMMAND_MAX: usize = 200;
 
 /// Content bounds for one checkpoint observation. Every field is bounded
 /// up front; the generated brief additionally enforces a total size bound
@@ -7269,5 +7923,314 @@ mod tests {
                 .expect("read"),
             None
         );
+    }
+
+    /// Request + advance + capture one replacement to the `checkpointed`
+    /// boundary: the precondition of every retirement test.
+    fn checkpointed_replacement(
+        state: &State,
+        lane: &str,
+        at: &str,
+        key: &str,
+    ) -> (LaneReplacementRow, LaneCheckpointRow) {
+        let record = quiescing_replacement(state, lane, at);
+        let observation = sample_checkpoint_observation();
+        let (checkpoint, updated, _) = state
+            .commit_lane_checkpoint(
+                &record.replacement_id,
+                1,
+                &observation,
+                &observation,
+                key,
+                at,
+            )
+            .expect("checkpoint");
+        assert_eq!(updated.phase, "checkpointed");
+        (updated, checkpoint)
+    }
+
+    fn retirement_binding(
+        generation: i64,
+        session: &str,
+        process: &str,
+        checkpoint_digest: &str,
+    ) -> Val {
+        object(vec![
+            ("generation", integer(generation)),
+            ("session", string(session)),
+            ("process", string(process)),
+            ("checkpoint_digest", string(checkpoint_digest)),
+        ])
+    }
+
+    fn retirement_recheck(
+        session: &str,
+        process: Option<&str>,
+        children: Vec<(&str, &str)>,
+        active: bool,
+    ) -> Val {
+        object(vec![
+            ("observed_at", string("2026-09-12T00:00:00Z")),
+            ("session", string(session)),
+            ("process", process.map(string).unwrap_or_else(null)),
+            (
+                "children",
+                Val::Arr(
+                    children
+                        .into_iter()
+                        .map(|(command, state)| {
+                            object(vec![("command", string(command)), ("state", string(state))])
+                        })
+                        .collect(),
+                ),
+            ),
+            ("active", bool_(active)),
+        ])
+    }
+
+    fn retirement_params(replacement_id: &str, binding: Val, recheck: Val) -> Val {
+        object(vec![
+            ("replacement_id", string(replacement_id)),
+            ("binding", binding),
+            ("recheck", recheck),
+            (
+                "harness",
+                object(vec![("key", string("lane-a")), ("kind", string("pi"))]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn lane_retirement_binds_generation_identity_and_checkpoint_digest() {
+        // Issue #75 AC1/AC2 at the state layer: the binding (lane generation,
+        // source session/process identity, committed checkpoint digest) and
+        // the immediate pre-stop quiescence recheck are validated BEFORE any
+        // effect; a changed identity or checkpoint refuses, unknown child or
+        // process evidence holds, and nothing about the record changes.
+        let path = temp_db("retirement-bind.db");
+        let at = "2026-09-12T00:00:00Z";
+        let state = State::open(&path, Retention::default()).expect("open");
+        let (record, checkpoint) = checkpointed_replacement(&state, "lane-8", at, "ik_cap-8001");
+        let digest = checkpoint.digest.clone();
+
+        // The exact binding passes and names only the plan's own record.
+        let plan = state
+            .begin_lane_retirement(&retirement_params(
+                &record.replacement_id,
+                retirement_binding(1, "sess-0001", "proc-0001", &digest),
+                retirement_recheck("sess-0001", Some("proc-0001"), vec![], false),
+            ))
+            .expect("bound plan");
+        assert_eq!(plan.record.replacement_id, record.replacement_id);
+        assert_eq!(plan.checkpoint.checkpoint_id, checkpoint.checkpoint_id);
+        assert_eq!(plan.recheck_observed_at, at);
+
+        let cases: Vec<(&str, Val, Val, &str)> = vec![
+            (
+                "changed checkpoint digest",
+                retirement_binding(1, "sess-0001", "proc-0001", &"f".repeat(64)),
+                retirement_recheck("sess-0001", Some("proc-0001"), vec![], false),
+                retirement_code::BINDING,
+            ),
+            (
+                "changed binding session",
+                retirement_binding(1, "sess-0009", "proc-0001", &digest),
+                retirement_recheck("sess-0009", Some("proc-0001"), vec![], false),
+                retirement_code::BINDING,
+            ),
+            (
+                "changed binding process",
+                retirement_binding(1, "sess-0001", "proc-0009", &digest),
+                retirement_recheck("sess-0001", Some("proc-0009"), vec![], false),
+                retirement_code::BINDING,
+            ),
+            (
+                "stale binding generation",
+                retirement_binding(2, "sess-0001", "proc-0001", &digest),
+                retirement_recheck("sess-0001", Some("proc-0001"), vec![], false),
+                retirement_code::BINDING,
+            ),
+            (
+                "recheck observed another session",
+                retirement_binding(1, "sess-0001", "proc-0001", &digest),
+                retirement_recheck("sess-0002", Some("proc-0001"), vec![], false),
+                retirement_code::BINDING,
+            ),
+            (
+                "recheck observed another process",
+                retirement_binding(1, "sess-0001", "proc-0001", &digest),
+                retirement_recheck("sess-0001", Some("proc-0002"), vec![], false),
+                retirement_code::BINDING,
+            ),
+            (
+                "unknown process identity",
+                retirement_binding(1, "sess-0001", "proc-0001", &digest),
+                retirement_recheck("sess-0001", None, vec![], false),
+                retirement_code::HELD,
+            ),
+            (
+                "unknown child activity",
+                retirement_binding(1, "sess-0001", "proc-0001", &digest),
+                retirement_recheck(
+                    "sess-0001",
+                    Some("proc-0001"),
+                    vec![("cargo test", "active")],
+                    false,
+                ),
+                retirement_code::HELD,
+            ),
+            (
+                "ambiguous child activity",
+                retirement_binding(1, "sess-0001", "proc-0001", &digest),
+                retirement_recheck(
+                    "sess-0001",
+                    Some("proc-0001"),
+                    vec![("cargo test", "ambiguous")],
+                    false,
+                ),
+                retirement_code::HELD,
+            ),
+            (
+                "execution still active",
+                retirement_binding(1, "sess-0001", "proc-0001", &digest),
+                retirement_recheck("sess-0001", Some("proc-0001"), vec![], true),
+                retirement_code::HELD,
+            ),
+        ];
+        for (what, binding, recheck, code) in cases {
+            let err = state
+                .begin_lane_retirement(&retirement_params(&record.replacement_id, binding, recheck))
+                .expect_err(what);
+            assert_eq!(err.code, code, "{what}: {}", err.message);
+            let unchanged = state
+                .lane_replacement_by_id(&record.replacement_id)
+                .expect("read")
+                .expect("row");
+            assert_eq!(unchanged, record, "{what}: the record is untouched");
+        }
+
+        // Closed contracts: an unknown binding/recheck field refuses and an
+        // unknown child state holds (never inferred).
+        let mut binding = retirement_binding(1, "sess-0001", "proc-0001", &digest);
+        if let Val::Obj(map) = &mut binding {
+            map.insert("lane_id".to_string(), string("lane-8"));
+        }
+        let err = state
+            .begin_lane_retirement(&retirement_params(
+                &record.replacement_id,
+                binding,
+                retirement_recheck("sess-0001", Some("proc-0001"), vec![], false),
+            ))
+            .expect_err("unknown binding field");
+        assert_eq!(err.code, retirement_code::BINDING, "{}", err.message);
+        let err = state
+            .begin_lane_retirement(&retirement_params(
+                &record.replacement_id,
+                retirement_binding(1, "sess-0001", "proc-0001", &digest),
+                retirement_recheck(
+                    "sess-0001",
+                    Some("proc-0001"),
+                    vec![("cargo test", "running")],
+                    false,
+                ),
+            ))
+            .expect_err("unknown child state");
+        assert_eq!(err.code, retirement_code::HELD, "{}", err.message);
+
+        // The paused state refuses before any effect: a held record.
+        let (held, _) = checkpointed_replacement(&state, "lane-9", at, "ik_cap-9001");
+        state
+            .hold_lane_replacement(&held.replacement_id, "operator pause", at)
+            .expect("hold");
+        let err = state
+            .begin_lane_retirement(&retirement_params(
+                &held.replacement_id,
+                retirement_binding(1, "sess-0001", "proc-0001", &"a".repeat(64)),
+                retirement_recheck("sess-0001", Some("proc-0001"), vec![], false),
+            ))
+            .expect_err("held record refuses");
+        assert_eq!(err.code, replacement_code::HELD, "{}", err.message);
+
+        // A record that has not reached the checkpointed boundary refuses.
+        let quiescing = quiescing_replacement(&state, "lane-11", at);
+        let err = state
+            .begin_lane_retirement(&retirement_params(
+                &quiescing.replacement_id,
+                retirement_binding(1, "sess-0001", "proc-0001", &"a".repeat(64)),
+                retirement_recheck("sess-0001", Some("proc-0001"), vec![], false),
+            ))
+            .expect_err("quiescing record refuses");
+        assert_eq!(err.code, replacement_code::ORDER, "{}", err.message);
+    }
+
+    #[test]
+    fn lane_retirement_commit_is_atomic_and_fenced() {
+        // Issue #75 AC1/AC6 at the state layer: the retirement commit is one
+        // transaction (record phase + history), fenced on the committed
+        // checkpoint digest and the exact phase/generation/outcome; a missed
+        // fence changes nothing and is classified typed.
+        let path = temp_db("retirement-commit.db");
+        let at = "2026-09-12T00:00:00Z";
+        let state = State::open(&path, Retention::default()).expect("open");
+        let (record, checkpoint) = checkpointed_replacement(&state, "lane-12", at, "ik_cap-1201");
+        let reason = "retired after one bounded graceful stop: backend process absent";
+
+        // A wrong checkpoint digest refuses and leaves the record untouched.
+        let err = state
+            .commit_lane_retirement(&record.replacement_id, 1, &"f".repeat(64), reason, at)
+            .expect_err("digest fence");
+        assert_eq!(err.code, retirement_code::BINDING, "{}", err.message);
+        let unchanged = state
+            .lane_replacement_by_id(&record.replacement_id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(unchanged, record);
+
+        // An unbounded evidence summary refuses (never silently truncated).
+        let err = state
+            .commit_lane_retirement(
+                &record.replacement_id,
+                1,
+                &checkpoint.digest,
+                &"x".repeat(RETIREMENT_REASON_MAX + 1),
+                at,
+            )
+            .expect_err("oversize reason");
+        assert_eq!(err.code, "state.replacement_invalid", "{}", err.message);
+
+        // The exact fence commits: phase retired + the transition history,
+        // atomically.
+        let retired = state
+            .commit_lane_retirement(&record.replacement_id, 1, &checkpoint.digest, reason, at)
+            .expect("commit");
+        assert_eq!(retired.phase, "retired");
+        assert_eq!(retired.outcome, "pending");
+        assert_eq!(retired.generation, 1);
+        let events = state
+            .lane_replacement_events(&record.replacement_id)
+            .expect("events");
+        let last = events.last().expect("last event");
+        assert_eq!(last.from_phase.as_deref(), Some("checkpointed"));
+        assert_eq!(last.to_phase, "retired");
+        assert_eq!(last.reason, reason);
+        assert_eq!(
+            events.len(),
+            4,
+            "requested (creation) -> quiescing -> checkpointed -> retired is the full history"
+        );
+
+        // A second commit cannot re-apply: the phase fence refuses typed.
+        let err = state
+            .commit_lane_retirement(&record.replacement_id, 1, &checkpoint.digest, reason, at)
+            .expect_err("second commit");
+        assert_eq!(err.code, replacement_code::ORDER, "{}", err.message);
+
+        // Cancellation after retirement is already refused by the record's
+        // own contract (the retirement is terminal for the cancellation
+        // window).
+        let err = state
+            .cancel_lane_replacement(&record.replacement_id, "too late", at)
+            .expect_err("cancel after retirement");
+        assert_eq!(err.code, replacement_code::RETIRED, "{}", err.message);
     }
 }
