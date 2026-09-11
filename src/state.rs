@@ -29,7 +29,7 @@ use crate::time;
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The schema version this binary understands (also `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Bounded-retention defaults (rows kept besides the chain genesis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,6 +304,67 @@ pub struct ScheduleRow {
     pub doc: String,
 }
 
+/// One durable lane replacement record (issue #73): a *request*, never an
+/// effect. The record binds one logical lane generation to its source
+/// owner identity and tracks the replacement phase through the linear
+/// chain [`LANE_REPLACEMENT_PHASES`] via transactional compare-and-set.
+/// Nothing in this slice spawns, kills, or touches Git — the record is the
+/// durable handoff intent a future executor consumes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneReplacementRow {
+    /// Replacement id (`rp_` + 16 hex; deterministic per lane generation).
+    pub replacement_id: String,
+    /// Logical lane identity (slug).
+    pub lane_id: String,
+    /// Source lane generation being replaced (>= 1).
+    pub generation: i64,
+    /// The successor generation slot (`generation + 1`).
+    pub successor_generation: i64,
+    /// Current phase (one of [`LANE_REPLACEMENT_PHASES`]).
+    pub phase: String,
+    /// Explicit outcome (one of [`LANE_REPLACEMENT_OUTCOMES`]).
+    pub outcome: String,
+    /// Bounded reason for a non-pending outcome ('' for `pending`).
+    pub outcome_reason: String,
+    /// Source session identity bound at request time.
+    pub source_session: String,
+    /// Source process identity bound at request time.
+    pub source_process: String,
+    /// Source role (one of [`LANE_REPLACEMENT_ROLES`]).
+    pub role: String,
+    /// Repository-relative worktree reference bound at request time.
+    pub worktree: String,
+    /// Operator reason for the replacement request.
+    pub reason: String,
+    /// Row creation time (RFC3339 UTC).
+    pub created_at: String,
+    /// Last row write time (RFC3339 UTC).
+    pub updated_at: String,
+}
+
+/// One lane replacement transition-history row (issue #73 AC6): state
+/// changes are appended inside the same transaction as the record write, so
+/// a restart replays the exact history and next allowed transition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneReplacementEventRow {
+    /// Monotonic event sequence.
+    pub seq: i64,
+    /// Replacement the event belongs to.
+    pub replacement_id: String,
+    /// Phase before the change (NULL for the creation event).
+    pub from_phase: Option<String>,
+    /// Phase after the change.
+    pub to_phase: String,
+    /// Outcome before the change (NULL for the creation event).
+    pub from_outcome: Option<String>,
+    /// Outcome after the change.
+    pub to_outcome: String,
+    /// Bounded reason ('' when the change carries none).
+    pub reason: String,
+    /// Recorded at (RFC3339 UTC).
+    pub at: String,
+}
+
 /// The daemon-owned state handle. All methods serialize on an internal
 /// mutex (one writer); a failed write poisons the handle (fail closed).
 pub struct State {
@@ -412,6 +473,10 @@ impl State {
         if user_version == M0004_APPLIES_FROM {
             run_m0004(&mut conn)?;
             user_version = M0004_APPLIES_TO;
+        }
+        if user_version == M0005_APPLIES_FROM {
+            run_m0005(&mut conn)?;
+            user_version = M0005_APPLIES_TO;
         }
         match user_version {
             v if v == SCHEMA_VERSION => {
@@ -1806,6 +1871,557 @@ impl State {
     }
 
     // ---------------------------------------------------------------------
+    // Lane replacement records (issue #73: request-only handoff records)
+    // ---------------------------------------------------------------------
+
+    /// Create the one replacement record for a logical lane generation and
+    /// append its creation history row in the same transaction. This is a
+    /// *request*: it persists durable state only — no spawn, kill, or Git
+    /// effect exists on this path. A second record for the same lane
+    /// generation is refused with `refusal.replacement.exists`, so
+    /// concurrent requests can never create two successor owners. Every
+    /// identity binding (session, process, role, worktree, reason) is
+    /// mandatory: missing/empty values refuse here too — never an inferred
+    /// empty lane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_lane_replacement(
+        &self,
+        lane_id: &str,
+        generation: i64,
+        source_session: &str,
+        source_process: &str,
+        role: &str,
+        worktree: &str,
+        reason: &str,
+        at: &str,
+    ) -> Result<LaneReplacementRow, StateError> {
+        let outcome = self.request_lane_replacement_inner(
+            lane_id,
+            generation,
+            source_session,
+            source_process,
+            role,
+            worktree,
+            reason,
+            at,
+        );
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_lane_replacement_inner(
+        &self,
+        lane_id: &str,
+        generation: i64,
+        source_session: &str,
+        source_process: &str,
+        role: &str,
+        worktree: &str,
+        reason: &str,
+        at: &str,
+    ) -> Result<LaneReplacementRow, StateError> {
+        for (field, value) in [
+            ("lane_id", lane_id),
+            ("source_session", source_session),
+            ("source_process", source_process),
+            ("role", role),
+            ("worktree", worktree),
+            ("reason", reason),
+        ] {
+            if value.is_empty() {
+                return Err(state_error(
+                    "state.replacement_invalid",
+                    format!("replacement {field} must be non-empty (refuse, never infer)"),
+                ));
+            }
+        }
+        if generation < 1 {
+            return Err(state_error(
+                "state.replacement_invalid",
+                "replacement generation must be >= 1",
+            ));
+        }
+        if !LANE_REPLACEMENT_ROLES.contains(&role) {
+            return Err(state_error(
+                "state.replacement_invalid",
+                format!("role {role:?} is outside the closed role set"),
+            ));
+        }
+        let replacement_id = replacement_id_for(lane_id, generation);
+        self.ensure_writable()?;
+        {
+            let mut conn = self.lock("request_lane_replacement")?;
+            let tx = conn
+                .transaction()
+                .map_err(|err| StateError::from_sqlite("request_lane_replacement: begin", err))?;
+            let existing: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT replacement_id, phase, outcome FROM lane_replacements
+                      WHERE lane_id = ?1 AND generation = ?2",
+                    params![lane_id, generation],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|err| StateError::from_sqlite("request_lane_replacement: lookup", err))?;
+            if let Some((existing_id, phase, outcome)) = existing {
+                return Err(state_error(
+                    replacement_code::EXISTS,
+                    format!(
+                        "lane {lane_id:?} generation {generation} already has replacement \
+                         {existing_id} ({phase}/{outcome}); a second successor owner cannot be created"
+                    ),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO lane_replacements (replacement_id, lane_id, generation,
+                    successor_generation, phase, outcome, outcome_reason, source_session,
+                    source_process, role, worktree, reason, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'requested', 'pending', '', ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                params![
+                    replacement_id,
+                    lane_id,
+                    generation,
+                    generation + 1,
+                    source_session,
+                    source_process,
+                    role,
+                    worktree,
+                    reason,
+                    at
+                ],
+            )
+            .map_err(|err| StateError::from_sqlite("request_lane_replacement: insert", err))?;
+            append_lane_replacement_event(
+                &tx,
+                &replacement_id,
+                None,
+                "requested",
+                None,
+                "pending",
+                reason,
+                at,
+            )?;
+            tx.commit()
+                .map_err(|err| StateError::from_sqlite("request_lane_replacement: commit", err))?;
+        }
+        self.lane_replacement_by_id(&replacement_id)?
+            .ok_or_else(|| state_error("state.not_found", "replacement vanished after insert"))
+    }
+
+    /// Advance a replacement to the phase that legally follows
+    /// `expected_phase` (transactional compare-and-set: the update matches
+    /// only when the record still carries exactly the presented phase,
+    /// generation, and a `pending` outcome; a missed match is classified
+    /// against the fresh row into a typed refusal). Stale generations,
+    /// invalid order, held/ambiguous/cancelled records, and replayed
+    /// expectations can never advance state.
+    pub fn advance_lane_replacement(
+        &self,
+        replacement_id: &str,
+        expected_phase: &str,
+        generation: i64,
+        at: &str,
+    ) -> Result<LaneReplacementRow, StateError> {
+        let outcome =
+            self.advance_lane_replacement_inner(replacement_id, expected_phase, generation, at);
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn advance_lane_replacement_inner(
+        &self,
+        replacement_id: &str,
+        expected_phase: &str,
+        generation: i64,
+        at: &str,
+    ) -> Result<LaneReplacementRow, StateError> {
+        self.ensure_writable()?;
+        {
+            let mut conn = self.lock("advance_lane_replacement")?;
+            let tx = conn
+                .transaction()
+                .map_err(|err| StateError::from_sqlite("advance_lane_replacement: begin", err))?;
+            let mut advanced = false;
+            if let Some(next_phase) = next_allowed_phase(expected_phase) {
+                let affected = tx
+                    .execute(
+                        "UPDATE lane_replacements
+                            SET phase = ?1, updated_at = ?2
+                          WHERE replacement_id = ?3 AND phase = ?4 AND generation = ?5
+                                AND outcome = 'pending'",
+                        params![next_phase, at, replacement_id, expected_phase, generation],
+                    )
+                    .map_err(|err| {
+                        StateError::from_sqlite("advance_lane_replacement: update", err)
+                    })?;
+                if affected == 1 {
+                    append_lane_replacement_event(
+                        &tx,
+                        replacement_id,
+                        Some(expected_phase),
+                        next_phase,
+                        Some("pending"),
+                        "pending",
+                        "",
+                        at,
+                    )?;
+                    advanced = true;
+                }
+            }
+            if advanced {
+                tx.commit().map_err(|err| {
+                    StateError::from_sqlite("advance_lane_replacement: commit", err)
+                })?;
+            } else {
+                let row: Option<LaneReplacementRow> = tx
+                    .query_row(
+                        "SELECT replacement_id, lane_id, generation, successor_generation,
+                                phase, outcome, outcome_reason, source_session, source_process,
+                                role, worktree, reason, created_at, updated_at
+                           FROM lane_replacements WHERE replacement_id = ?1",
+                        params![replacement_id],
+                        lane_replacement_row_from,
+                    )
+                    .optional()
+                    .map_err(|err| {
+                        StateError::from_sqlite("advance_lane_replacement: classify", err)
+                    })?;
+                return Err(lane_replacement_transition_refusal(
+                    row.as_ref(),
+                    replacement_id,
+                    expected_phase,
+                    generation,
+                ));
+            }
+        }
+        self.lane_replacement_by_id(replacement_id)?
+            .ok_or_else(|| state_error("state.not_found", "replacement vanished after advance"))
+    }
+
+    /// Park a pending replacement in the explicit `held` outcome (the pause
+    /// refusal: a held replacement refuses advancement and the state is
+    /// durable across restarts). The caller validates/normalizes `reason`.
+    pub fn hold_lane_replacement(
+        &self,
+        replacement_id: &str,
+        reason: &str,
+        at: &str,
+    ) -> Result<LaneReplacementRow, StateError> {
+        let outcome = self.hold_lane_replacement_inner(replacement_id, reason, at);
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn hold_lane_replacement_inner(
+        &self,
+        replacement_id: &str,
+        reason: &str,
+        at: &str,
+    ) -> Result<LaneReplacementRow, StateError> {
+        self.ensure_writable()?;
+        {
+            let mut conn = self.lock("hold_lane_replacement")?;
+            let tx = conn
+                .transaction()
+                .map_err(|err| StateError::from_sqlite("hold_lane_replacement: begin", err))?;
+            let row: Option<LaneReplacementRow> = tx
+                .query_row(
+                    "SELECT replacement_id, lane_id, generation, successor_generation,
+                            phase, outcome, outcome_reason, source_session, source_process,
+                            role, worktree, reason, created_at, updated_at
+                       FROM lane_replacements WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_replacement_row_from,
+                )
+                .optional()
+                .map_err(|err| StateError::from_sqlite("hold_lane_replacement: lookup", err))?;
+            let Some(row) = row else {
+                return Err(state_error(
+                    "state.not_found",
+                    format!("no lane replacement {replacement_id:?}"),
+                ));
+            };
+            let affected = if row.outcome == "pending" && row.phase != "adopted" {
+                tx.execute(
+                    "UPDATE lane_replacements
+                        SET outcome = 'held', outcome_reason = ?1, updated_at = ?2
+                      WHERE replacement_id = ?3 AND outcome = 'pending' AND phase != 'adopted'",
+                    params![reason, at, replacement_id],
+                )
+                .map_err(|err| StateError::from_sqlite("hold_lane_replacement: update", err))?
+            } else {
+                0
+            };
+            if affected == 1 {
+                append_lane_replacement_event(
+                    &tx,
+                    replacement_id,
+                    Some(&row.phase),
+                    &row.phase,
+                    Some("pending"),
+                    "held",
+                    reason,
+                    at,
+                )?;
+                tx.commit()
+                    .map_err(|err| StateError::from_sqlite("hold_lane_replacement: commit", err))?;
+            } else {
+                return Err(lane_replacement_outcome_refusal(&row, "hold"));
+            }
+        }
+        self.lane_replacement_by_id(replacement_id)?
+            .ok_or_else(|| state_error("state.not_found", "replacement vanished after hold"))
+    }
+
+    /// Cancel (invalidate) a pending replacement while it is still before
+    /// retirement: the original lane is preserved untouched and the pending
+    /// replacement becomes permanently unable to advance. Cancellation from
+    /// `retired` onward is refused (`refusal.replacement.retired`).
+    pub fn cancel_lane_replacement(
+        &self,
+        replacement_id: &str,
+        reason: &str,
+        at: &str,
+    ) -> Result<LaneReplacementRow, StateError> {
+        let outcome = self.cancel_lane_replacement_inner(replacement_id, reason, at);
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn cancel_lane_replacement_inner(
+        &self,
+        replacement_id: &str,
+        reason: &str,
+        at: &str,
+    ) -> Result<LaneReplacementRow, StateError> {
+        self.ensure_writable()?;
+        {
+            let mut conn = self.lock("cancel_lane_replacement")?;
+            let tx = conn
+                .transaction()
+                .map_err(|err| StateError::from_sqlite("cancel_lane_replacement: begin", err))?;
+            let row: Option<LaneReplacementRow> = tx
+                .query_row(
+                    "SELECT replacement_id, lane_id, generation, successor_generation,
+                            phase, outcome, outcome_reason, source_session, source_process,
+                            role, worktree, reason, created_at, updated_at
+                       FROM lane_replacements WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_replacement_row_from,
+                )
+                .optional()
+                .map_err(|err| StateError::from_sqlite("cancel_lane_replacement: lookup", err))?;
+            let Some(row) = row else {
+                return Err(state_error(
+                    "state.not_found",
+                    format!("no lane replacement {replacement_id:?}"),
+                ));
+            };
+            let cancellable = row.outcome != "cancelled" && phase_before_retirement(&row.phase);
+            let affected = if cancellable {
+                tx.execute(
+                    "UPDATE lane_replacements
+                        SET outcome = 'cancelled', outcome_reason = ?1, updated_at = ?2
+                      WHERE replacement_id = ?3 AND outcome != 'cancelled'
+                            AND phase IN ('requested', 'quiescing', 'checkpointed')",
+                    params![reason, at, replacement_id],
+                )
+                .map_err(|err| StateError::from_sqlite("cancel_lane_replacement: update", err))?
+            } else {
+                0
+            };
+            if affected == 1 {
+                append_lane_replacement_event(
+                    &tx,
+                    replacement_id,
+                    Some(&row.phase),
+                    &row.phase,
+                    Some(&row.outcome),
+                    "cancelled",
+                    reason,
+                    at,
+                )?;
+                tx.commit().map_err(|err| {
+                    StateError::from_sqlite("cancel_lane_replacement: commit", err)
+                })?;
+            } else if row.outcome == "cancelled" {
+                return Err(state_error(
+                    replacement_code::INVALIDATED,
+                    format!("replacement {replacement_id} was already cancelled"),
+                ));
+            } else {
+                return Err(state_error(
+                    replacement_code::RETIRED,
+                    format!(
+                        "cancellation after retirement is too late (replacement {replacement_id} \
+                         is at {:?})",
+                        row.phase
+                    ),
+                ));
+            }
+        }
+        self.lane_replacement_by_id(replacement_id)?
+            .ok_or_else(|| state_error("state.not_found", "replacement vanished after cancel"))
+    }
+
+    /// One lane replacement record by id.
+    pub fn lane_replacement_by_id(
+        &self,
+        replacement_id: &str,
+    ) -> Result<Option<LaneReplacementRow>, StateError> {
+        let conn = self.lock("lane_replacement_by_id")?;
+        conn.query_row(
+            "SELECT replacement_id, lane_id, generation, successor_generation,
+                    phase, outcome, outcome_reason, source_session, source_process,
+                    role, worktree, reason, created_at, updated_at
+               FROM lane_replacements WHERE replacement_id = ?1",
+            params![replacement_id],
+            lane_replacement_row_from,
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("lane_replacement_by_id: query", err))
+    }
+
+    /// The full transition history of one replacement, oldest first.
+    pub fn lane_replacement_events(
+        &self,
+        replacement_id: &str,
+    ) -> Result<Vec<LaneReplacementEventRow>, StateError> {
+        let conn = self.lock("lane_replacement_events")?;
+        let mut statement = conn
+            .prepare(
+                "SELECT seq, replacement_id, from_phase, to_phase, from_outcome, to_outcome,
+                        reason, at
+                   FROM lane_replacement_events WHERE replacement_id = ?1 ORDER BY seq",
+            )
+            .map_err(|err| StateError::from_sqlite("lane_replacement_events: prepare", err))?;
+        let rows = statement
+            .query_map(params![replacement_id], |row| {
+                Ok(LaneReplacementEventRow {
+                    seq: row.get(0)?,
+                    replacement_id: row.get(1)?,
+                    from_phase: row.get(2)?,
+                    to_phase: row.get(3)?,
+                    from_outcome: row.get(4)?,
+                    to_outcome: row.get(5)?,
+                    reason: row.get(6)?,
+                    at: row.get(7)?,
+                })
+            })
+            .map_err(|err| StateError::from_sqlite("lane_replacement_events: query", err))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(
+                row.map_err(|err| StateError::from_sqlite("lane_replacement_events: row", err))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Restart-reconciliation hook (issue #73 AC5/AC6): an interrupted
+    /// lane-replacement claim marks its record `ambiguous` — the explicit
+    /// "unknown, external reconciliation required" outcome — unless the
+    /// record is already terminal (cancelled/adopted). The record is
+    /// located from the claim's params (`replacement_id`, or
+    /// `lane_id` + `generation` for a request claim). Returns whether a
+    /// record was flipped.
+    pub fn mark_replacement_ambiguous(
+        &self,
+        params: &Val,
+        reason: &str,
+        at: &str,
+    ) -> Result<bool, StateError> {
+        let outcome = self.mark_replacement_ambiguous_inner(params, reason, at);
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn mark_replacement_ambiguous_inner(
+        &self,
+        params: &Val,
+        reason: &str,
+        at: &str,
+    ) -> Result<bool, StateError> {
+        self.ensure_writable()?;
+        let mut conn = self.lock("mark_replacement_ambiguous")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("mark_replacement_ambiguous: begin", err))?;
+        let replacement_id = match params.get("replacement_id").and_then(Val::as_str) {
+            Some(id) => Some(id.to_string()),
+            None => {
+                let lane = params.get("lane_id").and_then(Val::as_str);
+                let generation = params.get("generation").and_then(Val::as_int);
+                match (lane, generation) {
+                    (Some(lane), Some(generation)) => tx
+                        .query_row(
+                            "SELECT replacement_id FROM lane_replacements
+                              WHERE lane_id = ?1 AND generation = ?2",
+                            params![lane, generation],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(|err| {
+                            StateError::from_sqlite("mark_replacement_ambiguous: lookup", err)
+                        })?,
+                    _ => None,
+                }
+            }
+        };
+        let Some(replacement_id) = replacement_id else {
+            return Ok(false);
+        };
+        let row: Option<LaneReplacementRow> = tx
+            .query_row(
+                "SELECT replacement_id, lane_id, generation, successor_generation,
+                        phase, outcome, outcome_reason, source_session, source_process,
+                        role, worktree, reason, created_at, updated_at
+                   FROM lane_replacements WHERE replacement_id = ?1",
+                params![replacement_id],
+                lane_replacement_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("mark_replacement_ambiguous: read", err))?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        if row.outcome == "cancelled" || row.outcome == "ambiguous" || row.phase == "adopted" {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE lane_replacements
+                SET outcome = 'ambiguous', outcome_reason = ?1, updated_at = ?2
+              WHERE replacement_id = ?3 AND outcome != 'cancelled'",
+            params![reason, at, replacement_id],
+        )
+        .map_err(|err| StateError::from_sqlite("mark_replacement_ambiguous: update", err))?;
+        append_lane_replacement_event(
+            &tx,
+            &replacement_id,
+            Some(&row.phase),
+            &row.phase,
+            Some(&row.outcome),
+            "ambiguous",
+            reason,
+            at,
+        )?;
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("mark_replacement_ambiguous: commit", err))?;
+        Ok(true)
+    }
+
+    // ---------------------------------------------------------------------
     // Journal reads (hash-chain verified)
     // ---------------------------------------------------------------------
 
@@ -2359,6 +2975,237 @@ pub fn schedule_val(row: &ScheduleRow) -> Val {
     ])
 }
 
+/// Map one SQLite row onto [`LaneReplacementRow`] (column order of the
+/// lane_replacements SELECTs).
+fn lane_replacement_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneReplacementRow> {
+    Ok(LaneReplacementRow {
+        replacement_id: row.get(0)?,
+        lane_id: row.get(1)?,
+        generation: row.get(2)?,
+        successor_generation: row.get(3)?,
+        phase: row.get(4)?,
+        outcome: row.get(5)?,
+        outcome_reason: row.get(6)?,
+        source_session: row.get(7)?,
+        source_process: row.get(8)?,
+        role: row.get(9)?,
+        worktree: row.get(10)?,
+        reason: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+    })
+}
+
+/// Classify a refused lane-replacement transition against the fresh record:
+/// held/ambiguous/cancelled outcomes, stale generation, and invalid order
+/// each get their own typed refusal code (never a generic error).
+fn lane_replacement_transition_refusal(
+    row: Option<&LaneReplacementRow>,
+    replacement_id: &str,
+    expected_phase: &str,
+    presented_generation: i64,
+) -> StateError {
+    let Some(row) = row else {
+        return state_error(
+            "state.not_found",
+            format!("no lane replacement {replacement_id:?}"),
+        );
+    };
+    if row.outcome == "held" {
+        let reason = if row.outcome_reason.is_empty() {
+            "no reason recorded"
+        } else {
+            row.outcome_reason.as_str()
+        };
+        return state_error(
+            replacement_code::HELD,
+            format!("replacement {replacement_id} is held (paused): {reason}"),
+        );
+    }
+    if row.outcome == "ambiguous" {
+        return state_error(
+            replacement_code::AMBIGUOUS,
+            format!(
+                "replacement {replacement_id} was left ambiguous by an interrupted transition; \
+                 external reconciliation is required before it can advance"
+            ),
+        );
+    }
+    if row.outcome == "cancelled" {
+        return state_error(
+            replacement_code::INVALIDATED,
+            format!(
+                "replacement {replacement_id} was cancelled (invalidated); it can never advance"
+            ),
+        );
+    }
+    if row.generation != presented_generation {
+        return state_error(
+            replacement_code::STALE,
+            format!(
+                "presented generation {presented_generation} does not match replacement \
+                 {replacement_id} generation {}",
+                row.generation
+            ),
+        );
+    }
+    if row.phase != expected_phase {
+        let next = next_allowed_phase(&row.phase).unwrap_or("none");
+        return state_error(
+            replacement_code::ORDER,
+            format!(
+                "presented phase {expected_phase:?} is not the current phase {:?} (next allowed: {next})",
+                row.phase
+            ),
+        );
+    }
+    state_error(
+        replacement_code::ORDER,
+        format!(
+            "replacement {replacement_id} is at {:?}; no phase follows it",
+            row.phase
+        ),
+    )
+}
+
+/// Classify a refused hold against the fresh record (already-held,
+/// cancelled, ambiguous, or nothing to hold).
+fn lane_replacement_outcome_refusal(row: &LaneReplacementRow, verb: &str) -> StateError {
+    if row.outcome == "held" {
+        let reason = if row.outcome_reason.is_empty() {
+            "no reason recorded"
+        } else {
+            row.outcome_reason.as_str()
+        };
+        return state_error(
+            replacement_code::HELD,
+            format!(
+                "replacement {} is already held (paused): {reason}",
+                row.replacement_id
+            ),
+        );
+    }
+    if row.outcome == "ambiguous" {
+        return state_error(
+            replacement_code::AMBIGUOUS,
+            format!(
+                "replacement {} is ambiguous (interrupted transition); external reconciliation \
+                 is required",
+                row.replacement_id
+            ),
+        );
+    }
+    if row.outcome == "cancelled" {
+        return state_error(
+            replacement_code::INVALIDATED,
+            format!(
+                "replacement {} was cancelled; it cannot be {verb}ed again",
+                row.replacement_id
+            ),
+        );
+    }
+    state_error(
+        replacement_code::ORDER,
+        format!(
+            "replacement {} is at {:?}; there is nothing to {verb}",
+            row.replacement_id, row.phase
+        ),
+    )
+}
+
+/// Append one lane replacement transition-history row inside the caller's
+/// transaction (record writes and their history commit atomically).
+#[allow(clippy::too_many_arguments)]
+fn append_lane_replacement_event(
+    conn: &rusqlite::Transaction<'_>,
+    replacement_id: &str,
+    from_phase: Option<&str>,
+    to_phase: &str,
+    from_outcome: Option<&str>,
+    to_outcome: &str,
+    reason: &str,
+    at: &str,
+) -> Result<i64, StateError> {
+    let seq: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM lane_replacement_events",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| StateError::from_sqlite("replacement event: seq", err))?;
+    conn.execute(
+        "INSERT INTO lane_replacement_events (seq, replacement_id, from_phase, to_phase,
+            from_outcome, to_outcome, reason, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            seq,
+            replacement_id,
+            from_phase,
+            to_phase,
+            from_outcome,
+            to_outcome,
+            reason,
+            at
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("replacement event: insert", err))?;
+    Ok(seq)
+}
+
+/// One lane replacement record as an RPC-facing value; `next_allowed` is
+/// the precise next legal transition (null when the record cannot advance).
+pub fn lane_replacement_val(row: &LaneReplacementRow) -> Val {
+    let next_allowed = if row.outcome == "pending" {
+        next_allowed_phase(&row.phase)
+    } else {
+        None
+    };
+    object(vec![
+        ("replacement_id", string(&row.replacement_id)),
+        ("lane_id", string(&row.lane_id)),
+        ("generation", integer(row.generation)),
+        ("successor_generation", integer(row.successor_generation)),
+        ("phase", string(&row.phase)),
+        ("outcome", string(&row.outcome)),
+        ("outcome_reason", string(&row.outcome_reason)),
+        (
+            "next_allowed",
+            next_allowed.map(string).unwrap_or_else(null),
+        ),
+        (
+            "source",
+            object(vec![
+                ("session", string(&row.source_session)),
+                ("process", string(&row.source_process)),
+                ("role", string(&row.role)),
+                ("worktree", string(&row.worktree)),
+            ]),
+        ),
+        ("reason", string(&row.reason)),
+        ("created_at", string(&row.created_at)),
+        ("updated_at", string(&row.updated_at)),
+    ])
+}
+
+/// One lane replacement history row as an RPC-facing value.
+pub fn lane_replacement_event_val(row: &LaneReplacementEventRow) -> Val {
+    object(vec![
+        ("seq", integer(row.seq)),
+        (
+            "from_phase",
+            row.from_phase.as_deref().map(string).unwrap_or_else(null),
+        ),
+        ("to_phase", string(&row.to_phase)),
+        (
+            "from_outcome",
+            row.from_outcome.as_deref().map(string).unwrap_or_else(null),
+        ),
+        ("to_outcome", string(&row.to_outcome)),
+        ("reason", string(&row.reason)),
+        ("at", string(&row.at)),
+    ])
+}
+
 /// Prune audit rows beyond the retention bound, always keeping the chain
 /// genesis (seq 0) so verification keeps its anchor.
 fn prune_audit_locked(
@@ -2534,21 +3381,31 @@ const M0004_ID: &str = "m0004_schedules_lifecycle_v4";
 const M0004_APPLIES_FROM: i64 = 3;
 const M0004_APPLIES_TO: i64 = 4;
 
+/// m0005 adds the lane replacement record tables (issue #73): one durable
+/// replacement request per logical lane generation (typed phases, explicit
+/// held/ambiguous outcomes, CAS transitions) plus its transactional
+/// transition history. Request-only — no spawn/kill/Git effect exists in
+/// this slice; the tables are the durable handoff intent.
+const M0005_ID: &str = "m0005_lane_replacements_v5";
+const M0005_APPLIES_FROM: i64 = 4;
+const M0005_APPLIES_TO: i64 = 5;
+
 /// Ordered migration chain (id, applies_from, applies_to). The runner in
 /// [`State::open`] applies every pending migration before serving.
-const MIGRATIONS: [(&str, i64, i64); 4] = [
+const MIGRATIONS: [(&str, i64, i64); 5] = [
     (M0001_ID, M0001_APPLIES_FROM, M0001_APPLIES_TO),
     (M0002_ID, M0002_APPLIES_FROM, M0002_APPLIES_TO),
     (M0003_ID, M0003_APPLIES_FROM, M0003_APPLIES_TO),
     (M0004_ID, M0004_APPLIES_FROM, M0004_APPLIES_TO),
+    (M0005_ID, M0005_APPLIES_FROM, M0005_APPLIES_TO),
 ];
 
-/// Ordered migration-chain identifiers (`m0001`..`m0004`), exposed for the
+/// Ordered migration-chain identifiers (`m0001`..`m0005`), exposed for the
 /// release provenance chain (issue #10): `herdr-fleet --version` prints
 /// them so a release archive's provenance record can bind the exact
 /// state-schema migration chain of the binary it ships.
 pub fn migration_chain_ids() -> &'static [&'static str] {
-    const IDS: [&str; MIGRATIONS.len()] = [M0001_ID, M0002_ID, M0003_ID, M0004_ID];
+    const IDS: [&str; MIGRATIONS.len()] = [M0001_ID, M0002_ID, M0003_ID, M0004_ID, M0005_ID];
     &IDS
 }
 
@@ -2611,6 +3468,120 @@ CREATE TABLE approvals (
 const M0004_SQL: &str = "\
 ALTER TABLE schedules ADD COLUMN doc TEXT NOT NULL DEFAULT '';
 ALTER TABLE schedules ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
+";
+
+/// Ordered lane replacement phases (issue #73): one replacement moves
+/// through exactly this chain; every transition is a transactional
+/// compare-and-set on the current phase.
+pub const LANE_REPLACEMENT_PHASES: [&str; 7] = [
+    "requested",
+    "quiescing",
+    "checkpointed",
+    "retired",
+    "starting",
+    "adopting",
+    "adopted",
+];
+
+/// Explicit lane replacement outcomes (issue #73). `pending` is the normal
+/// advanceable state; `held` is an explicit parked state (advancement
+/// refused, durable across restarts — the lifecycle park verdict mirrored
+/// for the pause refusal); `ambiguous` is written by restart reconciliation
+/// when a replacement transition was interrupted (external reconciliation
+/// is required before it can advance); `cancelled` invalidates a pending
+/// replacement before retirement.
+pub const LANE_REPLACEMENT_OUTCOMES: [&str; 4] = ["pending", "held", "ambiguous", "cancelled"];
+
+/// Closed role set a replacement record may bind (doctrine roles). A role
+/// outside this set is refused, never inferred.
+pub const LANE_REPLACEMENT_ROLES: [&str; 3] = ["orchestrator", "implementer", "reviewer"];
+
+/// Typed refusal codes for lane replacement records (issue #73). Same
+/// dotted `refusal.*` vocabulary and never-downgrade style as the
+/// control-plane engine codes (`crate::mutation::code`); produced by this
+/// layer so RPC responses carry them unchanged.
+pub mod replacement_code {
+    /// A record already exists for this lane generation (no second
+    /// successor owner can be created).
+    pub const EXISTS: &str = "refusal.replacement.exists";
+    /// The presented generation does not match the record's generation.
+    pub const STALE: &str = "refusal.replacement.stale";
+    /// The presented phase is not the record's current phase (invalid
+    /// transition order, or nothing follows the current phase).
+    pub const ORDER: &str = "refusal.replacement.order";
+    /// The record is held (parked): advancement is refused until an
+    /// explicit invalidation.
+    pub const HELD: &str = "refusal.replacement.held";
+    /// The record was left ambiguous by an interrupted transition;
+    /// external reconciliation is required.
+    pub const AMBIGUOUS: &str = "refusal.replacement.ambiguous";
+    /// The record was cancelled (invalidated): it can never advance.
+    pub const INVALIDATED: &str = "refusal.replacement.invalidated";
+    /// Cancellation is only legal before retirement.
+    pub const RETIRED: &str = "refusal.replacement.retired";
+}
+
+/// The phase that legally follows `phase` (`None` for the terminal
+/// `adopted`, or an unknown phase).
+pub fn next_allowed_phase(phase: &str) -> Option<&'static str> {
+    let index = LANE_REPLACEMENT_PHASES.iter().position(|p| *p == phase)?;
+    LANE_REPLACEMENT_PHASES.get(index + 1).copied()
+}
+
+/// Whether `phase` precedes retirement (cancellation window).
+fn phase_before_retirement(phase: &str) -> bool {
+    LANE_REPLACEMENT_PHASES
+        .iter()
+        .position(|p| *p == phase)
+        .map(|index| index < 3)
+        .unwrap_or(false)
+}
+
+/// The deterministic replacement id for one logical lane generation:
+/// `rp_` + 16 hex of sha256 over `hf-lane-replacement/v1|<lane>|<gen>`.
+/// Same lane/generation → same id, so a replayed request and a restart
+/// observe the identical record identity.
+pub fn replacement_id_for(lane_id: &str, generation: i64) -> String {
+    let digest = sha256_hex(format!("hf-lane-replacement/v1|{lane_id}|{generation}").as_bytes());
+    format!("rp_{}", &digest[..16])
+}
+
+/// m0005 lane replacement tables (issue #73). `lane_replacements` holds one
+/// record per logical lane generation (UNIQUE — concurrent requests can
+/// never create two successor owners); `lane_replacement_events` is the
+/// transactional transition history appended inside the same transaction
+/// as every record write.
+const M0005_SQL: &str = "\
+CREATE TABLE lane_replacements (
+    replacement_id TEXT PRIMARY KEY,
+    lane_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    successor_generation INTEGER NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN
+        ('requested', 'quiescing', 'checkpointed', 'retired', 'starting', 'adopting', 'adopted')),
+    outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'held', 'ambiguous', 'cancelled')),
+    outcome_reason TEXT NOT NULL DEFAULT '',
+    source_session TEXT NOT NULL,
+    source_process TEXT NOT NULL,
+    role TEXT NOT NULL,
+    worktree TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (lane_id, generation)
+);
+CREATE TABLE lane_replacement_events (
+    seq INTEGER PRIMARY KEY,
+    replacement_id TEXT NOT NULL,
+    from_phase TEXT,
+    to_phase TEXT NOT NULL,
+    from_outcome TEXT,
+    to_outcome TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    at TEXT NOT NULL
+);
+CREATE INDEX idx_lane_replacement_events_record
+    ON lane_replacement_events(replacement_id, seq);
 ";
 
 const M0001_SQL: &str = "\
@@ -2854,6 +3825,36 @@ fn run_m0004(conn: &mut Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+/// Run migration m0005 in one transaction: the lane replacement record
+/// tables (issue #73 request-only handoff records + transition history).
+/// Purely additive — no existing table or row is touched, so stored grants
+/// are never reinterpreted by the upgrade.
+fn run_m0005(conn: &mut Connection) -> Result<(), StateError> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| StateError::from_sqlite("migrate m0005: begin", err))?;
+    let checksum = sha256_hex(M0005_SQL.as_bytes());
+    tx.execute_batch(M0005_SQL)
+        .map_err(|err| StateError::from_sqlite("migrate m0005", err))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (migration_id, applies_from, applies_to, checksum, applied_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            M0005_ID,
+            M0005_APPLIES_FROM,
+            M0005_APPLIES_TO,
+            checksum,
+            time::rfc3339_now()
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("migrate m0005: bookkeeping", err))?;
+    tx.pragma_update(None, "user_version", M0005_APPLIES_TO)
+        .map_err(|err| StateError::from_sqlite("migrate m0005: user_version", err))?;
+    tx.commit()
+        .map_err(|err| StateError::from_sqlite("migrate m0005: commit", err))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2951,12 +3952,13 @@ mod tests {
         let path = temp_db("m0004.db");
         let state = State::open(&path, Retention::default()).expect("open");
         let (_, _, _, version) = state.summary().expect("summary");
-        assert_eq!(version, 4, "m0004 is applied on a fresh database");
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "the full migration chain is applied on a fresh database"
+        );
         // A v3-era database (m0003 applied, m0004 pending) migrates forward:
         // the migration runner applies m0004 in place and the bookkeeping
         // row exists for the whole chain.
-        let (_, _, _, version) = state.summary().expect("summary");
-        assert_eq!(version, SCHEMA_VERSION);
         // Upsert + durable doc/pause/window round trip.
         let doc = sample_schedule_doc("sd_0123456789abcdef");
         let row = state.upsert_schedule(&doc).expect("upsert");
@@ -3503,7 +4505,7 @@ mod tests {
         let (_, _, _, version) = state.summary().expect("summary");
         assert_eq!(
             version, SCHEMA_VERSION,
-            "schema version {} after the full migration chain (m0001..m0004)",
+            "schema version {} after the full migration chain (m0001..m0005)",
             SCHEMA_VERSION
         );
         state.issue_grant(&sample_grant_doc()).expect("issue");
@@ -3666,6 +4668,240 @@ mod tests {
             doc.get("recorded_before_mutation").and_then(Val::as_bool),
             Some(false),
             "salvage is post-deletion evidence (the mutate.cleanup intent is the before record)"
+        );
+    }
+
+    #[test]
+    fn lane_replacement_migration_preserves_stored_grants() {
+        // Issue #73 AC6: the m0005 upgrade is purely additive. A database
+        // written at schema v4 (m0001..m0004) with a stored grant upgrades
+        // in place; the grant row (and the epoch) are exactly what they
+        // were — existing stored grants are never reinterpreted.
+        let path = temp_db("replacement-upgrade.db");
+        {
+            let mut conn = Connection::open(&path).expect("open raw");
+            run_initial_migration(&mut conn).expect("m0001");
+            run_m0002(&mut conn).expect("m0002");
+            run_m0003(&mut conn).expect("m0003");
+            run_m0004(&mut conn).expect("m0004");
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("user_version");
+            assert_eq!(version, 4, "raw fixture lands at schema v4");
+            conn.execute(
+                "INSERT INTO grants (grant_id, repository, issue_number, issue_revision,
+                    workflow_hash, policy_hash, phase, scope, caps, expires_at, state_epoch,
+                    status, created_at, revoked_at)
+                 VALUES ('gr_0123456789abcdef', 'example-org/widgets', 123, ?1, ?2, ?3, 'merge',
+                    'worktrees/issues/123', 'read,merge', '2999-01-01T00:00:00Z', 1, 'active',
+                    '2026-09-06T00:00:00Z', NULL)",
+                params!["a".repeat(40), "0".repeat(64), "f".repeat(64)],
+            )
+            .expect("stored grant insert");
+        }
+        // The current binary upgrades the v4 database; m0005 is additive.
+        let state = State::open(&path, Retention::default()).expect("upgrade open");
+        let grants = state.list_grants().expect("grants");
+        assert_eq!(grants.len(), 1);
+        let grant = &grants[0];
+        assert_eq!(grant.grant_id, "gr_0123456789abcdef");
+        assert_eq!(grant.repository, "example-org/widgets");
+        assert_eq!(grant.issue_number, 123);
+        assert_eq!(grant.issue_revision, "a".repeat(40));
+        assert_eq!(grant.workflow_hash, "0".repeat(64));
+        assert_eq!(grant.policy_hash, "f".repeat(64));
+        assert_eq!(grant.status, "active");
+        assert_eq!(grant.state_epoch, 1);
+        assert_eq!(state.current_epoch().expect("epoch"), 1);
+        assert_eq!(SCHEMA_VERSION, 5);
+        {
+            let conn = state.lock("test: m0005 bookkeeping").expect("lock");
+            let recorded: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                    params![M0005_ID],
+                    |row| row.get(0),
+                )
+                .expect("bookkeeping");
+            assert_eq!(recorded, 1, "m0005 recorded in schema_migrations");
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("user_version");
+            assert_eq!(version, 5);
+        }
+    }
+
+    #[test]
+    fn lane_replacement_record_lifecycle_is_cas_fenced_and_durable() {
+        let path = temp_db("replacement-lifecycle.db");
+        let at = "2026-09-06T00:00:00Z";
+        let state = State::open(&path, Retention::default()).expect("open");
+        let row = state
+            .request_lane_replacement(
+                "lane-7",
+                1,
+                "sess-0001",
+                "proc-0001",
+                "implementer",
+                "worktrees/issues/73",
+                "host rotation window",
+                at,
+            )
+            .expect("request");
+        assert_eq!(row.phase, "requested");
+        assert_eq!(row.outcome, "pending");
+        assert_eq!(row.successor_generation, 2);
+        assert_eq!(row.replacement_id, replacement_id_for("lane-7", 1));
+
+        // A second record for the same lane generation is refused (no two
+        // successor owners).
+        let duplicate = state
+            .request_lane_replacement(
+                "lane-7",
+                1,
+                "sess-0002",
+                "proc-0002",
+                "implementer",
+                "worktrees/issues/73",
+                "second request",
+                at,
+            )
+            .expect_err("duplicate refused");
+        assert_eq!(duplicate.code, replacement_code::EXISTS);
+
+        // CAS fences: stale generation and invalid order cannot advance.
+        let stale = state
+            .advance_lane_replacement(&row.replacement_id, "requested", 9, at)
+            .expect_err("stale generation refused");
+        assert_eq!(stale.code, replacement_code::STALE);
+        let wrong_order = state
+            .advance_lane_replacement(&row.replacement_id, "checkpointed", 1, at)
+            .expect_err("invalid order refused");
+        assert_eq!(wrong_order.code, replacement_code::ORDER);
+        let moved = state
+            .advance_lane_replacement(&row.replacement_id, "requested", 1, at)
+            .expect("advance to quiescing");
+        assert_eq!(moved.phase, "quiescing");
+        // A replayed expectation (same phase again) cannot advance state.
+        let replayed = state
+            .advance_lane_replacement(&row.replacement_id, "requested", 1, at)
+            .expect_err("replayed expectation refused");
+        assert_eq!(replayed.code, replacement_code::ORDER);
+        assert_eq!(
+            state
+                .lane_replacement_by_id(&row.replacement_id)
+                .expect("read")
+                .expect("row")
+                .phase,
+            "quiescing"
+        );
+
+        // PAUSED (held) refuses advancement; the state survives reopen.
+        let held = state
+            .hold_lane_replacement(&row.replacement_id, "operator hold", at)
+            .expect("hold");
+        assert_eq!(held.outcome, "held");
+        let held_advance = state
+            .advance_lane_replacement(&row.replacement_id, "quiescing", 1, at)
+            .expect_err("held refuses advancement");
+        assert_eq!(held_advance.code, replacement_code::HELD);
+        assert!(
+            held_advance.message.contains("operator hold"),
+            "{}",
+            held_advance.message
+        );
+
+        // Cancellation escapes the hold, preserves the original lane, and
+        // invalidates the pending replacement permanently.
+        let cancelled = state
+            .cancel_lane_replacement(&row.replacement_id, "cancelled by operator", at)
+            .expect("cancel");
+        assert_eq!(cancelled.outcome, "cancelled");
+        assert_eq!(cancelled.phase, "quiescing", "cancel leaves the phase");
+        assert_eq!(
+            cancelled.lane_id, "lane-7",
+            "the original lane is preserved"
+        );
+        assert_eq!(cancelled.source_session, "sess-0001");
+        let invalidated = state
+            .advance_lane_replacement(&row.replacement_id, "quiescing", 1, at)
+            .expect_err("cancelled record cannot advance");
+        assert_eq!(invalidated.code, replacement_code::INVALIDATED);
+        let re_cancel = state
+            .cancel_lane_replacement(&row.replacement_id, "", at)
+            .expect_err("already cancelled");
+        assert_eq!(re_cancel.code, replacement_code::INVALIDATED);
+
+        // Retirement passed: cancellation is too late (second lane).
+        let second = state
+            .request_lane_replacement(
+                "lane-8",
+                1,
+                "sess-0001",
+                "proc-0001",
+                "orchestrator",
+                "worktrees/issues/74",
+                "second lane replacement",
+                at,
+            )
+            .expect("request lane-8");
+        for expected in ["requested", "quiescing", "checkpointed"] {
+            state
+                .advance_lane_replacement(&second.replacement_id, expected, 1, at)
+                .expect("phase chain");
+        }
+        let too_late = state
+            .cancel_lane_replacement(&second.replacement_id, "", at)
+            .expect_err("cancellation after retirement refused");
+        assert_eq!(too_late.code, replacement_code::RETIRED);
+        let row2 = state
+            .lane_replacement_by_id(&second.replacement_id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(row2.phase, "retired");
+        assert_eq!(
+            row2.outcome, "pending",
+            "refused cancellation changed nothing"
+        );
+
+        // History: one row per accepted change, in order.
+        let events = state
+            .lane_replacement_events(&row.replacement_id)
+            .expect("history");
+        let to_phases: Vec<&str> = events.iter().map(|event| event.to_phase.as_str()).collect();
+        assert_eq!(
+            to_phases,
+            vec!["requested", "quiescing", "quiescing", "quiescing"]
+        );
+        let to_outcomes: Vec<&str> = events
+            .iter()
+            .map(|event| event.to_outcome.as_str())
+            .collect();
+        assert_eq!(to_outcomes, vec!["pending", "pending", "held", "cancelled"]);
+        drop(state);
+
+        // Restart: record, outcome, history and next-allowed persist exactly.
+        let state = State::open(&path, Retention::default()).expect("reopen");
+        let row = state
+            .lane_replacement_by_id(&row.replacement_id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.outcome, "cancelled", "outcome durable across restart");
+        assert_eq!(row.phase, "quiescing");
+        assert!(
+            matches!(
+                lane_replacement_val(&row).get("next_allowed"),
+                Some(Val::Null)
+            ),
+            "a cancelled record has no allowed transition"
+        );
+        assert_eq!(
+            state
+                .lane_replacement_events(&row.replacement_id)
+                .expect("history")
+                .len(),
+            4,
+            "history durable across restart"
         );
     }
 }

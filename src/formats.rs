@@ -143,6 +143,33 @@ pub fn is_schedule_id(text: &str) -> bool {
         && is_lower_hex(&text[PREFIX.len()..], 16)
 }
 
+/// Lane replacement id: `rp_` + 16 lowercase hex (issue #73).
+pub fn is_replacement_id(text: &str) -> bool {
+    const PREFIX: &str = "rp_";
+    text.len() == PREFIX.len() + 16
+        && text.starts_with(PREFIX)
+        && is_lower_hex(&text[PREFIX.len()..], 16)
+}
+
+/// Repository-relative worktree reference (issue #73 AC2):
+/// `[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*` with no `.`/`..` components and
+/// no leading slash — host-absolute paths and traversal never validate, so
+/// a record can only bind a relative worktree identity.
+pub fn is_worktree_ref(text: &str) -> bool {
+    const MAX_LEN: usize = 200;
+    if text.is_empty() || text.len() > MAX_LEN || text.starts_with('/') {
+        return false;
+    }
+    text.split('/').all(|component| {
+        !component.is_empty()
+            && component != "."
+            && component != ".."
+            && component
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    })
+}
+
 /// Migration id: `mNNNN_<snake>` (`^m[0-9]{4}_[a-z0-9_]+$`).
 pub fn is_migration_id(text: &str) -> bool {
     let body = text.strip_prefix('m').unwrap_or_default();
@@ -270,6 +297,30 @@ mod tests {
         assert!(is_action_code("a1_b-c.d"));
         assert!(!is_action_code("Mutate.merge"));
         assert!(!is_action_code(""));
+    }
+
+    #[test]
+    fn lane_replacement_format_rules() {
+        // Issue #73: replacement ids and relative worktree references.
+        assert!(is_replacement_id("rp_0123456789abcdef"));
+        assert!(!is_replacement_id("rp_0123456789abcde"), "15 hex");
+        assert!(!is_replacement_id("rp_0123456789ABCDEF"), "lowercase only");
+        assert!(!is_replacement_id("0123456789abcdef"));
+
+        assert!(is_worktree_ref("worktrees/issues/73"));
+        assert!(is_worktree_ref("lane-7"));
+        assert!(is_worktree_ref("pods/team_a/issue-1"));
+        assert!(!is_worktree_ref(""), "empty never binds");
+        assert!(!is_worktree_ref("/var/tmp/host-path"), "absolute refused");
+        assert!(!is_worktree_ref("../escape"), "traversal refused");
+        assert!(!is_worktree_ref("a/./b"), "dot component refused");
+        assert!(!is_worktree_ref("a//b"), "empty component refused");
+        assert!(!is_worktree_ref("a/b/"), "trailing slash refused");
+        assert!(!is_worktree_ref("a\\b"), "backslash refused");
+        assert!(
+            !is_worktree_ref(&"a".repeat(201)),
+            "over-long worktree refused"
+        );
     }
 
     #[test]

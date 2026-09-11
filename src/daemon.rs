@@ -545,6 +545,11 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "schedules.resume" => method_schedule_resume(shared, request),
         "schedules.delete" => method_schedule_delete(shared, request),
         "schedules.evaluate" => method_schedule_evaluate(shared, request),
+        "lane.replacement.request" => method_lane_replacement_request(shared, request),
+        "lane.replacement.advance" => method_lane_replacement_advance(shared, request),
+        "lane.replacement.hold" => method_lane_replacement_hold(shared, request),
+        "lane.replacement.cancel" => method_lane_replacement_cancel(shared, request),
+        "lane.replacement.status" => method_lane_replacement_status(shared, request),
         "grants.list" => method_grants_list(shared, request),
         "journal.tail" => method_journal_tail(shared, request),
         "grants.revoke" => method_grants_revoke(shared, request),
@@ -2308,6 +2313,443 @@ fn grant_doc(row: &crate::state::GrantRow) -> Val {
     ])
 }
 
+// ---------------------------------------------------------------------------
+// Lane replacement records (issue #73): request-only handoff surface.
+// Every method on this surface persists daemon-owned state and journals its
+// intent through the shared claim machinery; none of them spawns, kills, or
+// touches Git, and none uplifts authority (no grants are required, issued,
+// or consumed). An agent may *request* its own retirement; replacement
+// phases are recorded, never executed.
+// ---------------------------------------------------------------------------
+
+/// Read one required string parameter (identity bindings refuse when they
+/// are absent or the wrong type — never a defaulted value).
+fn required_str<'a>(params: Option<&'a Val>, key: &str) -> Option<&'a str> {
+    params
+        .and_then(|params| params.get(key))
+        .and_then(Val::as_str)
+}
+
+/// `lane.replacement.request`: create the one replacement record for a
+/// logical lane generation (phase `requested`). The request binds the
+/// source session/process identity, role, worktree and reason; missing or
+/// invalid identities refuse. This endpoint has no spawn/kill/Git effect
+/// and no authority uplift — it never authorizes its own replacement
+/// effects.
+fn method_lane_replacement_request(shared: &Arc<Shared>, request: &Request) -> String {
+    let params = request.params.as_ref();
+    let lane_id = match required_str(params, "lane_id") {
+        Some(text) if crate::formats::is_slug(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.replacement.request requires params.lane_id (slug)",
+            );
+        }
+    };
+    let generation = match params
+        .and_then(|params| params.get("generation"))
+        .and_then(Val::as_int)
+    {
+        Some(generation) if generation >= 1 => generation,
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.replacement.request requires params.generation (positive integer)",
+            );
+        }
+    };
+    let source_session = match required_str(params, "source_session") {
+        Some(text) if crate::formats::is_actor(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.replacement.request requires params.source_session (session identity)",
+            );
+        }
+    };
+    let source_process = match required_str(params, "source_process") {
+        Some(text) if crate::formats::is_actor(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.replacement.request requires params.source_process (process identity)",
+            );
+        }
+    };
+    let role = match required_str(params, "role") {
+        Some(text) if crate::state::LANE_REPLACEMENT_ROLES.contains(&text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.replacement.request requires params.role (one of the doctrine roles)",
+            );
+        }
+    };
+    let worktree = match required_str(params, "worktree") {
+        Some(text) if crate::formats::is_worktree_ref(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.replacement.request requires params.worktree (repository-relative path)",
+            );
+        }
+    };
+    let reason = match required_str(params, "reason") {
+        Some(text)
+            if !text.is_empty() && text.len() <= 300 && !text.chars().any(char::is_control) =>
+        {
+            text.to_string()
+        }
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.replacement.request requires params.reason (1-300 printable characters)",
+            );
+        }
+    };
+    let replacement_id = crate::state::replacement_id_for(&lane_id, generation);
+    let target = format!("lane-replacement:{replacement_id}");
+    match journal_mutation(shared, request, "mutate.lane-replacement.request", &target) {
+        Intent::Claimed { key } => {
+            let outcome = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                match state.request_lane_replacement(
+                    &lane_id,
+                    generation,
+                    &source_session,
+                    &source_process,
+                    &role,
+                    &worktree,
+                    &reason,
+                    &time::rfc3339_now(),
+                ) {
+                    Ok(row) => Ok(object(vec![(
+                        "replacement",
+                        crate::state::lane_replacement_val(&row),
+                    )])),
+                    Err(err) => Err((err.code, err.message)),
+                }
+            };
+            match outcome {
+                Ok(result) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "lane.replacement.request",
+                    true,
+                    result,
+                    None,
+                ),
+                Err((code, message)) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "lane.replacement.request",
+                    false,
+                    null(),
+                    Some((code, message)),
+                ),
+            }
+        }
+        Intent::Replay { response } => replay(shared, &response),
+        Intent::Refused { code, message } => err_response(&request.id, code, message),
+    }
+}
+
+/// `lane.replacement.advance`: transactional compare-and-set to the phase
+/// that follows `expected_phase`. The presented generation fences stale
+/// requests (and the update re-asserts it), so an invalid order, a stale
+/// generation, or a replayed expectation can never advance state.
+fn method_lane_replacement_advance(shared: &Arc<Shared>, request: &Request) -> String {
+    let params = request.params.as_ref();
+    let replacement_id = match required_str(params, "replacement_id") {
+        Some(text) if crate::formats::is_replacement_id(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.replacement.advance requires params.replacement_id (rp_ id)",
+            );
+        }
+    };
+    let expected_phase = match required_str(params, "expected_phase") {
+        Some(text) if crate::state::LANE_REPLACEMENT_PHASES.contains(&text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.replacement.advance requires params.expected_phase (a lane replacement phase)",
+            );
+        }
+    };
+    let generation = match params
+        .and_then(|params| params.get("generation"))
+        .and_then(Val::as_int)
+    {
+        Some(generation) if generation >= 1 => generation,
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.replacement.advance requires params.generation (positive integer)",
+            );
+        }
+    };
+    let target = format!("lane-replacement:{replacement_id}");
+    match journal_mutation(shared, request, "mutate.lane-replacement.advance", &target) {
+        Intent::Claimed { key } => {
+            crash_point("lane-replacement.after-intent");
+            let outcome = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                match state.advance_lane_replacement(
+                    &replacement_id,
+                    &expected_phase,
+                    generation,
+                    &time::rfc3339_now(),
+                ) {
+                    Ok(row) => Ok(object(vec![(
+                        "replacement",
+                        crate::state::lane_replacement_val(&row),
+                    )])),
+                    Err(err) => Err((err.code, err.message)),
+                }
+            };
+            match outcome {
+                Ok(result) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "lane.replacement.advance",
+                    true,
+                    result,
+                    None,
+                ),
+                Err((code, message)) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "lane.replacement.advance",
+                    false,
+                    null(),
+                    Some((code, message)),
+                ),
+            }
+        }
+        Intent::Replay { response } => replay(shared, &response),
+        Intent::Refused { code, message } => err_response(&request.id, code, message),
+    }
+}
+
+/// `lane.replacement.hold`: park a pending replacement in the explicit
+/// `held` outcome. Advancement is refused while held (the pause refusal),
+/// and the held state is durable across daemon restarts.
+fn method_lane_replacement_hold(shared: &Arc<Shared>, request: &Request) -> String {
+    let params = request.params.as_ref();
+    let replacement_id = match required_str(params, "replacement_id") {
+        Some(text) if crate::formats::is_replacement_id(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.replacement.hold requires params.replacement_id (rp_ id)",
+            );
+        }
+    };
+    let reason = match required_str(params, "reason") {
+        Some(text)
+            if !text.is_empty() && text.len() <= 300 && !text.chars().any(char::is_control) =>
+        {
+            text.to_string()
+        }
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.replacement.hold requires params.reason (1-300 printable characters)",
+            );
+        }
+    };
+    let target = format!("lane-replacement:{replacement_id}");
+    match journal_mutation(shared, request, "mutate.lane-replacement.hold", &target) {
+        Intent::Claimed { key } => {
+            let outcome = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                match state.hold_lane_replacement(&replacement_id, &reason, &time::rfc3339_now()) {
+                    Ok(row) => Ok(object(vec![(
+                        "replacement",
+                        crate::state::lane_replacement_val(&row),
+                    )])),
+                    Err(err) => Err((err.code, err.message)),
+                }
+            };
+            match outcome {
+                Ok(result) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "lane.replacement.hold",
+                    true,
+                    result,
+                    None,
+                ),
+                Err((code, message)) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "lane.replacement.hold",
+                    false,
+                    null(),
+                    Some((code, message)),
+                ),
+            }
+        }
+        Intent::Replay { response } => replay(shared, &response),
+        Intent::Refused { code, message } => err_response(&request.id, code, message),
+    }
+}
+
+/// `lane.replacement.cancel`: invalidate a pending replacement before
+/// retirement. The original lane is preserved untouched; the invalidated
+/// record can never advance.
+fn method_lane_replacement_cancel(shared: &Arc<Shared>, request: &Request) -> String {
+    let params = request.params.as_ref();
+    let replacement_id = match required_str(params, "replacement_id") {
+        Some(text) if crate::formats::is_replacement_id(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.replacement.cancel requires params.replacement_id (rp_ id)",
+            );
+        }
+    };
+    let reason = match params.and_then(|params| params.get("reason")) {
+        None => String::new(),
+        Some(Val::Str(text)) if text.len() <= 300 && !text.chars().any(char::is_control) => {
+            text.clone()
+        }
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.replacement.cancel reason must be <= 300 printable characters",
+            );
+        }
+    };
+    let target = format!("lane-replacement:{replacement_id}");
+    match journal_mutation(shared, request, "mutate.lane-replacement.cancel", &target) {
+        Intent::Claimed { key } => {
+            let outcome = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                match state.cancel_lane_replacement(&replacement_id, &reason, &time::rfc3339_now())
+                {
+                    Ok(row) => Ok(object(vec![(
+                        "replacement",
+                        crate::state::lane_replacement_val(&row),
+                    )])),
+                    Err(err) => Err((err.code, err.message)),
+                }
+            };
+            match outcome {
+                Ok(result) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "lane.replacement.cancel",
+                    true,
+                    result,
+                    None,
+                ),
+                Err((code, message)) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "lane.replacement.cancel",
+                    false,
+                    null(),
+                    Some((code, message)),
+                ),
+            }
+        }
+        Intent::Replay { response } => replay(shared, &response),
+        Intent::Refused { code, message } => err_response(&request.id, code, message),
+    }
+}
+
+/// `lane.replacement.status`: read one replacement record with its exact
+/// transition history and the precise next allowed transition. Read-only —
+/// no claim, no journal write.
+fn method_lane_replacement_status(shared: &Arc<Shared>, request: &Request) -> String {
+    let replacement_id = match required_str(request.params.as_ref(), "replacement_id") {
+        Some(text) if crate::formats::is_replacement_id(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.replacement.status requires params.replacement_id (rp_ id)",
+            );
+        }
+    };
+    let state = match shared.lock_state() {
+        Ok(state) => state,
+        Err(message) => return err_response(&request.id, "state.unavailable", message),
+    };
+    let row = match state.lane_replacement_by_id(&replacement_id) {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return err_response(
+                &request.id,
+                "state.not_found",
+                format!("no lane replacement {replacement_id:?}"),
+            );
+        }
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let history = match state.lane_replacement_events(&replacement_id) {
+        Ok(events) => events,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let history: Vec<Val> = history
+        .iter()
+        .map(crate::state::lane_replacement_event_val)
+        .collect();
+    ok_response(
+        &request.id,
+        object(vec![
+            ("replacement", crate::state::lane_replacement_val(&row)),
+            ("history", Val::Arr(history)),
+        ]),
+    )
+}
+
 fn method_journal_tail(shared: &Arc<Shared>, request: &Request) -> String {
     let params = request.params.as_ref();
     let after_seq = params
@@ -3179,6 +3621,38 @@ fn reconcile_claims(state: &State, log: &DaemonLog) -> Result<usize, DaemonError
                         claim.key, claim.request_id
                     ),
                 );
+                // Issue #73: an interrupted lane-replacement claim also
+                // flips its record to the explicit `ambiguous` outcome, so
+                // the record itself refuses advancement until external
+                // reconciliation (the claim machinery and the record agree).
+                if claim.method.starts_with("lane.replacement.")
+                    && let Ok(doc) = Val::parse_json(&claim.request_line)
+                    && let Some(params) = doc.get("params")
+                {
+                    match state.mark_replacement_ambiguous(
+                        params,
+                        &format!("interrupted {} claim ({})", claim.method, claim.key),
+                        &time::rfc3339_now(),
+                    ) {
+                        Ok(true) => {
+                            log.write(
+                                "warn",
+                                "reconcile.replacement",
+                                &format!(
+                                    "lane replacement for claim {} marked ambiguous",
+                                    claim.key
+                                ),
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            return Err(daemon_error(
+                                "daemon.reconcile",
+                                format!("{}: {}", err.code, err.message),
+                            ));
+                        }
+                    }
+                }
             }
             Err(err) => {
                 return Err(daemon_error(

@@ -25,11 +25,13 @@ remain usable without it; SQLite owns state; no network control API).
 - `method` is a closed set: `capabilities`, `doctor`, `status`, `plan`,
   `apply`, `grants.list`, `grants.revoke`, `schedules.list`,
   `schedules.create`, `schedules.pause`, `schedules.resume`,
-  `schedules.delete`, `schedules.evaluate`, `state.epoch`, `backup.create`,
-  `restore.begin`, `journal.tail`, `events.subscribe`
-  (issues #5/#9 add the event stream and the lifecycle methods over the
-  socket; the closed set above is mirrored by the Rust schema validator and
-  the fixture oracle).
+  `schedules.delete`, `schedules.evaluate`, `lane.replacement.request`,
+  `lane.replacement.advance`, `lane.replacement.hold`,
+  `lane.replacement.cancel`, `lane.replacement.status`, `state.epoch`,
+  `backup.create`, `restore.begin`, `journal.tail`, `events.subscribe`
+  (issues #5/#9/#73 add the event stream, the lifecycle methods, and the
+  request-only lane replacement surface over the socket; the closed set
+  above is mirrored by the Rust schema validator and the fixture oracle).
 - `apply` **requires** `params.idempotency_key` (`ik_` format): an apply
   without a key is refused at parse time (`rpc/request.malformed.json`).
   Replaying the same request id + idempotency key returns the recorded
@@ -61,6 +63,44 @@ remain usable without it; SQLite owns state; no network control API).
 - Cold boot runs the same evaluation once per due schedule before the
   socket serves (recovery with Herdr absent is covered in
   spec-lifecycle.md).
+
+## Lane replacement methods (issue #73)
+
+Request-only lane replacement records (spec-state.md "Handoff additions"):
+one durable record per logical lane generation, persisted through the same
+claim/journal machinery as every daemon mutation (each method requires
+`params.idempotency_key`). No method on this surface spawns, kills, or
+touches Git, and none requires, issues, or consumes a grant — an agent may
+*request* its own retirement but can never authorize its own replacement
+effects.
+
+- `lane.replacement.request` creates the record at phase `requested` from
+  `params` `lane_id`, `generation`, `source_session`, `source_process`,
+  `role` (doctrine roles), `worktree` (repository-relative) and `reason`.
+  Missing or invalid identities are refused typed (`refusal.malformed`) and
+  nothing is inferred; a second record for the same lane generation is
+  refused (`refusal.replacement.exists`) — concurrent requests can never
+  create two successor owners, and the same request (same id + idempotency
+  key) replays its recorded response.
+- `lane.replacement.advance` performs the transactional compare-and-set to
+  the phase that follows `params.expected_phase` (with `replacement_id` and
+  `generation`). A stale generation (`refusal.replacement.stale`), an
+  invalid order or replayed expectation (`refusal.replacement.order`), and
+  a held/ambiguous/cancelled record (`refusal.replacement.held` /
+  `.ambiguous` / `.invalidated`) cannot advance state.
+- `lane.replacement.hold` parks a pending record in the explicit `held`
+  outcome (required `reason`); advancement is refused while held, and the
+  held state is durable across daemon restarts.
+- `lane.replacement.cancel` invalidates a pending replacement before
+  retirement; the original lane generation is preserved untouched and the
+  invalidated record can never advance. From `retired` onward cancellation
+  is refused (`refusal.replacement.retired`).
+- `lane.replacement.status` reads one record with its exact transition
+  history and the precise `next_allowed` transition (null when the record
+  cannot advance). Read-only — no claim and no journal write.
+- Restart reconciliation marks a record whose transition was interrupted
+  `ambiguous` (the claim machinery and the record agree); external
+  reconciliation is required before it can advance.
 
 ## Responses: `hf-rpc-response/v1`
 

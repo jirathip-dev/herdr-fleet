@@ -91,6 +91,9 @@ RPC_METHODS = frozenset(
     {"capabilities", "doctor", "status", "plan", "apply", "grants.list",
      "grants.revoke", "schedules.list", "schedules.create", "schedules.pause",
      "schedules.resume", "schedules.delete", "schedules.evaluate",
+     "lane.replacement.request", "lane.replacement.advance",
+     "lane.replacement.hold", "lane.replacement.cancel",
+     "lane.replacement.status",
      "state.epoch", "backup.create", "restore.begin", "journal.tail",
      "events.subscribe"}
 )
