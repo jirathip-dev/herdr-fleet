@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use herdr_fleet::adapters::{
-    ADAPTER_TIMEOUT, AgentIdentity, CODE_CREDENTIALS, CODE_EXIT, CODE_MALFORMED,
+    ADAPTER_TIMEOUT, AgentIdentity, CODE_BINDING, CODE_CREDENTIALS, CODE_EXIT, CODE_MALFORMED,
     CODE_PROCESS_DEATH, CODE_STALE_IDENTITY, CODE_TIMEOUT, CODE_UNAVAILABLE,
     CODE_UNKNOWN_CAPABILITY, CODE_UNKNOWN_HARNESS, HarnessKind, Op, OpRequest, Profile,
     bind_identity, execute_named, execute_op, new_session, probe_profile,
@@ -179,6 +179,27 @@ fn official_kinds() -> [HarnessKind; 5] {
     HarnessKind::OFFICIAL
 }
 
+/// Synthetic provider/model binding values for the fake contract tests
+/// (issue #80): deliberately different from the historical code literals,
+/// so a reintroduced literal in the Pi/Jcode prompt row fails the
+/// exact-argv fakes (AC1 RED mutation probe). Never real provider policy.
+const TEST_PROVIDER: &str = "example-provider";
+const TEST_MODEL: &str = "example-model";
+
+/// An official profile carrying the explicit provider/model binding the
+/// Pi/Jcode prompt rows require (issue #80). Kinds whose prompt row does
+/// not carry the pair are returned unchanged.
+fn official_profile(kind: HarnessKind) -> Profile {
+    let profile = Profile::official(kind, kind.name()).expect("profile");
+    if matches!(kind, HarnessKind::Pi | HarnessKind::Jcode) {
+        profile
+            .with_binding(TEST_PROVIDER, TEST_MODEL)
+            .expect("binding")
+    } else {
+        profile
+    }
+}
+
 /// Declared current version for a kind (mirrors the metadata table in
 /// src/adapters.rs / docs/contracts/compatibility.md).
 fn declared_current(kind: HarnessKind) -> &'static str {
@@ -215,23 +236,24 @@ fn executable_name(kind: HarnessKind) -> &'static str {
 /// - `exit-n`: exits with a plain non-zero code.
 fn harness_body(kind: HarnessKind, action: &str, version: &str) -> String {
     let prompt_check = match kind {
-        HarnessKind::Hermes => "[ \"$1\" = \"chat\" ] && [ \"$2\" = \"-q\" ]",
-        HarnessKind::ClaudeCode => "[ \"$1\" = \"-p\" ]",
-        HarnessKind::Codex => "[ \"$1\" = \"exec\" ]",
-        // The pinned one-shot row: provider/model flags, `--print`, the
-        // end-of-options guard, then the payload as the final data element.
-        HarnessKind::Pi => {
-            "[ \"$1\" = \"--provider\" ] && [ \"$2\" = \"deepseek\" ] && [ \"$3\" = \"--model\" ] && [ \"$4\" = \"deepseek-chat\" ] && [ \"$5\" = \"--print\" ] && [ \"$6\" = \"--\" ]"
-        }
-        // The pinned one-shot row: `run`, provider/model flags, `--json`,
-        // the end-of-options guard, then the payload as the final data
-        // element (issue #37; the real jcode v0.84.0 binary accepts this
-        // row — verified 2026-09-08 — and exits 1 with the measured
-        // missing-key text when no provider key is present).
-        HarnessKind::Jcode => {
-            "[ \"$1\" = \"run\" ] && [ \"$2\" = \"--provider\" ] && [ \"$3\" = \"deepseek\" ] && [ \"$4\" = \"--model\" ] && [ \"$5\" = \"deepseek-chat\" ] && [ \"$6\" = \"--json\" ] && [ \"$7\" = \"--\" ]"
-        }
-        HarnessKind::Argv => "true",
+        HarnessKind::Hermes => "[ \"$1\" = \"chat\" ] && [ \"$2\" = \"-q\" ]".to_string(),
+        HarnessKind::ClaudeCode => "[ \"$1\" = \"-p\" ]".to_string(),
+        HarnessKind::Codex => "[ \"$1\" = \"exec\" ]".to_string(),
+        // The pinned one-shot row: the provider/model pair comes from the
+        // profile binding (issue #80), then `--print`, the end-of-options
+        // guard, and the payload as the final data element.
+        HarnessKind::Pi => format!(
+            "[ \"$1\" = \"--provider\" ] && [ \"$2\" = \"{TEST_PROVIDER}\" ] && [ \"$3\" = \"--model\" ] && [ \"$4\" = \"{TEST_MODEL}\" ] && [ \"$5\" = \"--print\" ] && [ \"$6\" = \"--\" ]"
+        ),
+        // The pinned one-shot row: `run`, the bound provider/model pair
+        // (issue #80), `--json`, the end-of-options guard, then the payload
+        // as the final data element (issue #37; the real jcode v0.84.0
+        // binary accepts this row — verified 2026-09-08 — and exits 1 with
+        // the measured missing-key text when no provider key is present).
+        HarnessKind::Jcode => format!(
+            "[ \"$1\" = \"run\" ] && [ \"$2\" = \"--provider\" ] && [ \"$3\" = \"{TEST_PROVIDER}\" ] && [ \"$4\" = \"--model\" ] && [ \"$5\" = \"{TEST_MODEL}\" ] && [ \"$6\" = \"--json\" ] && [ \"$7\" = \"--\" ]"
+        ),
+        HarnessKind::Argv => "true".to_string(),
     };
     let payload = match kind {
         HarnessKind::Hermes => "\"$3\"",
@@ -318,7 +340,7 @@ fn official_exact_version_probes_accept_declared_current_and_refuse_below_minimu
         let bins = FakeBins::new();
         let current = declared_current(kind);
         bins.bin(executable_name(kind), &harness_body(kind, "echo", current));
-        let profile = Profile::official(kind, kind.name()).expect("profile");
+        let profile = official_profile(kind);
         let env = bins.env();
 
         let probe = probe_retry(&profile, &env);
@@ -352,7 +374,7 @@ fn official_exact_version_probes_accept_declared_current_and_refuse_below_minimu
 fn probe_of_a_missing_executable_is_a_typed_unavailable_result() {
     for kind in official_kinds() {
         let bins = FakeBins::new();
-        let profile = Profile::official(kind, kind.name()).expect("profile");
+        let profile = official_profile(kind);
         let env = bins.env();
         let probe = probe_retry(&profile, &env);
         assert!(!probe.present);
@@ -373,7 +395,7 @@ fn success_prompt_delivers_the_payload_as_data_and_returns_the_transcript() {
             &harness_body(kind, "echo", declared_current(kind)),
         );
         bins.bin("herdr", &workspace_body(matching_show_json()));
-        let profile = Profile::official(kind, kind.name()).expect("profile");
+        let profile = official_profile(kind);
         let payload = "implement the typed adapter contract for issue 7";
         let result = run_op_retry(
             &profile,
@@ -403,7 +425,7 @@ fn missing_executable_is_a_typed_unavailable_refusal_and_independent_ops_survive
         let bins = FakeBins::new();
         // No harness executable is installed in the fake dir; herdr exists.
         bins.bin("herdr", &workspace_body(matching_show_json()));
-        let profile = Profile::official(kind, kind.name()).expect("profile");
+        let profile = official_profile(kind);
         let env = bins.env();
 
         let result = run_op_retry(&profile, &prompt_request("hello", ADAPTER_TIMEOUT), &env);
@@ -433,7 +455,7 @@ fn auth_failure_is_a_typed_credentials_refusal() {
             executable_name(kind),
             &harness_body(kind, "auth", declared_current(kind)),
         );
-        let profile = Profile::official(kind, kind.name()).expect("profile");
+        let profile = official_profile(kind);
         let result = run_op_retry(
             &profile,
             &prompt_request("do the thing", ADAPTER_TIMEOUT),
@@ -453,7 +475,7 @@ fn unsupported_capability_is_a_typed_refusal_at_the_named_boundary() {
             executable_name(kind),
             &harness_body(kind, "echo", declared_current(kind)),
         );
-        let profile = Profile::official(kind, kind.name()).expect("profile");
+        let profile = official_profile(kind);
         let result = run_named_retry(
             &profile,
             "teleport",
@@ -475,7 +497,7 @@ fn hanging_prompt_is_deadline_cancelled_and_ambiguous() {
             executable_name(kind),
             &harness_body(kind, "hang", declared_current(kind)),
         );
-        let profile = Profile::official(kind, kind.name()).expect("profile");
+        let profile = official_profile(kind);
         let started = std::time::Instant::now();
         let result = run_op_retry(
             &profile,
@@ -502,7 +524,7 @@ fn interrupt_operation_is_accepted_and_terminal_state_is_observable() {
             &harness_body(kind, "echo", declared_current(kind)),
         );
         bins.bin("herdr", &workspace_body(matching_show_json()));
-        let profile = Profile::official(kind, kind.name()).expect("profile");
+        let profile = official_profile(kind);
         let env = bins.env();
 
         let interrupt = run_op_retry(&profile, &workspace_request(Op::Interrupt), &env);
@@ -532,7 +554,7 @@ fn malformed_workspace_output_is_a_typed_malformed_refusal() {
             "herdr",
             r#"echo 'this is definitely not json {{{' ; exit 0"#,
         );
-        let profile = Profile::official(kind, kind.name()).expect("profile");
+        let profile = official_profile(kind);
         let result = run_op_retry(&profile, &workspace_request(Op::Observe), &bins.env());
         assert_eq!(
             result.code,
@@ -552,7 +574,7 @@ fn process_death_is_a_typed_ambiguous_outcome() {
             executable_name(kind),
             &harness_body(kind, "die", declared_current(kind)),
         );
-        let profile = Profile::official(kind, kind.name()).expect("profile");
+        let profile = official_profile(kind);
         let result = run_op_retry(
             &profile,
             &prompt_request("do not survive this", ADAPTER_TIMEOUT),
@@ -571,7 +593,7 @@ fn plain_nonzero_exit_is_a_typed_failed_outcome() {
             executable_name(kind),
             &harness_body(kind, "exit-3", declared_current(kind)),
         );
-        let profile = Profile::official(kind, kind.name()).expect("profile");
+        let profile = official_profile(kind);
         let result = run_op_retry(
             &profile,
             &prompt_request("make it fail", ADAPTER_TIMEOUT),
@@ -616,7 +638,7 @@ fn pi_missing_provider_key_env_is_a_typed_credentials_refusal() {
         "pi",
         "if [ \"$1\" = \"--version\" ]; then echo '0.85.1'; exit 0; fi\nif [ \"$1\" = \"--provider\" ] && [ \"$6\" = \"--\" ]; then echo 'No API key found for deepseek.' >&2; echo 'Use /login to log into a provider via OAuth or API key.' >&2; exit 1; fi\necho \"unexpected argv: $*\" >&2\nexit 9\n",
     );
-    let profile = Profile::official(HarnessKind::Pi, "pi").expect("profile");
+    let profile = pi_profile();
     let result = run_op_retry(
         &profile,
         &prompt_request("do the thing", ADAPTER_TIMEOUT),
@@ -635,12 +657,14 @@ fn pi_hostile_payload_is_data_and_environment_stays_allowlisted() {
     // plus the environment it actually saw.
     bins.bin(
         "pi",
-        r#"if [ "$1" = "--provider" ] && [ "$2" = "deepseek" ] && [ "$3" = "--model" ] && [ "$4" = "deepseek-chat" ] && [ "$5" = "--print" ] && [ "$6" = "--" ]; then printf 'argv_ok payload=[%s] path=[%s] secret=[%s]' "$7" "$PATH" "${HF_TEST_SECRET_VAR:-unset}"; exit 0; fi
+        &format!(
+            r#"if [ "$1" = "--provider" ] && [ "$2" = "{TEST_PROVIDER}" ] && [ "$3" = "--model" ] && [ "$4" = "{TEST_MODEL}" ] && [ "$5" = "--print" ] && [ "$6" = "--" ]; then printf 'argv_ok payload=[%s] path=[%s] secret=[%s]' "$7" "$PATH" "${{HF_TEST_SECRET_VAR:-unset}}"; exit 0; fi
 echo "unexpected argv: $*" >&2
 exit 9
-"#,
+"#
+        ),
     );
-    let profile = Profile::official(HarnessKind::Pi, "pi").expect("profile");
+    let profile = pi_profile();
     let hostile = "a; rm -rf /tmp/x; $(touch /tmp/pwned33); `echo injected`; \"quoted\"; && || | > < & newline\nhere; s/ed/; -leading --flag-like";
     let result = run_op_retry(
         &profile,
@@ -686,7 +710,7 @@ fn pi_spawned_identity_is_the_resolved_absolute_path_witness() {
         "pi",
         "if [ \"$1\" = \"--provider\" ] && [ \"$6\" = \"--\" ]; then printf '%s' \"$0\"; exit 0; fi\nexit 9\n",
     );
-    let profile = Profile::official(HarnessKind::Pi, "pi").expect("profile");
+    let profile = pi_profile();
     let identity = bind_identity("ws-session-33", "tty-33-pi", 1).expect("identity");
     let session = new_session("sess-pi-c1-witness", identity).expect("session");
     let result = run_op_retry(
@@ -730,7 +754,7 @@ fn pi_prompt_runs_confined_to_the_assigned_worktree() {
         "pi",
         "if [ \"$1\" = \"--provider\" ] && [ \"$6\" = \"--\" ]; then pwd; exit 0; fi\nexit 9\n",
     );
-    let profile = Profile::official(HarnessKind::Pi, "pi").expect("profile");
+    let profile = pi_profile();
     let identity = bind_identity("ws-session-33", "tty-33-pi", 1).expect("identity");
     let session = new_session("sess-pi-confinement", identity).expect("session");
     // A fake "worktree" directory (the test stands in for the lane root).
@@ -783,7 +807,7 @@ fn identity_read_back_matches_the_bound_triple_and_stale_read_backs_are_refused(
             &harness_body(kind, "echo", declared_current(kind)),
         );
         bins.bin("herdr", &workspace_body(matching_show_json()));
-        let profile = Profile::official(kind, kind.name()).expect("profile");
+        let profile = official_profile(kind);
         let env = bins.env();
 
         // Fresh identity read-back: all three parts match.
@@ -898,7 +922,7 @@ fn same_plan_fixture_passes_against_fake_implementations_of_every_adapter_contra
             &harness_body(kind, "echo", declared_current(kind)),
         );
         bins.bin("herdr", &workspace_body(matching_show_json()));
-        let profile = Profile::official(kind, kind.name()).expect("profile");
+        let profile = official_profile(kind);
         let statuses = run_scenario(&profile, &sequence, &bins.env(), kind.name());
         status_sets.push(statuses);
     }
@@ -1049,6 +1073,8 @@ fn unknown_harness_kind_fails_typed_and_independent_probes_keep_working() {
         kind: "teleport".to_string(),
         executable: "teleport".to_string(),
         env_allow: vec!["PATH".to_string()],
+        provider: None,
+        model: None,
     };
     let err = Profile::from_config(&unknown).expect_err("unknown kind refused");
     assert_eq!(err.code, CODE_UNKNOWN_HARNESS);
@@ -1061,6 +1087,8 @@ fn unknown_harness_kind_fails_typed_and_independent_probes_keep_working() {
         kind: "hermes".to_string(),
         executable: "hermes".to_string(),
         env_allow: vec!["PATH".to_string()],
+        provider: None,
+        model: None,
     };
     let profile = Profile::from_config(&known).expect("known kind parses");
     let probe = probe_retry(&profile, &bins.env());
@@ -1218,12 +1246,23 @@ fn herdr_logger_body() -> &'static str {
 }
 
 fn pi_profile() -> Profile {
-    Profile::official(HarnessKind::Pi, "pi").expect("pi profile")
+    official_profile(HarnessKind::Pi)
 }
 
 /// Read the fake-herdr argv log written by the last run.
 fn read_fake_log(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
+}
+
+/// The settled (last) lifecycle report row in the fake-herdr argv log. A
+/// bounded spawn retry can re-run the prompt operation, so the log may
+/// carry more than one report row; the final row is the settled report.
+fn last_fake_log_line(path: &Path) -> String {
+    read_fake_log(path)
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[test]
@@ -1273,8 +1312,8 @@ fn pi_prompt_under_herdr_reports_idle_after_a_successful_one_shot() {
     );
     assert_eq!(result.status, "succeeded", "report must not change the op");
     assert_eq!(
-        read_fake_log(&log),
-        "pane report-agent w33:p1 --source custom:herdr-fleet-pi --agent pi --state idle\n"
+        last_fake_log_line(&log),
+        "pane report-agent w33:p1 --source custom:herdr-fleet-pi --agent pi --state idle"
     );
 }
 
@@ -1301,8 +1340,8 @@ fn pi_prompt_credentials_under_herdr_reports_blocked_with_a_static_message() {
     assert_eq!(result.status, "refused");
     assert_eq!(result.code, Some(CODE_CREDENTIALS));
     assert_eq!(
-        read_fake_log(&log),
-        "pane report-agent w33:p1 --source custom:herdr-fleet-pi --agent pi --state blocked --message harness credentials required\n"
+        last_fake_log_line(&log),
+        "pane report-agent w33:p1 --source custom:herdr-fleet-pi --agent pi --state blocked --message harness credentials required"
     );
 }
 
@@ -1326,8 +1365,8 @@ fn pi_prompt_timeout_under_herdr_reports_idle_after_the_deadline_kill() {
     assert_eq!(result.status, "ambiguous");
     assert_eq!(result.code, Some(CODE_TIMEOUT));
     assert_eq!(
-        read_fake_log(&log),
-        "pane report-agent w33:p1 --source custom:herdr-fleet-pi --agent pi --state idle\n"
+        last_fake_log_line(&log),
+        "pane report-agent w33:p1 --source custom:herdr-fleet-pi --agent pi --state idle"
     );
 }
 
@@ -1402,11 +1441,12 @@ fn pi_herdr_report_failure_never_changes_the_typed_op_result() {
 // ---------------------------------------------------------------------------
 
 /// The jcode fake whose prompt invocation verifies the exact documented
-/// row (`run --provider deepseek --model deepseek-chat --json --`) and
-/// then prints `line` (plus the version branch).
+/// row (`run --provider <binding> --model <binding> --json --`; the pair
+/// comes from the profile binding, issue #80) and then prints `line`
+/// (plus the version branch).
 fn jcode_row_body(line: &str) -> String {
     format!(
-        "if [ \"$1\" = \"--version\" ]; then echo '0.84.0'; exit 0; fi\nif [ \"$1\" = \"run\" ] && [ \"$2\" = \"--provider\" ] && [ \"$3\" = \"deepseek\" ] && [ \"$4\" = \"--model\" ] && [ \"$5\" = \"deepseek-chat\" ] && [ \"$6\" = \"--json\" ] && [ \"$7\" = \"--\" ]; then {line}\nfi\necho \"unexpected argv: $*\" >&2\nexit 9\n"
+        "if [ \"$1\" = \"--version\" ]; then echo '0.84.0'; exit 0; fi\nif [ \"$1\" = \"run\" ] && [ \"$2\" = \"--provider\" ] && [ \"$3\" = \"{TEST_PROVIDER}\" ] && [ \"$4\" = \"--model\" ] && [ \"$5\" = \"{TEST_MODEL}\" ] && [ \"$6\" = \"--json\" ] && [ \"$7\" = \"--\" ]; then {line}\nfi\necho \"unexpected argv: $*\" >&2\nexit 9\n"
     )
 }
 
@@ -1423,7 +1463,7 @@ fn jcode_missing_provider_key_env_is_a_typed_credentials_refusal() {
             "echo 'Error: DEEPSEEK_API_KEY not found in environment or ~/.config/jcode/deepseek.env' >&2\nexit 1",
         ),
     );
-    let profile = Profile::official(HarnessKind::Jcode, "jcode").expect("profile");
+    let profile = jcode_profile();
     let result = run_op_retry(
         &profile,
         &prompt_request("do the thing", ADAPTER_TIMEOUT),
@@ -1446,7 +1486,7 @@ fn jcode_real_version_output_shape_is_parsed_by_the_probe() {
         "jcode",
         "if [ \"$1\" = \"--version\" ]; then echo 'jcode v0.84.0 (57d587899)'; exit 0; fi\nexit 9\n",
     );
-    let profile = Profile::official(HarnessKind::Jcode, "jcode").expect("profile");
+    let profile = jcode_profile();
     let probe = probe_retry(&profile, &bins.env());
     assert!(probe.present, "detail: {:?}", probe.detail);
     assert_eq!(probe.version.as_deref(), Some("0.84.0"));
@@ -1454,33 +1494,127 @@ fn jcode_real_version_output_shape_is_parsed_by_the_probe() {
 }
 
 #[test]
-fn jcode_json_envelope_transcript_is_parsed_from_success_stdout() {
+fn jcode_json_envelope_transcript_and_returned_identity_are_surfaced() {
     // jcode's `--json` row prints one top-level JSON object on stdout
-    // whose `text` field carries the final answer (shape measured against
-    // the real jcode v0.84.0 binary on 2026-09-08). The adapter parses the
-    // envelope so the typed transcript is the model text, not the raw
-    // envelope.
+    // whose `text` field carries the final answer and whose
+    // `provider`/`model` fields carry the identity the harness actually
+    // used (shape measured against the real jcode v0.84.0 binary on
+    // 2026-09-08; issue #80). The adapter parses the envelope so the typed
+    // transcript is the model text and the requested/returned identity
+    // pair is observable on the typed result.
     let bins = FakeBins::new();
+    let envelope = format!(
+        "{{\n  \"session_id\": \"session_kangaroo_1788883711941_a3cc1cf55178c963\",\n  \"provider\": \"{TEST_PROVIDER}\",\n  \"model\": \"{TEST_MODEL}\",\n  \"text\": \"implemented the ini parser; 12 tests pass\",\n  \"usage\": {{\"input_tokens\": 123, \"output_tokens\": 45}}\n}}"
+    );
     bins.bin(
         "jcode",
-        &jcode_row_body(
-            "printf '%s' '{\n  \"session_id\": \"session_kangaroo_1788883711941_a3cc1cf55178c963\",\n  \"provider\": \"deepseek\",\n  \"model\": \"deepseek-chat\",\n  \"text\": \"implemented the ini parser; 12 tests pass\",\n  \"usage\": {\"input_tokens\": 123, \"output_tokens\": 45}\n}'\nexit 0",
-        ),
+        &jcode_row_body(&format!("printf '%s' '{envelope}'\nexit 0")),
     );
-    let profile = Profile::official(HarnessKind::Jcode, "jcode").expect("profile");
+    let profile = jcode_profile();
     let result = run_op_retry(
         &profile,
         &prompt_request("implement the ini parser", ADAPTER_TIMEOUT),
         &bins.env(),
     );
     assert_eq!(result.status, "succeeded");
-    let transcript = result
-        .payload
-        .as_ref()
-        .and_then(|p| p.get("transcript"))
-        .and_then(Val::as_str)
-        .expect("transcript");
-    assert_eq!(transcript, "implemented the ini parser; 12 tests pass");
+    let payload = result.payload.as_ref().expect("payload");
+    assert_eq!(
+        payload.get("transcript").and_then(Val::as_str),
+        Some("implemented the ini parser; 12 tests pass")
+    );
+    let requested = payload.get("requested").expect("requested identity");
+    assert_eq!(
+        requested.get("provider").and_then(Val::as_str),
+        Some(TEST_PROVIDER)
+    );
+    assert_eq!(
+        requested.get("model").and_then(Val::as_str),
+        Some(TEST_MODEL)
+    );
+    let returned = payload.get("returned").expect("returned identity");
+    assert_eq!(
+        returned.get("provider").and_then(Val::as_str),
+        Some(TEST_PROVIDER)
+    );
+    assert_eq!(
+        returned.get("model").and_then(Val::as_str),
+        Some(TEST_MODEL)
+    );
+}
+
+#[test]
+fn jcode_returned_identity_mismatch_is_observable_and_never_coerced() {
+    // The envelope reports a different provider/model than the requested
+    // binding: both are surfaced verbatim — the returned identity is never
+    // overwritten with the requested pair (issue #80 AC4).
+    let bins = FakeBins::new();
+    let envelope = "{\n  \"provider\": \"other-provider-9\",\n  \"model\": \"other-model-9\",\n  \"text\": \"mismatch transcript\"\n}";
+    bins.bin(
+        "jcode",
+        &jcode_row_body(&format!("printf '%s' '{envelope}'\nexit 0")),
+    );
+    let profile = jcode_profile();
+    let result = run_op_retry(
+        &profile,
+        &prompt_request("payload", ADAPTER_TIMEOUT),
+        &bins.env(),
+    );
+    assert_eq!(result.status, "succeeded");
+    let payload = result.payload.as_ref().expect("payload");
+    assert_eq!(
+        payload.get("transcript").and_then(Val::as_str),
+        Some("mismatch transcript")
+    );
+    assert_eq!(
+        payload
+            .get("requested")
+            .and_then(|identity| identity.get("provider"))
+            .and_then(Val::as_str),
+        Some(TEST_PROVIDER)
+    );
+    assert_eq!(
+        payload
+            .get("returned")
+            .and_then(|identity| identity.get("provider"))
+            .and_then(Val::as_str),
+        Some("other-provider-9")
+    );
+    assert_eq!(
+        payload
+            .get("returned")
+            .and_then(|identity| identity.get("model"))
+            .and_then(Val::as_str),
+        Some("other-model-9")
+    );
+}
+
+#[test]
+fn jcode_non_envelope_stdout_keeps_the_raw_transcript() {
+    // Non-envelope stdout falls back to the raw transcript with no content
+    // loss; no returned identity is observable, while the requested
+    // binding is still surfaced (issue #80 AC4).
+    let bins = FakeBins::new();
+    bins.bin(
+        "jcode",
+        &jcode_row_body("printf '%s' 'plain model output; no envelope'\nexit 0"),
+    );
+    let profile = jcode_profile();
+    let result = run_op_retry(
+        &profile,
+        &prompt_request("payload", ADAPTER_TIMEOUT),
+        &bins.env(),
+    );
+    assert_eq!(result.status, "succeeded");
+    let payload = result.payload.as_ref().expect("payload");
+    assert_eq!(
+        payload.get("transcript").and_then(Val::as_str),
+        Some("plain model output; no envelope")
+    );
+    assert_eq!(payload.get("returned"), Some(&Val::Null));
+    assert!(
+        payload.get("requested").is_some(),
+        "the requested binding stays observable"
+    );
 }
 
 #[test]
@@ -1495,7 +1629,7 @@ fn jcode_hostile_payload_is_data_and_environment_stays_allowlisted() {
             "printf 'argv_ok payload=[%s] path=[%s] secret=[%s]' \"$8\" \"$PATH\" \"${HF_TEST_SECRET_VAR:-unset}\"\nexit 0",
         ),
     );
-    let profile = Profile::official(HarnessKind::Jcode, "jcode").expect("profile");
+    let profile = jcode_profile();
     let hostile = "a; rm -rf /tmp/x; $(touch /tmp/pwned37); `echo injected`; \"quoted\"; && || | > < & newline\nhere; s/ed/; -leading --flag-like";
     let result = run_op_retry(
         &profile,
@@ -1537,7 +1671,7 @@ fn jcode_hostile_payload_is_data_and_environment_stays_allowlisted() {
 fn jcode_spawned_identity_is_the_resolved_absolute_path_witness() {
     let bins = FakeBins::new();
     let fake = bins.bin("jcode", &jcode_row_body("printf '%s' \"$0\"\nexit 0"));
-    let profile = Profile::official(HarnessKind::Jcode, "jcode").expect("profile");
+    let profile = jcode_profile();
     let identity = bind_identity("ws-session-37", "tty-37-jcode", 1).expect("identity");
     let session = new_session("sess-jcode-c1-witness", identity).expect("session");
     let result = run_op_retry(
@@ -1577,7 +1711,7 @@ fn jcode_spawned_identity_is_the_resolved_absolute_path_witness() {
 fn jcode_prompt_runs_confined_to_the_assigned_worktree() {
     let bins = FakeBins::new();
     bins.bin("jcode", &jcode_row_body("pwd\nexit 0"));
-    let profile = Profile::official(HarnessKind::Jcode, "jcode").expect("profile");
+    let profile = jcode_profile();
     let identity = bind_identity("ws-session-37", "tty-37-jcode", 1).expect("identity");
     let session = new_session("sess-jcode-confinement", identity).expect("session");
     let base = std::env::var_os("CARGO_TARGET_TMPDIR")
@@ -1623,7 +1757,7 @@ fn jcode_prompt_runs_confined_to_the_assigned_worktree() {
 // ---------------------------------------------------------------------------
 
 fn jcode_profile() -> Profile {
-    Profile::official(HarnessKind::Jcode, "jcode").expect("jcode profile")
+    official_profile(HarnessKind::Jcode)
 }
 
 fn jcode_env_with_log(bins: &FakeBins, log: &Path) -> BTreeMap<String, String> {
@@ -1674,8 +1808,8 @@ fn jcode_prompt_under_herdr_reports_idle_after_a_successful_one_shot() {
     );
     assert_eq!(result.status, "succeeded", "report must not change the op");
     assert_eq!(
-        read_fake_log(&log),
-        "pane report-agent w33:p1 --source custom:herdr-fleet-jcode --agent jcode --state idle\n"
+        last_fake_log_line(&log),
+        "pane report-agent w33:p1 --source custom:herdr-fleet-jcode --agent jcode --state idle"
     );
 }
 
@@ -1700,8 +1834,8 @@ fn jcode_prompt_credentials_under_herdr_reports_blocked_with_a_static_message() 
     assert_eq!(result.status, "refused");
     assert_eq!(result.code, Some(CODE_CREDENTIALS));
     assert_eq!(
-        read_fake_log(&log),
-        "pane report-agent w33:p1 --source custom:herdr-fleet-jcode --agent jcode --state blocked --message harness credentials required\n"
+        last_fake_log_line(&log),
+        "pane report-agent w33:p1 --source custom:herdr-fleet-jcode --agent jcode --state blocked --message harness credentials required"
     );
 }
 
@@ -1721,8 +1855,8 @@ fn jcode_prompt_timeout_under_herdr_reports_idle_after_the_deadline_kill() {
     assert_eq!(result.status, "ambiguous");
     assert_eq!(result.code, Some(CODE_TIMEOUT));
     assert_eq!(
-        read_fake_log(&log),
-        "pane report-agent w33:p1 --source custom:herdr-fleet-jcode --agent jcode --state idle\n"
+        last_fake_log_line(&log),
+        "pane report-agent w33:p1 --source custom:herdr-fleet-jcode --agent jcode --state idle"
     );
 }
 
@@ -1779,4 +1913,120 @@ fn jcode_herdr_report_failure_never_changes_the_typed_op_result() {
     let prompt = run_op_retry(&profile, &prompt_request("hello", ADAPTER_TIMEOUT), &env);
     assert_eq!(prompt.status, "refused");
     assert_eq!(prompt.code, Some(CODE_UNAVAILABLE));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #80: explicit provider/model binding (AC1/AC3). The fakes pin the
+// exact argv, so the pair must come from the profile binding (a
+// reintroduced literal fails these); an unbound profile refuses with the
+// documented typed code without spawning anything, and reports `blocked`
+// under herdr.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prompt_rows_source_the_pair_from_the_declared_binding_not_a_literal() {
+    // A second, different declared pair (the shared matrix fakes pin the
+    // first): the row follows the binding, never a hardcoded literal.
+    for kind in [HarnessKind::Pi, HarnessKind::Jcode] {
+        let bins = FakeBins::new();
+        let prompt_check = match kind {
+            HarnessKind::Pi => {
+                "[ \"$1\" = \"--provider\" ] && [ \"$2\" = \"alt-provider\" ] && [ \"$3\" = \"--model\" ] && [ \"$4\" = \"alt-model\" ] && [ \"$5\" = \"--print\" ] && [ \"$6\" = \"--\" ]"
+            }
+            HarnessKind::Jcode => {
+                "[ \"$1\" = \"run\" ] && [ \"$2\" = \"--provider\" ] && [ \"$3\" = \"alt-provider\" ] && [ \"$4\" = \"--model\" ] && [ \"$5\" = \"alt-model\" ] && [ \"$6\" = \"--json\" ] && [ \"$7\" = \"--\" ]"
+            }
+            _ => unreachable!("binding test covers the official pair rows only"),
+        };
+        bins.bin(
+            executable_name(kind),
+            &format!(
+                "if {prompt_check}; then printf '%s' bound_ok; exit 0; fi\necho \"unexpected argv: $*\" >&2\nexit 9\n"
+            ),
+        );
+        let profile = Profile::official(kind, kind.name())
+            .expect("profile")
+            .with_binding("alt-provider", "alt-model")
+            .expect("binding");
+        let result = run_op_retry(
+            &profile,
+            &prompt_request("payload", ADAPTER_TIMEOUT),
+            &bins.env(),
+        );
+        assert_eq!(
+            result.status,
+            "succeeded",
+            "{}: code={:?} detail={:?}",
+            kind.name(),
+            result.code,
+            result.detail
+        );
+        assert_eq!(
+            result
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("transcript"))
+                .and_then(Val::as_str),
+            Some("bound_ok"),
+            "{}",
+            kind.name()
+        );
+    }
+}
+
+#[test]
+fn unbound_prompt_is_a_typed_refusal_without_spawning_the_harness() {
+    // AC3 (issue #80): with no declared binding the terminal prompt refuses
+    // with the documented code and nothing is spawned — the fake dir holds
+    // no harness executable, so a spawn attempt would classify as
+    // `refusal.unavailable.harness` instead. No default, no substitution.
+    for kind in [HarnessKind::Pi, HarnessKind::Jcode] {
+        let bins = FakeBins::new();
+        let profile = Profile::official(kind, kind.name()).expect("profile");
+        let result = run_op_retry(
+            &profile,
+            &prompt_request("do the thing", ADAPTER_TIMEOUT),
+            &bins.env(),
+        );
+        assert_eq!(result.status, "refused", "{}", kind.name());
+        assert_eq!(result.code, Some(CODE_BINDING), "{}", kind.name());
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("binding"),
+            "{}: message names the missing binding: {:?}",
+            kind.name(),
+            result.message
+        );
+    }
+}
+
+#[test]
+fn unbound_prompt_under_herdr_reports_blocked_with_a_static_message() {
+    // The typed binding refusal maps to the documented `blocked` lifecycle
+    // report (declaring the provider/model pair is a user decision). No pi
+    // executable exists, so a spawn attempt would be `refusal.unavailable`;
+    // the report row must still fire with the static message.
+    let bins = FakeBins::new();
+    let log = bins.path.join("herdr-argv.log");
+    bins.bin("herdr", herdr_logger_body());
+    let profile = Profile::official(HarnessKind::Pi, "pi").expect("profile");
+    let mut env = bins.env_herdr();
+    env.insert(
+        "HF_FAKE_LOG".to_string(),
+        log.to_string_lossy().into_owned(),
+    );
+    let result = run_op_retry(
+        &profile,
+        &prompt_request("do the thing", ADAPTER_TIMEOUT),
+        &env,
+    );
+    assert_eq!(result.status, "refused");
+    assert_eq!(result.code, Some(CODE_BINDING));
+    assert_eq!(
+        last_fake_log_line(&log),
+        "pane report-agent w33:p1 --source custom:herdr-fleet-pi --agent pi --state blocked --message harness provider/model binding required"
+    );
 }

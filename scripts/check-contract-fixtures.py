@@ -266,10 +266,23 @@ def validate_config(obj: dict) -> tuple[str, str]:
         if not isinstance(obj["harness"], dict):
             return _ref(REFUSE_MALFORMED, "config.harness must be a table")
         for name, entry in obj["harness"].items():
-            if not isinstance(entry, dict) or set(entry) != {"kind", "executable", "env_allow"}:
+            shape = {"kind", "executable", "env_allow", "provider", "model"}
+            required = {"kind", "executable", "env_allow"}
+            if (
+                not isinstance(entry, dict)
+                or not required.issubset(entry)
+                or not set(entry) <= shape
+            ):
                 return _ref(REFUSE_MALFORMED, "config.harness.{}: bad shape".format(name))
             if not isinstance(entry["kind"], str) or not isinstance(entry["executable"], str):
                 return _ref(REFUSE_MALFORMED, "config.harness.{}: kind/executable strings".format(name))
+            # Optional provider/model binding pair (issue #80): the document
+            # carries strings; bare-token and both-or-neither validation is
+            # the decoder's (config.rs) rule.
+            for key in ("provider", "model"):
+                if key in entry and not isinstance(entry[key], str):
+                    return _ref(REFUSE_MALFORMED,
+                                "config.harness.{}.{} must be a string".format(name, key))
             env_allow = entry["env_allow"]
             if not isinstance(env_allow, list) or not all(
                 isinstance(item, str) for item in env_allow

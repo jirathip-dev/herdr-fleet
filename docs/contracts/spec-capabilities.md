@@ -1,6 +1,6 @@
 # Spec: harness and forge capability negotiation
 
-Refs #3, #7. Family: `hf-capability/v1`. Fixtures:
+Refs #3, #7, #80. Family: `hf-capability/v1`. Fixtures:
 [`capability/`](../../schemas/fixtures/capability/capability.harness.valid.json). Design commitment
 (ADR-0003: adapters at a small typed capability boundary; unsupported
 capabilities return a typed refusal and never silently fall back to shell
@@ -92,6 +92,9 @@ can run with **no harness credentials** (AC7).
   not in the closed harness set or not declared), `refusal.unavailable.harness`
   (executable missing/unspawnable), `refusal.credentials` (auth failure —
   credentials stay in the harness, never in herdr-fleet, AC8),
+  `refusal.binding.missing` (the harness profile declares no explicit
+  provider/model binding; the terminal prompt refuses — no default is
+  inferred and no fallback model is substituted, issue #80),
   `refusal.malformed.output` (unparsable structured output),
   `refusal.stale.identity`, `refusal.identity.incomplete`,
   `refusal.request.malformed`, `adapter.timeout` (deadline exceeded, the
@@ -124,6 +127,7 @@ can run with **no harness credentials** (AC7).
   | `start` succeeded | `working` (lane active) |
   | terminal `prompt` — succeeded / failed / refused / ambiguous (timeout, process death, plain exit) | `idle` |
   | terminal `prompt` with `refusal.credentials` | `blocked` + static message `harness credentials required` (a provider key decision is needed; the message never carries credential text) |
+  | terminal `prompt` with `refusal.binding.missing` | `blocked` + static message `harness provider/model binding required` (a declaration decision is needed — the profile has no `provider`/`model` binding pair; the message never carries binding values) |
 
   The `pane report-agent` input accepts `idle`/`working`/`blocked`/`unknown`,
   not the derived `done` status, so terminal one-shots report `idle`. A live
@@ -146,18 +150,23 @@ can run with **no harness credentials** (AC7).
 ## Harness neutrality consequences
 
 - Hermes/Claude Code/Codex/Pi/Jcode are 1.0 **adapter examples**
-  (issues #7/#33/#37)
+  (issues #7/#33/#37/#80)
   with their own compatibility matrices
   ([compatibility.md](compatibility.md)); the domain core contains no
   product-name branches and no model/provider names. Pi's one-shot prompt
-  row and Jcode's one-shot `jcode run` row
-  carry provider/model as opaque adapter metadata in argv (measured
-  example rows; never persisted, never on a wire); provider keys arrive
-  only through the environment allowlist. Jcode's `--json` row emits a
-  machine-readable envelope on stdout (top-level object with a `text`
-  field, shape measured against v0.84.0 on 2026-09-08); the adapter
-  parses the transcript out of that envelope when the output has the
-  envelope shape and otherwise keeps raw stdout.
+  row and Jcode's one-shot `jcode run` row source their
+  `--provider`/`--model` argv pair from the harness profile's **explicit
+  binding** (`harness.<key>.provider`/`model`, issue #80);
+  the pair is declared input — never a code literal, never persisted,
+  never on a wire — and a profile without the binding refuses the prompt
+  (`refusal.binding.missing`: no default, no substitution); provider keys
+  arrive only through the environment allowlist. Jcode's `--json` row
+  emits a machine-readable envelope on stdout (top-level object with a
+  `text` field plus the returned `provider`/`model`, shape measured
+  against v0.84.0 on 2026-09-08); the adapter parses the transcript out
+  of that envelope and surfaces the returned identity alongside the
+  requested pair on the typed result (a requested/returned mismatch is
+  observable and never silently coerced), and otherwise keeps raw stdout.
 - An unknown or unavailable harness fails clearly without degrading
   unrelated read-only operations (issue #7 AC4; observe.rs pattern).
 - Herdr and `gh` themselves are negotiated the same way; see
