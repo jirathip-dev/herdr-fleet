@@ -1342,6 +1342,22 @@ fn execute_config(action: ConfigAction, invocation: &Invocation) -> CmdResult {
                             "env_allow",
                             Val::Arr(harness.env_allow.iter().map(|name| string(name)).collect()),
                         ),
+                        (
+                            "provider",
+                            harness
+                                .provider
+                                .as_ref()
+                                .map(|provider| string(provider))
+                                .unwrap_or_else(null),
+                        ),
+                        (
+                            "model",
+                            harness
+                                .model
+                                .as_ref()
+                                .map(|model| string(model))
+                                .unwrap_or_else(null),
+                        ),
                     ])
                 })
                 .collect();

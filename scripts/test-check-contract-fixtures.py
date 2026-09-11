@@ -69,6 +69,25 @@ def run_discrimination(probe) -> None:
     _check(code == probe.REFUSE_MALFORMED,
            "config unknown table must refuse-malformed, got " + code)
 
+    # 1b. Config harness binding (issue #80): the optional provider/model
+    #     pair is a string pair in the document rules; a non-string token is
+    #     refused. (Bare-token / both-or-neither rules live in the decoder.)
+    p = _tamper_copy("config/config.valid.toml",
+                     lambda b: b.replace(b'env_allow = ["PATH", "HOME"]',
+                                         b'env_allow = ["PATH", "HOME"]\nprovider = 5'))
+    code, _msg = probe.validate_file(p, "hf-config")
+    _check(code == probe.REFUSE_MALFORMED,
+           "config harness non-string provider must refuse-malformed, got " + code)
+
+    p = _tamper_copy("config/config.valid.toml",
+                     lambda b: b.replace(b'env_allow = ["PATH", "HOME"]',
+                                         b'env_allow = ["PATH", "HOME"]\n'
+                                         b'provider = "example-provider"\n'
+                                         b'model = "example-model"'))
+    code, _msg = probe.validate_file(p, "hf-config")
+    _check(code == probe.ACCEPT,
+           "config harness provider/model pair must be accepted, got " + code)
+
     # 2. Policy: overlay may only tighten.
     p = _tamper_copy("policy/policy.valid.toml",
                      lambda b: b.replace(b'production_confirmation = "tty"',

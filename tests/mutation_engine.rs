@@ -1408,18 +1408,114 @@ fn dirty_cleanup_archive_preserves_exact_bytes_and_manifest_and_never_deletes() 
         manifest_sha,
         "manifest file digest must equal the reported manifest_sha256"
     );
-    // Archive NEVER deletes: the dirty lane stays in place, and a repeat
-    // archive within the same second refuses to overwrite the existing
-    // archive directory (fail closed — salvage bytes are never clobbered).
+    // Archive NEVER deletes: the dirty lane stays in place. The repeat
+    // archive's destination name is wall-clock second-granular (the daemon
+    // names it `lane-<branch>-<unix seconds>`), so the second call has two
+    // legal outcomes and the test must not depend on which one happens:
+    //   * collision (same second) -> typed refusal of the existing
+    //     destination (fail closed — salvage bytes are never clobbered), or
+    //   * next second -> a second, complete archive under a DIFFERENT
+    //     directory name.
+    // The clock-independent INVARIANT, asserted in either branch: the FIRST
+    // archive directory stays byte-unchanged.
     assert!(lane2.exists() && lane2.join("uncommitted.txt").exists());
-    let (repeat_code, _) = archive_scenario.apply_err(68, "x1", None, None);
-    assert_eq!(
-        repeat_code, "effect.archive.failed",
-        "an existing archive dir is never overwritten"
+    let repeat = rpc(
+        &archive_scenario.fixture.socket,
+        &fresh_id(68),
+        "apply",
+        Some(archive_scenario.params(68, "x1", None, None, None, false)),
     );
+    if let Some(true) = repeat.get("ok").and_then(Val::as_bool) {
+        // Next-second branch: a second archive, complete and distinct.
+        let result = repeat.get("result").expect("result");
+        assert_eq!(
+            result.get("removed").and_then(Val::as_bool),
+            Some(false),
+            "a repeat archive still never removes the lane"
+        );
+        let second = result.get("archived").expect("second archived doc");
+        let second_dir = PathBuf::from(
+            second
+                .get("archive_dir")
+                .and_then(Val::as_str)
+                .expect("second archive dir"),
+        );
+        assert_ne!(
+            second_dir, archive_dir,
+            "a successful second archive must use a fresh destination"
+        );
+        let second_files = second
+            .get("files")
+            .and_then(Val::as_array)
+            .expect("second files");
+        assert_eq!(second_files.len(), 3, "the second archive is complete");
+        let second_manifest_sha = second
+            .get("manifest_sha256")
+            .and_then(Val::as_str)
+            .expect("second manifest sha");
+        let second_manifest_text =
+            std::fs::read_to_string(second_dir.join("manifest.json")).expect("second manifest");
+        assert_eq!(
+            herdr_fleet::canonical::sha256_hex(second_manifest_text.as_bytes()),
+            second_manifest_sha,
+            "the second manifest digest must pin its own bytes"
+        );
+        for file in second_files {
+            let rel = file.get("path").and_then(Val::as_str).expect("path");
+            let bytes = std::fs::read(second_dir.join(rel)).expect("second archive bytes");
+            assert_eq!(
+                herdr_fleet::canonical::sha256_hex(&bytes),
+                file.get("sha256").and_then(Val::as_str).expect("sha"),
+                "second archive {rel} digest"
+            );
+            assert_eq!(
+                Some(bytes.len() as i64),
+                file.get("bytes").and_then(Val::as_int),
+                "second archive {rel} byte count"
+            );
+        }
+    } else {
+        // Same-second branch: the typed refusal of the existing destination.
+        let error = repeat.get("error").expect("error doc");
+        assert_eq!(
+            error.get("code").and_then(Val::as_str),
+            Some("effect.archive.failed"),
+            "an existing archive dir is never overwritten: {}",
+            herdr_fleet::canonical::canonical_text(&repeat)
+        );
+    }
+    // The invariant, independent of which branch ran: the FIRST archive
+    // directory is byte-unchanged — its manifest digest still equals the
+    // recorded one and every entry still matches the recorded manifest.
+    let first_manifest_text =
+        std::fs::read_to_string(archive_dir.join("manifest.json")).expect("first manifest");
+    assert_eq!(
+        herdr_fleet::canonical::sha256_hex(first_manifest_text.as_bytes()),
+        manifest_sha,
+        "the first archive manifest must be byte-unchanged"
+    );
+    for file in files {
+        let rel = file.get("path").and_then(Val::as_str).expect("path");
+        let bytes = std::fs::read(archive_dir.join(rel)).expect("first archive bytes");
+        assert_eq!(
+            herdr_fleet::canonical::sha256_hex(&bytes),
+            file.get("sha256").and_then(Val::as_str).expect("sha"),
+            "first archive {rel} digest must be unchanged"
+        );
+        assert_eq!(
+            Some(bytes.len() as i64),
+            file.get("bytes").and_then(Val::as_int),
+            "first archive {rel} byte count"
+        );
+    }
     assert!(
         lane2.join("uncommitted.txt").exists(),
         "dirty file survives"
+    );
+    assert_eq!(
+        std::fs::read_to_string(lane2.join("uncommitted.txt")).expect("lane bytes"),
+        payload,
+        "the dirty payload must still be in place"
     );
 }
 

@@ -583,7 +583,9 @@ fn validate_config(obj: &Val) -> Verdict {
             }
         }
     }
-    // harness.<key>: exactly {kind, executable, env_allow}
+    // harness.<key>: {kind, executable, env_allow} plus the optional
+    // provider/model binding pair (issue #80; bare-token validation lives
+    // in the decoder, config.rs)
     if let Some(harnesses) = obj.get("harness") {
         let Val::Obj(entries) = harnesses else {
             return Verdict::refuse(Refusal::Malformed, "config.harness must be a table");
@@ -596,7 +598,7 @@ fn validate_config(obj: &Val) -> Verdict {
             if let Err(verdict) = require_keys(
                 entry,
                 &["kind", "executable", "env_allow"],
-                &["kind", "executable", "env_allow"],
+                &["kind", "executable", "env_allow", "provider", "model"],
                 &where_,
             ) {
                 return verdict;
@@ -605,6 +607,12 @@ fn validate_config(obj: &Val) -> Verdict {
                 return verdict;
             }
             if let Err(verdict) = expect_str(entry, "executable", &where_, None) {
+                return verdict;
+            }
+            if let Err(verdict) = expect_str(entry, "provider", &where_, None) {
+                return verdict;
+            }
+            if let Err(verdict) = expect_str(entry, "model", &where_, None) {
                 return verdict;
             }
             match entry.get("env_allow") {

@@ -87,6 +87,24 @@ pub struct Harness {
     pub executable: String,
     /// Explicit environment allowlist.
     pub env_allow: Vec<String>,
+    /// Explicit provider binding token for the official prompt rows that
+    /// carry the provider/model pair on argv (Pi, Jcode; issue #80). `None`
+    /// when the config declares no binding — there is no default and no
+    /// inference; the prompt refuses instead (`refusal.binding.missing`).
+    pub provider: Option<String>,
+    /// See [`Harness::provider`].
+    pub model: Option<String>,
+}
+
+/// A bare binding token: non-empty, no whitespace, no path separators, no
+/// NUL. The harness provider/model binding (issue #80) is carried as argv
+/// data only — bare tokens are never paths and never shell text.
+pub(crate) fn is_bare_token(text: &str) -> bool {
+    !text.is_empty()
+        && !text.contains('/')
+        && !text.contains('\\')
+        && !text.contains('\0')
+        && !text.chars().any(char::is_whitespace)
 }
 
 /// The parsed policy overlay.
@@ -305,6 +323,29 @@ fn extract_config(path: &Path, doc: &Val) -> Result<Config, LoadError> {
                     "config.harness.{key}.executable must be a bare executable name (no path separators); it is resolved through the allowlisted PATH"
                 )));
             }
+            // The optional provider/model binding pair (issue #80). Each
+            // declared token must be a bare token and the pair must be
+            // declared together: there is no default, no inferred half, and
+            // an unbound profile refuses the prompt at the adapter boundary.
+            let provider = entry
+                .get("provider")
+                .and_then(Val::as_str)
+                .map(str::to_string);
+            let model = entry.get("model").and_then(Val::as_str).map(str::to_string);
+            for (field, value) in [("provider", &provider), ("model", &model)] {
+                if let Some(value) = value
+                    && !is_bare_token(value)
+                {
+                    return Err(fail(format!(
+                        "config.harness.{key}.{field} must be a non-empty bare token (no whitespace or path separators)"
+                    )));
+                }
+            }
+            if provider.is_some() != model.is_some() {
+                return Err(fail(format!(
+                    "config.harness.{key}.provider and .model must be declared together"
+                )));
+            }
             harnesses.push(Harness {
                 key: key.clone(),
                 kind: entry
@@ -321,6 +362,8 @@ fn extract_config(path: &Path, doc: &Val) -> Result<Config, LoadError> {
                         .collect(),
                     _ => Vec::new(),
                 },
+                provider,
+                model,
             });
         }
     }
@@ -435,11 +478,16 @@ branch = "staging"
 enabled = true
 
 # Optional harness adapter profiles (kind, PATH-resolved executable, and
-# the explicit environment allowlist for subprocesses).
+# the explicit environment allowlist for subprocesses). A harness whose
+# prompt row carries a provider/model pair on argv (pi, jcode) also needs
+# this explicit binding pair; without it the prompt refuses (no default is
+# inferred).
 # [harness.cli]
 # kind = "argv"
 # executable = "hf-cli-example"
 # env_allow = ["PATH", "HOME"]
+# provider = "example-provider"
+# model = "example-model"
 
 # Optional workflow pin: id + 64-hex hash of the canonical workflow
 # document. Without a pin, `plan` uses the built-in doctrine workflow.
@@ -567,6 +615,52 @@ production_confirmation = "tty"
     }
 
     #[test]
+    fn harness_provider_model_binding_is_decoded_and_validated() {
+        let bound = load_config(&write_temp(
+            "harness-binding.toml",
+            r#"schema = "hf-config/v1"
+[harness.pi]
+kind = "pi"
+executable = "pi"
+env_allow = ["PATH"]
+provider = "example-provider"
+model = "example-model"
+"#,
+        ))
+        .expect("binding decodes");
+        let harness = &bound.harnesses[0];
+        assert_eq!(harness.provider.as_deref(), Some("example-provider"));
+        assert_eq!(harness.model.as_deref(), Some("example-model"));
+
+        // A declared binding must be a bare token pair: no path separators,
+        // no blank/whitespace values, and never a half pair.
+        for (name, provider_line, model_line) in [
+            (
+                "path",
+                "provider = \"example/provider\"",
+                "model = \"example-model\"",
+            ),
+            ("blank", "provider = \"example-provider\"", "model = \"  \""),
+            ("half", "provider = \"example-provider\"", ""),
+        ] {
+            let content = format!(
+                "schema = \"hf-config/v1\"\n[harness.pi]\nkind = \"pi\"\nexecutable = \"pi\"\nenv_allow = [\"PATH\"]\n{provider_line}\n{model_line}\n"
+            );
+            let err = load_config(&write_temp(
+                &format!("harness-binding-{name}.toml"),
+                &content,
+            ))
+            .expect_err("invalid binding refused");
+            assert_eq!(err.code, "config.invalid", "{name}");
+            assert!(
+                err.message.contains("provider") || err.message.contains("model"),
+                "{name}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
     fn overlay_narrows_effective_repositories() {
         let dir = std::env::temp_dir().join(format!("hf-config-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -633,7 +727,18 @@ repositories = ["example-org/alpha"]
     fn resolve_repository_by_key_and_identity() {
         let dir = std::env::temp_dir().join(format!("hf-config-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = write_temp("resolve.toml", VALID);
+        // Self-contained: no policy overlay reference, so this test never
+        // depends on an overlay another test wrote into the shared
+        // per-process temp dir (order-dependent coupling).
+        let path = write_temp(
+            "resolve.toml",
+            r#"schema = "hf-config/v1"
+[repository.widgets]
+origin = "https://github.com/example-org/widgets"
+branch = "staging"
+enabled = true
+"#,
+        );
         let config = load_config(&path).expect("load");
         assert_eq!(
             resolve_repository(&config, "widgets")
