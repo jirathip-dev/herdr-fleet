@@ -27,6 +27,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -282,7 +283,7 @@ pub fn serve(paths: &DaemonPaths) -> Result<(), DaemonError> {
             "events mirror drifted or was missing; rebuilt from the events table",
         );
     }
-    let reconciled = reconcile_claims(&state, &log)?;
+    let reconciled = reconcile_claims(&state, &log, &paths.checkpoints_dir)?;
     // Cold-boot schedule recovery (issue #9 AC2/AC9): every due schedule
     // fires at most ONE fresh coalesced evaluation per boot (missed windows
     // are skipped, never replayed), refused schedules park themselves, and
@@ -550,6 +551,8 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "lane.replacement.hold" => method_lane_replacement_hold(shared, request),
         "lane.replacement.cancel" => method_lane_replacement_cancel(shared, request),
         "lane.replacement.status" => method_lane_replacement_status(shared, request),
+        "lane.checkpoint.create" => method_lane_checkpoint_create(shared, request),
+        "lane.checkpoint.status" => method_lane_checkpoint_status(shared, request),
         "grants.list" => method_grants_list(shared, request),
         "journal.tail" => method_journal_tail(shared, request),
         "grants.revoke" => method_grants_revoke(shared, request),
@@ -2750,6 +2753,201 @@ fn method_lane_replacement_status(shared: &Arc<Shared>, request: &Request) -> St
     )
 }
 
+/// `lane.checkpoint.create`: capture ONE atomic checkpoint at the quiescing
+/// boundary (issue #74). The request carries the replacement identity, the
+/// source-generation fence, and TWO observations of the lane; the capture
+/// refuses (`refusal.checkpoint.changed`) when the two views disagree.
+/// Active external harness execution requires a supported quiescence
+/// acknowledgment AND a process/child observation (`refusal.checkpoint.ack`);
+/// an observed active/ambiguous side-effecting child holds completion
+/// (`refusal.checkpoint.held` — nothing is signalled, killed, or cleaned up
+/// to obtain a snapshot); oversize required data is a typed hold
+/// (`refusal.checkpoint.oversize`); missing evidence refuses
+/// (`refusal.checkpoint.incomplete`). The checkpoint row and the record's
+/// `quiescing` → `checkpointed` transition commit in ONE transaction (the
+/// commit marker); the derived brief artifact is materialized after the
+/// commit and a restart regenerates it from the durable row. No spawn, kill,
+/// or Git effect exists on this path, and no grant is required, issued, or
+/// consumed.
+fn method_lane_checkpoint_create(shared: &Arc<Shared>, request: &Request) -> String {
+    let params = request.params.as_ref();
+    let replacement_id = match required_str(params, "replacement_id") {
+        Some(text) if crate::formats::is_replacement_id(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.checkpoint.create requires params.replacement_id (rp_ id)",
+            );
+        }
+    };
+    let generation = match params
+        .and_then(|params| params.get("generation"))
+        .and_then(Val::as_int)
+    {
+        Some(generation) if generation >= 1 => generation,
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.checkpoint.create requires params.generation (positive integer)",
+            );
+        }
+    };
+    let observation = match params.and_then(|params| params.get("observation")) {
+        Some(value @ Val::Obj(_)) => value.clone(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.checkpoint.create requires params.observation (object)",
+            );
+        }
+    };
+    let reobservation = match params.and_then(|params| params.get("reobservation")) {
+        Some(value @ Val::Obj(_)) => value.clone(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.checkpoint.create requires params.reobservation (object; the second \
+                 observation of the same capture window)",
+            );
+        }
+    };
+    let target = format!("lane-checkpoint:{replacement_id}");
+    match journal_mutation(shared, request, "mutate.lane-checkpoint.create", &target) {
+        Intent::Claimed { key } => {
+            crash_point("lane-checkpoint.after-intent");
+            let outcome = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                state
+                    .commit_lane_checkpoint(
+                        &replacement_id,
+                        generation,
+                        &observation,
+                        &reobservation,
+                        &key,
+                        &time::rfc3339_now(),
+                    )
+                    .map_err(|err| (err.code, err.message))
+            };
+            match outcome {
+                Ok((checkpoint, replacement, brief)) => {
+                    crash_point("lane-checkpoint.after-record");
+                    let brief_path = match write_checkpoint_brief(
+                        &shared.paths.checkpoints_dir,
+                        &checkpoint.checkpoint_id,
+                        &checkpoint.brief_digest,
+                        &brief,
+                    ) {
+                        Ok(path) => path,
+                        Err(message) => {
+                            // The commit is the contract; the brief is a
+                            // derivation. A failed materialization is
+                            // logged and reconciled (regenerated) on the
+                            // next daemon start — never a state rollback.
+                            shared.log.write(
+                                "warn",
+                                "checkpoint.brief.deferred",
+                                &format!(
+                                    "checkpoint {} brief artifact not materialized ({}); \
+                                     restart reconciliation regenerates it from the durable row",
+                                    checkpoint.checkpoint_id, message
+                                ),
+                            );
+                            checkpoint_brief_path(
+                                &shared.paths.checkpoints_dir,
+                                &checkpoint.checkpoint_id,
+                            )
+                        }
+                    };
+                    let mut checkpoint_val = crate::state::lane_checkpoint_val(&checkpoint);
+                    if let Val::Obj(map) = &mut checkpoint_val {
+                        map.insert(
+                            "brief_path".to_string(),
+                            string(brief_path.to_string_lossy().as_ref()),
+                        );
+                    }
+                    finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.checkpoint.create",
+                        true,
+                        object(vec![
+                            ("checkpoint", checkpoint_val),
+                            ("brief", string(&brief)),
+                            (
+                                "replacement",
+                                crate::state::lane_replacement_val(&replacement),
+                            ),
+                        ]),
+                        None,
+                    )
+                }
+                Err((code, message)) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "lane.checkpoint.create",
+                    false,
+                    null(),
+                    Some((code, message)),
+                ),
+            }
+        }
+        Intent::Replay { response } => replay(shared, &response),
+        Intent::Refused { code, message } => err_response(&request.id, code, message),
+    }
+}
+
+/// `lane.checkpoint.status`: read the durable checkpoint committed for one
+/// replacement record (with its digest bindings and the derived brief
+/// artifact pointer). Read-only — no claim, no journal write, and no
+/// artifact materialization.
+fn method_lane_checkpoint_status(shared: &Arc<Shared>, request: &Request) -> String {
+    let replacement_id = match required_str(request.params.as_ref(), "replacement_id") {
+        Some(text) if crate::formats::is_replacement_id(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.checkpoint.status requires params.replacement_id (rp_ id)",
+            );
+        }
+    };
+    let state = match shared.lock_state() {
+        Ok(state) => state,
+        Err(message) => return err_response(&request.id, "state.unavailable", message),
+    };
+    let row = match state.lane_checkpoint_by_replacement(&replacement_id) {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return err_response(
+                &request.id,
+                "state.not_found",
+                format!("no lane checkpoint for replacement {replacement_id:?}"),
+            );
+        }
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let mut checkpoint_val = crate::state::lane_checkpoint_val(&row);
+    if let Val::Obj(map) = &mut checkpoint_val {
+        let path = checkpoint_brief_path(&shared.paths.checkpoints_dir, &row.checkpoint_id);
+        map.insert(
+            "brief_path".to_string(),
+            string(path.to_string_lossy().as_ref()),
+        );
+    }
+    ok_response(&request.id, object(vec![("checkpoint", checkpoint_val)]))
+}
+
 fn method_journal_tail(shared: &Arc<Shared>, request: &Request) -> String {
     let params = request.params.as_ref();
     let after_seq = params
@@ -3591,7 +3789,11 @@ fn compute_replay(
 
 /// Mark every claim left `claimed` by an interrupted run as ambiguous with a
 /// typed outcome and a `reconcile.*` journal record. Returns the count.
-fn reconcile_claims(state: &State, log: &DaemonLog) -> Result<usize, DaemonError> {
+fn reconcile_claims(
+    state: &State,
+    log: &DaemonLog,
+    checkpoints_dir: &Path,
+) -> Result<usize, DaemonError> {
     let pending = state.claims_in_flight()?;
     let mut reconciled = 0usize;
     for claim in pending {
@@ -3653,6 +3855,18 @@ fn reconcile_claims(state: &State, log: &DaemonLog) -> Result<usize, DaemonError
                         }
                     }
                 }
+                // Issue #74: an interrupted checkpoint claim reconciles
+                // against its commit marker (the committed checkpoint row;
+                // see reconcile_lane_checkpoint) instead of blindly flipping
+                // the record: the record's `quiescing` -> `checkpointed`
+                // transition commits atomically with the row, so the record
+                // is never in doubt.
+                if claim.method == "lane.checkpoint.create"
+                    && let Ok(doc) = Val::parse_json(&claim.request_line)
+                    && let Some(params) = doc.get("params")
+                {
+                    reconcile_lane_checkpoint(state, log, checkpoints_dir, params)?;
+                }
             }
             Err(err) => {
                 return Err(daemon_error(
@@ -3663,6 +3877,174 @@ fn reconcile_claims(state: &State, log: &DaemonLog) -> Result<usize, DaemonError
         }
     }
     Ok(reconciled)
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint brief artifacts (issue #74)
+// ---------------------------------------------------------------------------
+
+/// The deterministic artifact path of one checkpoint brief (inside the
+/// daemon-owned checkpoints directory).
+fn checkpoint_brief_path(dir: &Path, checkpoint_id: &str) -> PathBuf {
+    dir.join(format!("{checkpoint_id}.brief"))
+}
+
+/// Materialize one checkpoint brief artifact (atomic tmp + rename inside the
+/// daemon-owned checkpoints directory) and verify the written bytes against
+/// the committed brief digest before publishing the final name. The artifact
+/// is a pure derivation of the durable row: a failure here is deferred to
+/// restart reconciliation (which regenerates and verifies it), never a state
+/// rollback.
+fn write_checkpoint_brief(
+    dir: &Path,
+    checkpoint_id: &str,
+    brief_digest: &str,
+    brief: &str,
+) -> Result<PathBuf, String> {
+    let path = checkpoint_brief_path(dir, checkpoint_id);
+    let tmp = dir.join(format!("{checkpoint_id}.brief.tmp"));
+    std::fs::write(&tmp, brief.as_bytes())
+        .map_err(|err| format!("write {}: {err}", tmp.display()))?;
+    let written =
+        std::fs::read(&tmp).map_err(|err| format!("read back {}: {err}", tmp.display()))?;
+    let digest = crate::canonical::sha256_hex(&written);
+    if digest != brief_digest {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "brief digest mismatch after write ({digest} != {brief_digest})"
+        ));
+    }
+    std::fs::rename(&tmp, &path).map_err(|err| format!("rename {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+/// Restart reconciliation for one interrupted `lane.checkpoint.create` claim
+/// (issue #74 AC7). The committed checkpoint row is the commit marker — the
+/// row and the replacement record's `quiescing` → `checkpointed` transition
+/// commit in one transaction, so:
+///
+/// - row present: the capture committed; the derived brief artifact is
+///   (re)materialized from the durable row and verified against
+///   `brief_digest` — the restart yields the NEW COMPLETE checkpoint.
+/// - row absent and no artifact: the capture never committed; the record is
+///   untouched (the previous complete state) and the standard ambiguous
+///   claim reconciliation keeps the retry path honest.
+/// - row absent but an artifact exists: inconsistent (only a non-atomic
+///   implementation produces this); fail closed — the record is parked
+///   `ambiguous` and the daemon logs it rather than adopting or silently
+///   deleting an artifact no commit produced.
+fn reconcile_lane_checkpoint(
+    state: &State,
+    log: &DaemonLog,
+    checkpoints_dir: &Path,
+    params: &Val,
+) -> Result<(), DaemonError> {
+    let Some(replacement_id) = params
+        .get("replacement_id")
+        .and_then(Val::as_str)
+        .filter(|text| crate::formats::is_replacement_id(text))
+    else {
+        return Ok(());
+    };
+    let checkpoint_id = crate::state::checkpoint_id_for(replacement_id);
+    let path = checkpoint_brief_path(checkpoints_dir, &checkpoint_id);
+    let tmp = checkpoints_dir.join(format!("{checkpoint_id}.brief.tmp"));
+    let row = state
+        .lane_checkpoint_by_replacement(replacement_id)
+        .map_err(|err| {
+            daemon_error(
+                "daemon.reconcile",
+                format!("checkpoint reconciliation: {}: {}", err.code, err.message),
+            )
+        })?;
+    let Some(row) = row else {
+        if path.exists() || tmp.exists() {
+            state
+                .mark_replacement_ambiguous(
+                    params,
+                    "checkpoint artifact present without a committed checkpoint record; \
+                     external reconciliation is required",
+                    &time::rfc3339_now(),
+                )
+                .map_err(|err| {
+                    daemon_error(
+                        "daemon.reconcile",
+                        format!("checkpoint reconciliation: {}: {}", err.code, err.message),
+                    )
+                })?;
+            log.write(
+                "warn",
+                "reconcile.lane.checkpoint",
+                &format!(
+                    "checkpoint artifact {checkpoint_id}.brief exists without a committed \
+                     record; replacement parked ambiguous"
+                ),
+            );
+        }
+        return Ok(());
+    };
+    let existing_ok = std::fs::read(&path)
+        .map(|bytes| crate::canonical::sha256_hex(&bytes) == row.brief_digest)
+        .unwrap_or(false);
+    if existing_ok {
+        log.write(
+            "info",
+            "reconcile.lane.checkpoint",
+            &format!(
+                "checkpoint {checkpoint_id} was committed before the interrupt; brief artifact \
+                 reused (digest verified)"
+            ),
+        );
+        return Ok(());
+    }
+    let brief = crate::state::lane_checkpoint_brief(&row).map_err(|err| {
+        daemon_error(
+            "daemon.reconcile",
+            format!("checkpoint reconciliation: {}: {}", err.code, err.message),
+        )
+    })?;
+    let digest = crate::canonical::sha256_hex(brief.as_bytes());
+    if digest != row.brief_digest {
+        state
+            .mark_replacement_ambiguous(
+                params,
+                "regenerated checkpoint brief does not match the recorded digest; external \
+                 reconciliation is required",
+                &time::rfc3339_now(),
+            )
+            .map_err(|err| {
+                daemon_error(
+                    "daemon.reconcile",
+                    format!("checkpoint reconciliation: {}: {}", err.code, err.message),
+                )
+            })?;
+        log.write(
+            "warn",
+            "reconcile.lane.checkpoint",
+            &format!(
+                "checkpoint {checkpoint_id} brief regeneration drifted from the recorded \
+                 digest; replacement parked ambiguous"
+            ),
+        );
+        return Ok(());
+    }
+    write_checkpoint_brief(checkpoints_dir, &checkpoint_id, &row.brief_digest, &brief).map_err(
+        |message| {
+            daemon_error(
+                "daemon.reconcile",
+                format!("checkpoint reconciliation: {message}"),
+            )
+        },
+    )?;
+    log.write(
+        "info",
+        "reconcile.lane.checkpoint",
+        &format!(
+            "checkpoint {checkpoint_id} was committed before the interrupt; brief artifact \
+             regenerated from the durable record (digest verified)"
+        ),
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

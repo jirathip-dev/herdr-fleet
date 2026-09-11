@@ -125,6 +125,55 @@ to journal fails closed — the mutation does not start.
   untouched. An agent may request its own retirement but can never
   authorize its own replacement effects.
 
+## Checkpoint additions (issue #74)
+
+- **Migration `m0006_lane_checkpoints_v6`** (0 → 6 chain) adds the lane
+  checkpoint table `lane_checkpoints`: one checkpoint per replacement
+  record (`UNIQUE (replacement_id)`), holding the canonical snapshot of
+  the captured lane (role/task, worktree/branch/head/base, dirty and
+  untracked inventory with their bounded integrity digests, report round +
+  reviewed sha, pending gates, observed child commands, execution/ack
+  state, orchestrator references, daemon-observed outstanding operations),
+  the two observation digests, the snapshot digest, and the generated
+  brief digest. `SCHEMA_VERSION` is 6. The migration is purely additive —
+  no existing table or row is touched, so stored grants and replacement
+  records are never reinterpreted by the upgrade.
+- **The checkpoint commit is atomic**: `commit_lane_checkpoint` writes the
+  checkpoint row, the record's `quiescing` → `checkpointed` transition and
+  the transition-history row in ONE transaction (the record's compare-and-
+  set fence re-asserts pending/quiescing/generation). The compact brief is
+  a deterministic derivation of the committed row: it is materialized
+  after the commit, and restart reconciliation regenerates it (verifying
+  `brief_digest`) when a crash lands between the commit and the artifact
+  write. An artifact without a committed record can only come from a
+  non-atomic implementation and fails closed (the record is parked
+  `ambiguous`, never adopted or silently deleted) — so a restart yields
+  either the previous complete checkpoint or the new complete one.
+- **Quiescing fence**: while a pending replacement sits inside the
+  quiescing window (`quiescing` or `checkpointed`, outcome `pending`), new
+  replacement requests for the lane are refused (`refusal.replacement.fenced`)
+  — a lane cannot fork into a second successor slot mid-handoff — and the
+  capture itself is only admitted at the exact `quiescing` boundary.
+- **Two observations + closed contract**: the capture requires two
+  observations of the lane that are canonically identical (a disagreement
+  refuses with `refusal.checkpoint.changed`); every required field must be
+  present, bounded and valid (`refusal.checkpoint.incomplete` — missing
+  evidence is never silently omitted); active external harness execution
+  requires a supported quiescence acknowledgment AND a process/child
+  observation (`refusal.checkpoint.ack`); active or ambiguous
+  side-effecting child commands hold completion (`refusal.checkpoint.held`
+  — nothing is signalled, killed, or cleaned up to obtain a snapshot); and
+  required data whose generated brief exceeds the enforced 3 KiB bound is
+  a typed hold (`refusal.checkpoint.oversize`), never a truncation.
+- **Orchestrator checkpoints** reference existing worker/reviewer
+  replacement records (existence and role are validated;
+  `refusal.checkpoint.references` otherwise) plus bounded pending
+  completion-event tokens, and never alter the referenced lanes.
+- **Restart reconciliation**: an interrupted `lane.checkpoint.create`
+  claim reconciles against its commit marker (the checkpoint row) instead
+  of blindly parking the record — the record's transition commits
+  atomically with the row, so the record is never in doubt.
+
 ## Fixture map
 
 Accept: `migration.valid.json` (0→1, checksummed), `audit.valid.jsonl`

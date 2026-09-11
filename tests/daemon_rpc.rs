@@ -54,6 +54,7 @@ impl Fixture {
             audit_mirror_path: state_dir.join("journal").join("audit.jsonl"),
             events_mirror_path: state_dir.join("journal").join("events.jsonl"),
             backups_dir: state_dir.join("backups"),
+            checkpoints_dir: state_dir.join("checkpoints"),
             log_path: state_dir.join("daemon.log"),
         }
     }

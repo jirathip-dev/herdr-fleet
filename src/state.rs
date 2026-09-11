@@ -16,6 +16,7 @@
 //! rows); the chain genesis row is never pruned so verification always has
 //! an anchor.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -24,12 +25,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::canonical::{canonical_text, sha256_hex};
+use crate::canonical::{canonical_bytes, canonical_text, sha256_hex};
 use crate::time;
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The schema version this binary understands (also `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Bounded-retention defaults (rows kept besides the chain genesis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,6 +366,40 @@ pub struct LaneReplacementEventRow {
     pub at: String,
 }
 
+/// One durable lane checkpoint record (issue #74): the atomic capture that
+/// completes one replacement's `quiescing` → `checkpointed` transition.
+/// The snapshot column is the durable authority (validated, bounded, and
+/// digest-bound); the compact brief is a deterministic derivation of the
+/// row — never trusted from a request, regenerated after a restart when the
+/// derived artifact is missing. One checkpoint exists per replacement
+/// (`UNIQUE (replacement_id)`); a second capture is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneCheckpointRow {
+    /// Checkpoint id (`ck_` + 16 hex; deterministic per replacement).
+    pub checkpoint_id: String,
+    /// The replacement record this checkpoint completes.
+    pub replacement_id: String,
+    /// Logical lane identity (slug).
+    pub lane_id: String,
+    /// Source lane generation the checkpoint captures.
+    pub generation: i64,
+    /// Source role (one of [`LANE_REPLACEMENT_ROLES`]).
+    pub role: String,
+    /// sha256 over the canonical bytes of the first observation.
+    pub observation_digest: String,
+    /// sha256 over the canonical bytes of the re-observation (equal by
+    /// construction: the two-observation stability rule refuses a mismatch).
+    pub reobservation_digest: String,
+    /// Canonical snapshot JSON text (the durable capture authority).
+    pub snapshot: String,
+    /// sha256 over the canonical bytes of the snapshot.
+    pub digest: String,
+    /// sha256 over the generated brief bytes.
+    pub brief_digest: String,
+    /// Recorded at (RFC3339 UTC).
+    pub created_at: String,
+}
+
 /// The daemon-owned state handle. All methods serialize on an internal
 /// mutex (one writer); a failed write poisons the handle (fail closed).
 pub struct State {
@@ -477,6 +512,10 @@ impl State {
         if user_version == M0005_APPLIES_FROM {
             run_m0005(&mut conn)?;
             user_version = M0005_APPLIES_TO;
+        }
+        if user_version == M0006_APPLIES_FROM {
+            run_m0006(&mut conn)?;
+            user_version = M0006_APPLIES_TO;
         }
         match user_version {
             v if v == SCHEMA_VERSION => {
@@ -1975,6 +2014,33 @@ impl State {
                     ),
                 ));
             }
+            // Quiescing fence (issue #74): while a pending replacement for
+            // this lane sits inside the handoff window (the record has been
+            // advanced to `quiescing` or `checkpointed`), new replacement
+            // requests for the lane are fenced — a lane cannot fork into a
+            // second successor slot mid-handoff. The fence lifts when the
+            // handoff resolves (retired and beyond) or is cancelled/held.
+            let fenced: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT replacement_id, phase FROM lane_replacements
+                      WHERE lane_id = ?1 AND outcome = 'pending'
+                            AND phase IN ('quiescing', 'checkpointed')
+                      LIMIT 1",
+                    params![lane_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|err| StateError::from_sqlite("request_lane_replacement: fence", err))?;
+            if let Some((holder, phase)) = fenced {
+                return Err(state_error(
+                    replacement_code::FENCED,
+                    format!(
+                        "lane {lane_id:?} is inside the quiescing window: replacement {holder} \
+                         is at {phase:?}; new replacement requests for this lane are fenced \
+                         until the handoff resolves or is cancelled"
+                    ),
+                ));
+            }
             tx.execute(
                 "INSERT INTO lane_replacements (replacement_id, lane_id, generation,
                     successor_generation, phase, outcome, outcome_reason, source_session,
@@ -2325,6 +2391,284 @@ impl State {
             );
         }
         Ok(out)
+    }
+
+    /// Capture one lane checkpoint (issue #74): validate the observed lane
+    /// state against the record and the closed observation contract, enforce
+    /// the two-observation stability rule, then commit the checkpoint record
+    /// AND the record's `quiescing` → `checkpointed` transition in ONE
+    /// transaction. Returns the committed checkpoint row, the updated
+    /// replacement row, and the generated brief text. The brief is a pure
+    /// derivation of the committed row (the durable authority) — the caller
+    /// materializes it as an artifact, and restart reconciliation can always
+    /// regenerate it byte-for-byte.
+    ///
+    /// `exclude_key` is the caller's own idempotency key: the in-flight
+    /// claim of the capture itself is not an "outstanding operation".
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_lane_checkpoint(
+        &self,
+        replacement_id: &str,
+        generation: i64,
+        observation: &Val,
+        reobservation: &Val,
+        exclude_key: &str,
+        at: &str,
+    ) -> Result<(LaneCheckpointRow, LaneReplacementRow, String), StateError> {
+        let outcome = self.commit_lane_checkpoint_inner(
+            replacement_id,
+            generation,
+            observation,
+            reobservation,
+            exclude_key,
+            at,
+        );
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_lane_checkpoint_inner(
+        &self,
+        replacement_id: &str,
+        generation: i64,
+        observation: &Val,
+        reobservation: &Val,
+        exclude_key: &str,
+        at: &str,
+    ) -> Result<(LaneCheckpointRow, LaneReplacementRow, String), StateError> {
+        self.ensure_writable()?;
+        // Two observations detect changes during capture: the capture only
+        // commits when both views of the lane are canonically identical.
+        // An inconsistent view refuses the checkpoint (neither is trusted).
+        let observation_text = canonical_text(observation);
+        let reobservation_text = canonical_text(reobservation);
+        if observation_text != reobservation_text {
+            return Err(state_error(
+                checkpoint_code::CHANGED,
+                "the two observations of the lane differ: the state changed during capture; \
+                 the checkpoint refuses to commit either view (no state is changed)",
+            ));
+        }
+        let observation_digest = sha256_hex(&canonical_bytes(observation));
+        let reobservation_digest = sha256_hex(&canonical_bytes(reobservation));
+        let checkpoint_id = checkpoint_id_for(replacement_id);
+        {
+            let mut conn = self.lock("commit_lane_checkpoint")?;
+            let tx = conn
+                .transaction()
+                .map_err(|err| StateError::from_sqlite("commit_lane_checkpoint: begin", err))?;
+            let record: Option<LaneReplacementRow> = tx
+                .query_row(
+                    "SELECT replacement_id, lane_id, generation, successor_generation,
+                            phase, outcome, outcome_reason, source_session, source_process,
+                            role, worktree, reason, created_at, updated_at
+                       FROM lane_replacements WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_replacement_row_from,
+                )
+                .optional()
+                .map_err(|err| StateError::from_sqlite("commit_lane_checkpoint: record", err))?;
+            let Some(record) = record else {
+                return Err(state_error(
+                    "state.not_found",
+                    format!("no lane replacement {replacement_id:?}"),
+                ));
+            };
+            // One replacement carries at most ONE capture: an existing
+            // checkpoint row refuses any second capture outright (the row
+            // and the record transition commit together, so a row also
+            // means the boundary was consumed).
+            let existing: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM lane_checkpoints WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    |row| row.get(0),
+                )
+                .map_err(|err| StateError::from_sqlite("commit_lane_checkpoint: exists", err))?;
+            if existing != 0 {
+                return Err(state_error(
+                    checkpoint_code::EXISTS,
+                    format!(
+                        "replacement {replacement_id} already has checkpoint {checkpoint_id}: \
+                         one replacement carries at most one capture (a second one cannot exist)"
+                    ),
+                ));
+            }
+            // Capture is only admitted at the quiescing boundary: the
+            // record must be pending, at `quiescing`, at the presented
+            // generation (the same typed classifier as every transition).
+            if record.outcome != "pending"
+                || record.generation != generation
+                || record.phase != "quiescing"
+            {
+                return Err(lane_replacement_transition_refusal(
+                    Some(&record),
+                    replacement_id,
+                    "quiescing",
+                    generation,
+                ));
+            }
+            // Outstanding operations are daemon-observed: the unresolved
+            // claims other than the capture itself (bounded, with the exact
+            // total so nothing looks silently truncated).
+            let outstanding_count: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM idempotency WHERE status = 'claimed' AND key != ?1",
+                    params![exclude_key],
+                    |row| row.get(0),
+                )
+                .map_err(|err| {
+                    StateError::from_sqlite("commit_lane_checkpoint: outstanding", err)
+                })?;
+            let mut outstanding: Vec<(String, String)> = Vec::new();
+            {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT key, method FROM idempotency
+                          WHERE status = 'claimed' AND key != ?1
+                          ORDER BY key LIMIT 8",
+                    )
+                    .map_err(|err| {
+                        StateError::from_sqlite("commit_lane_checkpoint: outstanding prepare", err)
+                    })?;
+                let rows = statement
+                    .query_map(params![exclude_key], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|err| {
+                        StateError::from_sqlite("commit_lane_checkpoint: outstanding query", err)
+                    })?;
+                for row in rows {
+                    outstanding.push(row.map_err(|err| {
+                        StateError::from_sqlite("commit_lane_checkpoint: outstanding row", err)
+                    })?);
+                }
+            }
+            let epoch = current_epoch_locked(&tx)?;
+            let snapshot = checkpoint_snapshot_val(
+                &record,
+                observation,
+                &observation_digest,
+                &reobservation_digest,
+                &outstanding,
+                outstanding_count,
+                epoch,
+                at,
+                &checkpoint_id,
+                &tx,
+            )?;
+            let snapshot_text = canonical_text(&snapshot);
+            let digest = sha256_hex(&canonical_bytes(&snapshot));
+            let provisional = LaneCheckpointRow {
+                checkpoint_id,
+                replacement_id: record.replacement_id.clone(),
+                lane_id: record.lane_id.clone(),
+                generation,
+                role: record.role.clone(),
+                observation_digest,
+                reobservation_digest,
+                snapshot: snapshot_text,
+                digest,
+                brief_digest: String::new(),
+                created_at: at.to_string(),
+            };
+            let brief = lane_checkpoint_brief(&provisional)?;
+            if brief.len() > CHECKPOINT_BRIEF_MAX_BYTES {
+                return Err(state_error(
+                    checkpoint_code::OVERSIZE,
+                    format!(
+                        "the generated brief is {} bytes, over the enforced \n\
+                         {CHECKPOINT_BRIEF_MAX_BYTES}-byte bound; required data is never truncated — \
+                         reduce the recorded gates/children and retry",
+                        brief.len()
+                    ),
+                ));
+            }
+            let brief_digest = sha256_hex(brief.as_bytes());
+            tx.execute(
+                "INSERT INTO lane_checkpoints (checkpoint_id, replacement_id, lane_id,
+                    generation, role, observation_digest, reobservation_digest, snapshot,
+                    digest, brief_digest, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    provisional.checkpoint_id,
+                    provisional.replacement_id,
+                    provisional.lane_id,
+                    provisional.generation,
+                    provisional.role,
+                    provisional.observation_digest,
+                    provisional.reobservation_digest,
+                    provisional.snapshot,
+                    provisional.digest,
+                    brief_digest,
+                    provisional.created_at
+                ],
+            )
+            .map_err(|err| StateError::from_sqlite("commit_lane_checkpoint: insert", err))?;
+            let affected = tx
+                .execute(
+                    "UPDATE lane_replacements
+                        SET phase = 'checkpointed', updated_at = ?1
+                      WHERE replacement_id = ?2 AND phase = 'quiescing'
+                            AND generation = ?3 AND outcome = 'pending'",
+                    params![at, replacement_id, generation],
+                )
+                .map_err(|err| StateError::from_sqlite("commit_lane_checkpoint: advance", err))?;
+            if affected != 1 {
+                return Err(state_error(
+                    "state.conflict",
+                    format!("checkpoint commit lost its compare-and-set fence on {replacement_id}"),
+                ));
+            }
+            append_lane_replacement_event(
+                &tx,
+                replacement_id,
+                Some("quiescing"),
+                "checkpointed",
+                Some("pending"),
+                "pending",
+                "",
+                at,
+            )?;
+            let updated: LaneReplacementRow = tx
+                .query_row(
+                    "SELECT replacement_id, lane_id, generation, successor_generation,
+                            phase, outcome, outcome_reason, source_session, source_process,
+                            role, worktree, reason, created_at, updated_at
+                       FROM lane_replacements WHERE replacement_id = ?1",
+                    params![replacement_id],
+                    lane_replacement_row_from,
+                )
+                .map_err(|err| StateError::from_sqlite("commit_lane_checkpoint: reread", err))?;
+            tx.commit()
+                .map_err(|err| StateError::from_sqlite("commit_lane_checkpoint: commit", err))?;
+            let checkpoint = LaneCheckpointRow {
+                brief_digest,
+                ..provisional
+            };
+            Ok((checkpoint, updated, brief))
+        }
+    }
+
+    /// One lane checkpoint by replacement id (read-only).
+    pub fn lane_checkpoint_by_replacement(
+        &self,
+        replacement_id: &str,
+    ) -> Result<Option<LaneCheckpointRow>, StateError> {
+        let conn = self.lock("lane_checkpoint_by_replacement")?;
+        conn.query_row(
+            "SELECT checkpoint_id, replacement_id, lane_id, generation, role,
+                    observation_digest, reobservation_digest, snapshot, digest,
+                    brief_digest, created_at
+               FROM lane_checkpoints WHERE replacement_id = ?1",
+            params![replacement_id],
+            lane_checkpoint_row_from,
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("lane_checkpoint_by_replacement: query", err))
     }
 
     /// Restart-reconciliation hook (issue #73 AC5/AC6): an interrupted
@@ -2777,6 +3121,11 @@ impl State {
             .optional()
             .map_err(|err| StateError::from_sqlite("append_audit: prev", err))?
             .unwrap_or_default();
+        // ONE clock read for the record: the stored `line` and the `at`
+        // column must be the same instant, or the next open's chain
+        // verification refuses the row (column/line mismatch) — two reads
+        // could straddle a second boundary.
+        let at = time::rfc3339_now();
         let doc = object(vec![
             ("schema", string("hf-audit/v1")),
             ("seq", integer(seq)),
@@ -2794,7 +3143,7 @@ impl State {
                 "recorded_before_mutation",
                 bool_(action.starts_with("mutate.")),
             ),
-            ("at", string(&time::rfc3339_now())),
+            ("at", string(&at)),
         ]);
         let line = canonical_text(&doc);
         let record_hash = sha256_hex(&[line.as_bytes(), prev_hash.as_bytes()].concat());
@@ -2811,7 +3160,7 @@ impl State {
                 grant_id,
                 epoch,
                 action.starts_with("mutate."),
-                time::rfc3339_now(),
+                at,
                 prev_hash,
                 record_hash,
                 line
@@ -3206,6 +3555,848 @@ pub fn lane_replacement_event_val(row: &LaneReplacementEventRow) -> Val {
     ])
 }
 
+/// Map one SQLite row onto [`LaneCheckpointRow`] (column order of the
+/// lane_checkpoints SELECTs).
+fn lane_checkpoint_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneCheckpointRow> {
+    Ok(LaneCheckpointRow {
+        checkpoint_id: row.get(0)?,
+        replacement_id: row.get(1)?,
+        lane_id: row.get(2)?,
+        generation: row.get(3)?,
+        role: row.get(4)?,
+        observation_digest: row.get(5)?,
+        reobservation_digest: row.get(6)?,
+        snapshot: row.get(7)?,
+        digest: row.get(8)?,
+        brief_digest: row.get(9)?,
+        created_at: row.get(10)?,
+    })
+}
+
+/// One lane checkpoint row as an RPC-facing value (the snapshot field is the
+/// parsed canonical snapshot object or null; the brief artifact is a
+/// derivation, so its bytes are never echoed here).
+pub fn lane_checkpoint_val(row: &LaneCheckpointRow) -> Val {
+    object(vec![
+        ("checkpoint_id", string(&row.checkpoint_id)),
+        ("replacement_id", string(&row.replacement_id)),
+        ("lane_id", string(&row.lane_id)),
+        ("generation", integer(row.generation)),
+        ("role", string(&row.role)),
+        ("observation_digest", string(&row.observation_digest)),
+        ("reobservation_digest", string(&row.reobservation_digest)),
+        ("digest", string(&row.digest)),
+        ("brief_digest", string(&row.brief_digest)),
+        (
+            "snapshot",
+            Val::parse_json(&row.snapshot).unwrap_or_else(|_| null()),
+        ),
+        ("created_at", string(&row.created_at)),
+    ])
+}
+
+/// A non-empty, bounded, printable string (no control characters).
+fn printable_bounded(text: &str, max_len: usize) -> bool {
+    !text.is_empty() && text.len() <= max_len && !text.chars().any(char::is_control)
+}
+
+/// One required bounded printable text field of a checkpoint observation
+/// sub-object. Missing or invalid required evidence refuses typed — it is
+/// never silently omitted.
+fn cp_text(
+    map: &BTreeMap<String, Val>,
+    key: &str,
+    what: &str,
+    max_len: usize,
+) -> Result<String, StateError> {
+    match map.get(key).and_then(Val::as_str) {
+        Some(text) if printable_bounded(text, max_len) => Ok(text.to_string()),
+        _ => Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!(
+                "{what}.{key} must be a non-empty printable string of at most {max_len} \
+                 characters (missing evidence is never silently omitted)"
+            ),
+        )),
+    }
+}
+
+/// One required 64-hex sha256 integrity digest of a checkpoint observation
+/// sub-object.
+fn cp_hex64(map: &BTreeMap<String, Val>, key: &str, what: &str) -> Result<String, StateError> {
+    match map.get(key).and_then(Val::as_str) {
+        Some(text) if crate::formats::is_hex64(text) => Ok(text.to_string()),
+        _ => Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!("{what}.{key} must be a 64-hex sha256 digest (bounded integrity evidence)"),
+        )),
+    }
+}
+
+/// One required 40-hex (commit-sized) field of a checkpoint observation
+/// sub-object.
+fn cp_hex40(map: &BTreeMap<String, Val>, key: &str, what: &str) -> Result<String, StateError> {
+    match map.get(key).and_then(Val::as_str) {
+        Some(text) if crate::formats::is_hex40(text) => Ok(text.to_string()),
+        _ => Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!("{what}.{key} must be a 40-hex commit identity"),
+        )),
+    }
+}
+
+/// One required non-negative count field of a checkpoint observation
+/// sub-object.
+fn cp_count(map: &BTreeMap<String, Val>, key: &str, what: &str) -> Result<i64, StateError> {
+    match map.get(key).and_then(Val::as_int) {
+        Some(value) if (0..=1_000_000).contains(&value) => Ok(value),
+        _ => Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!("{what}.{key} must be a non-negative integer count"),
+        )),
+    }
+}
+
+/// One required object field of a checkpoint observation.
+fn cp_object<'a>(
+    map: &'a BTreeMap<String, Val>,
+    key: &str,
+    what: &str,
+) -> Result<&'a BTreeMap<String, Val>, StateError> {
+    match map.get(key) {
+        Some(Val::Obj(inner)) => Ok(inner),
+        _ => Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!("{what}.{key} must be an object"),
+        )),
+    }
+}
+
+/// One required array field of a checkpoint observation.
+fn cp_array<'a>(
+    map: &'a BTreeMap<String, Val>,
+    key: &str,
+    what: &str,
+) -> Result<&'a [Val], StateError> {
+    match map.get(key) {
+        Some(Val::Arr(items)) => Ok(items),
+        _ => Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!("{what}.{key} must be an array"),
+        )),
+    }
+}
+
+/// Enforce the closed key set of one checkpoint observation sub-object:
+/// every required key present, no unknown key accepted.
+fn cp_closed(
+    map: &BTreeMap<String, Val>,
+    required: &[&str],
+    optional: &[&str],
+    what: &str,
+) -> Result<(), StateError> {
+    for key in required {
+        if !map.contains_key(*key) {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                format!(
+                    "{what} is missing required field {key:?} (missing evidence is never \
+                     silently omitted)"
+                ),
+            ));
+        }
+    }
+    for key in map.keys() {
+        if !required.contains(&key.as_str()) && !optional.contains(&key.as_str()) {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                format!("{what} carries unknown field {key:?}; the contract is closed"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Git-ref-shaped branch identity: 1-120 chars of `[A-Za-z0-9._/-]`, no
+/// leading `-` or `/`, no `..`, no trailing `.`, `/` or `.lock`.
+fn is_branch_ref(text: &str) -> bool {
+    if text.is_empty() || text.len() > 120 {
+        return false;
+    }
+    if text.starts_with('-') || text.starts_with('/') {
+        return false;
+    }
+    if text.ends_with('.') || text.ends_with('/') || text.ends_with(".lock") {
+        return false;
+    }
+    if text.contains("..") || text.contains("//") {
+        return false;
+    }
+    text.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
+/// Validate the `observation.execution` block: the declared external harness
+/// execution state and its (optional for inactive execution) supported
+/// quiescence acknowledgment. Active execution REQUIRES a supported
+/// acknowledgment — daemon fencing alone is not claimed to stop arbitrary
+/// shell actions, so the capture refuses without the session's own
+/// acknowledgment.
+// The return tuple is (execution active, optional (kind, session, at) ack).
+#[allow(clippy::type_complexity)]
+fn cp_execution(
+    map: &BTreeMap<String, Val>,
+) -> Result<(bool, Option<(String, String, String)>), StateError> {
+    cp_closed(map, &["active", "ack"], &[], "observation.execution")?;
+    let active = match map.get("active") {
+        Some(Val::Bool(active)) => *active,
+        _ => {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                "observation.execution.active must be a boolean",
+            ));
+        }
+    };
+    let ack = match map.get("ack") {
+        None | Some(Val::Null) => None,
+        Some(Val::Obj(ack)) => {
+            cp_closed(
+                ack,
+                &["kind", "session", "at"],
+                &[],
+                "observation.execution.ack",
+            )?;
+            let kind = cp_text(ack, "kind", "observation.execution.ack", 64)?;
+            if !CHECKPOINT_ACK_KINDS.contains(&kind.as_str()) {
+                return Err(state_error(
+                    checkpoint_code::ACK,
+                    format!(
+                        "unsupported quiescence acknowledgment kind {kind:?} \
+                         (supported: {:?})",
+                        CHECKPOINT_ACK_KINDS
+                    ),
+                ));
+            }
+            let session = cp_text(ack, "session", "observation.execution.ack", 64)?;
+            if !crate::formats::is_actor(&session) {
+                return Err(state_error(
+                    checkpoint_code::ACK,
+                    "observation.execution.ack.session must be an actor identity",
+                ));
+            }
+            let at = cp_text(ack, "at", "observation.execution.ack", 20)?;
+            if !crate::formats::is_rfc3339_seconds_z(&at) {
+                return Err(state_error(
+                    checkpoint_code::ACK,
+                    "observation.execution.ack.at must be an RFC3339 UTC (seconds, Z) timestamp",
+                ));
+            }
+            Some((kind, session, at))
+        }
+        Some(_) => {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                "observation.execution.ack must be an object or null",
+            ));
+        }
+    };
+    match (active, &ack) {
+        (false, Some((kind, _, _))) => {
+            return Err(state_error(
+                checkpoint_code::ACK,
+                format!(
+                    "a quiescence acknowledgment ({kind:?}) was supplied while external harness \
+                     execution is not active; refused, never silently ignored"
+                ),
+            ));
+        }
+        (true, None) => {
+            return Err(state_error(
+                checkpoint_code::ACK,
+                "active external harness execution requires a supported quiescence \
+                 acknowledgment AND a process/child observation; daemon fencing alone does \
+                 not stop arbitrary shell actions",
+            ));
+        }
+        _ => {}
+    }
+    Ok((active, ack))
+}
+
+/// Validate the `observation.orchestration` block (orchestrator records
+/// only): worker/reviewer references must name EXISTING lane replacement
+/// records of the matching role, and pending completion events are bounded
+/// tokens. Referencing lanes never alters them.
+// The return tuple is (workers, reviewers, pending events).
+#[allow(clippy::type_complexity)]
+fn cp_orchestration(
+    tx: &rusqlite::Transaction<'_>,
+    map: &BTreeMap<String, Val>,
+) -> Result<(Vec<String>, Vec<String>, Vec<String>), StateError> {
+    cp_closed(
+        map,
+        &["workers", "reviewers", "pending_events"],
+        &[],
+        "observation.orchestration",
+    )?;
+    let mut workers = Vec::new();
+    for item in cp_array(map, "workers", "observation.orchestration")? {
+        let Some(id) = item.as_str() else {
+            return Err(state_error(
+                checkpoint_code::REFERENCES,
+                "observation.orchestration.workers entries must be replacement ids (rp_ + 16 hex)",
+            ));
+        };
+        if !crate::formats::is_replacement_id(id) {
+            return Err(state_error(
+                checkpoint_code::REFERENCES,
+                format!("reference {id:?} is not a lane replacement id (rp_ + 16 hex)"),
+            ));
+        }
+        let role: Option<String> = tx
+            .query_row(
+                "SELECT role FROM lane_replacements WHERE replacement_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("checkpoint: worker reference", err))?;
+        match role.as_deref() {
+            Some("implementer") => workers.push(id.to_string()),
+            Some(other) => {
+                return Err(state_error(
+                    checkpoint_code::REFERENCES,
+                    format!(
+                        "worker reference {id} names a {other} record; worker references must \
+                         name existing implementer lanes"
+                    ),
+                ));
+            }
+            None => {
+                return Err(state_error(
+                    checkpoint_code::REFERENCES,
+                    format!(
+                        "worker reference {id} does not exist; orchestrator checkpoints \
+                         reference existing worker identities only"
+                    ),
+                ));
+            }
+        }
+        if workers.len() > CHECKPOINT_REFERENCES_MAX {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                format!("at most {CHECKPOINT_REFERENCES_MAX} worker references per checkpoint"),
+            ));
+        }
+    }
+    let mut reviewers = Vec::new();
+    for item in cp_array(map, "reviewers", "observation.orchestration")? {
+        let Some(id) = item.as_str() else {
+            return Err(state_error(
+                checkpoint_code::REFERENCES,
+                "observation.orchestration.reviewers entries must be replacement ids (rp_ + 16 hex)",
+            ));
+        };
+        if !crate::formats::is_replacement_id(id) {
+            return Err(state_error(
+                checkpoint_code::REFERENCES,
+                format!("reference {id:?} is not a lane replacement id (rp_ + 16 hex)"),
+            ));
+        }
+        let role: Option<String> = tx
+            .query_row(
+                "SELECT role FROM lane_replacements WHERE replacement_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("checkpoint: reviewer reference", err))?;
+        match role.as_deref() {
+            Some("reviewer") => reviewers.push(id.to_string()),
+            Some(other) => {
+                return Err(state_error(
+                    checkpoint_code::REFERENCES,
+                    format!(
+                        "reviewer reference {id} names a {other} record; reviewer references \
+                         must name existing reviewer lanes"
+                    ),
+                ));
+            }
+            None => {
+                return Err(state_error(
+                    checkpoint_code::REFERENCES,
+                    format!(
+                        "reviewer reference {id} does not exist; orchestrator checkpoints \
+                         reference existing reviewer identities only"
+                    ),
+                ));
+            }
+        }
+        if reviewers.len() > CHECKPOINT_REFERENCES_MAX {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                format!("at most {CHECKPOINT_REFERENCES_MAX} reviewer references per checkpoint"),
+            ));
+        }
+    }
+    let mut events = Vec::new();
+    for item in cp_array(map, "pending_events", "observation.orchestration")? {
+        let Some(text) = item.as_str() else {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                "observation.orchestration.pending_events entries must be strings",
+            ));
+        };
+        if !printable_bounded(text, 120) {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                "observation.orchestration.pending_events entries must be 1-120 printable \
+                 characters",
+            ));
+        }
+        events.push(text.to_string());
+        if events.len() > CHECKPOINT_REFERENCES_MAX {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                format!(
+                    "at most {CHECKPOINT_REFERENCES_MAX} pending completion events per checkpoint"
+                ),
+            ));
+        }
+    }
+    Ok((workers, reviewers, events))
+}
+
+/// Validate one checkpoint observation against the replacement record and
+/// the closed contract, and build the canonical snapshot value. Every
+/// required field is present and bounded or the capture refuses; active or
+/// ambiguous side-effecting child commands HOLD completion (nothing is
+/// signalled, killed, or cleaned up to obtain a snapshot).
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_snapshot_val(
+    record: &LaneReplacementRow,
+    observation: &Val,
+    observation_digest: &str,
+    reobservation_digest: &str,
+    outstanding: &[(String, String)],
+    outstanding_count: i64,
+    epoch: i64,
+    at: &str,
+    checkpoint_id: &str,
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<Val, StateError> {
+    let Val::Obj(obs) = observation else {
+        return Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            "observation must be an object",
+        ));
+    };
+    cp_closed(
+        obs,
+        &[
+            "role",
+            "task",
+            "worktree",
+            "branch",
+            "head",
+            "base",
+            "dirty",
+            "untracked",
+            "report",
+            "gates",
+            "children",
+            "execution",
+        ],
+        &["orchestration"],
+        "observation",
+    )?;
+    let role = cp_text(obs, "role", "observation", 64)?;
+    if role != record.role {
+        return Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!(
+                "observation.role {role:?} does not match the replacement record role {:?} \
+                 (a checkpoint binds the lane it captures)",
+                record.role
+            ),
+        ));
+    }
+    let task = cp_text(obs, "task", "observation", 200)?;
+    let worktree = cp_text(obs, "worktree", "observation", 200)?;
+    if worktree != record.worktree || !crate::formats::is_worktree_ref(&worktree) {
+        return Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!(
+                "observation.worktree {worktree:?} does not match the replacement record \
+                 worktree {:?}",
+                record.worktree
+            ),
+        ));
+    }
+    let branch = cp_text(obs, "branch", "observation", 120)?;
+    if !is_branch_ref(&branch) {
+        return Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!("observation.branch {branch:?} is not a git-ref-shaped branch identity"),
+        ));
+    }
+    let head = cp_hex40(obs, "head", "observation")?;
+    let base = cp_hex40(obs, "base", "observation")?;
+    let dirty = cp_object(obs, "dirty", "observation")?;
+    cp_closed(dirty, &["count", "digest"], &[], "observation.dirty")?;
+    let dirty_count = cp_count(dirty, "count", "observation.dirty")?;
+    let dirty_digest = cp_hex64(dirty, "digest", "observation.dirty")?;
+    let untracked = cp_object(obs, "untracked", "observation")?;
+    cp_closed(
+        untracked,
+        &["count", "digest"],
+        &[],
+        "observation.untracked",
+    )?;
+    let untracked_count = cp_count(untracked, "count", "observation.untracked")?;
+    let untracked_digest = cp_hex64(untracked, "digest", "observation.untracked")?;
+    let report = cp_object(obs, "report", "observation")?;
+    cp_closed(
+        report,
+        &["round", "reviewed_sha"],
+        &[],
+        "observation.report",
+    )?;
+    let report_round = match report.get("round").and_then(Val::as_int) {
+        Some(value) if (1..=100_000).contains(&value) => value,
+        _ => {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                "observation.report.round must be a positive integer",
+            ));
+        }
+    };
+    let reviewed_sha = cp_hex40(report, "reviewed_sha", "observation.report")?;
+    let gates = cp_array(obs, "gates", "observation")?;
+    if gates.len() > CHECKPOINT_GATES_MAX {
+        return Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!("at most {CHECKPOINT_GATES_MAX} gate entries per checkpoint"),
+        ));
+    }
+    let mut gate_vals: Vec<Val> = Vec::with_capacity(gates.len());
+    for (index, gate) in gates.iter().enumerate() {
+        let what = format!("observation.gates[{index}]");
+        let Val::Obj(gate_map) = gate else {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                format!("{what} must be an object"),
+            ));
+        };
+        cp_closed(gate_map, &["name", "status"], &[], &what)?;
+        let name = cp_text(gate_map, "name", &what, 80)?;
+        let status = cp_text(gate_map, "status", &what, 16)?;
+        if !CHECKPOINT_GATE_STATUSES.contains(&status.as_str()) {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                format!("{what}.status {status:?} is outside {CHECKPOINT_GATE_STATUSES:?}"),
+            ));
+        }
+        gate_vals.push(object(vec![
+            ("name", string(&name)),
+            ("status", string(&status)),
+        ]));
+    }
+    let children = cp_array(obs, "children", "observation")?;
+    if children.len() > CHECKPOINT_CHILDREN_MAX {
+        return Err(state_error(
+            checkpoint_code::INCOMPLETE,
+            format!("at most {CHECKPOINT_CHILDREN_MAX} observed child commands per checkpoint"),
+        ));
+    }
+    let mut child_vals: Vec<Val> = Vec::with_capacity(children.len());
+    for (index, child) in children.iter().enumerate() {
+        let what = format!("observation.children[{index}]");
+        let Val::Obj(child_map) = child else {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                format!("{what} must be an object"),
+            ));
+        };
+        cp_closed(child_map, &["command", "state"], &[], &what)?;
+        let command = cp_text(child_map, "command", &what, 160)?;
+        let state = cp_text(child_map, "state", &what, 16)?;
+        if !CHECKPOINT_CHILD_STATES.contains(&state.as_str()) {
+            return Err(state_error(
+                checkpoint_code::INCOMPLETE,
+                format!("{what}.state {state:?} is outside {CHECKPOINT_CHILD_STATES:?}"),
+            ));
+        }
+        if state != "exited" {
+            return Err(state_error(
+                checkpoint_code::HELD,
+                format!(
+                    "observed side-effecting child command {command:?} is {state:?}: checkpoint \
+                     completion is held; nothing is signalled, killed, or cleaned up to obtain \
+                     a snapshot — let the child finish and retry"
+                ),
+            ));
+        }
+        child_vals.push(object(vec![
+            ("command", string(&command)),
+            ("state", string(&state)),
+        ]));
+    }
+    let execution = cp_object(obs, "execution", "observation")?;
+    let (active, ack) = cp_execution(execution)?;
+    let execution_val = object(vec![
+        ("active", bool_(active)),
+        (
+            "ack",
+            match &ack {
+                Some((kind, session, ack_at)) => object(vec![
+                    ("kind", string(kind)),
+                    ("session", string(session)),
+                    ("at", string(ack_at)),
+                ]),
+                None => null(),
+            },
+        ),
+    ]);
+    let orchestration = match (record.role.as_str(), obs.get("orchestration")) {
+        ("orchestrator", Some(Val::Obj(map))) => {
+            let (workers, reviewers, events) = cp_orchestration(tx, map)?;
+            Some(object(vec![
+                (
+                    "workers",
+                    Val::Arr(workers.iter().map(|id| string(id)).collect()),
+                ),
+                (
+                    "reviewers",
+                    Val::Arr(reviewers.iter().map(|id| string(id)).collect()),
+                ),
+                (
+                    "pending_events",
+                    Val::Arr(events.iter().map(|event| string(event)).collect()),
+                ),
+            ]))
+        }
+        ("orchestrator", _) => {
+            return Err(state_error(
+                checkpoint_code::REFERENCES,
+                "an orchestrator checkpoint must reference its existing worker/reviewer lanes \
+                 and pending completion events (observation.orchestration)",
+            ));
+        }
+        (_, Some(_)) => {
+            return Err(state_error(
+                checkpoint_code::REFERENCES,
+                "observation.orchestration is only valid for orchestrator lane checkpoints",
+            ));
+        }
+        (_, None) => None,
+    };
+    let mut fields: Vec<(&str, Val)> = vec![
+        ("checkpoint_id", string(checkpoint_id)),
+        ("replacement_id", string(&record.replacement_id)),
+        ("lane_id", string(&record.lane_id)),
+        ("generation", integer(record.generation)),
+        ("role", string(&role)),
+        ("task", string(&task)),
+        ("worktree", string(&worktree)),
+        ("branch", string(&branch)),
+        ("head", string(&head)),
+        ("base", string(&base)),
+        (
+            "dirty",
+            object(vec![
+                ("count", integer(dirty_count)),
+                ("digest", string(&dirty_digest)),
+            ]),
+        ),
+        (
+            "untracked",
+            object(vec![
+                ("count", integer(untracked_count)),
+                ("digest", string(&untracked_digest)),
+            ]),
+        ),
+        (
+            "report",
+            object(vec![
+                ("round", integer(report_round)),
+                ("reviewed_sha", string(&reviewed_sha)),
+            ]),
+        ),
+        ("gates", Val::Arr(gate_vals)),
+        ("children", Val::Arr(child_vals)),
+        ("execution", execution_val),
+        (
+            "outstanding_operations",
+            object(vec![
+                ("count", integer(outstanding_count)),
+                (
+                    "operations",
+                    Val::Arr(
+                        outstanding
+                            .iter()
+                            .map(|(key, method)| {
+                                object(vec![("key", string(key)), ("method", string(method))])
+                            })
+                            .collect(),
+                    ),
+                ),
+            ]),
+        ),
+        ("state_epoch", integer(epoch)),
+        ("captured_at", string(at)),
+        ("observation_digest", string(observation_digest)),
+        ("reobservation_digest", string(reobservation_digest)),
+    ];
+    if let Some(orchestration) = orchestration {
+        fields.push(("orchestration", orchestration));
+    }
+    Ok(object(fields))
+}
+
+/// The compact human/agent brief for one committed checkpoint record.
+/// Deterministic: the same row always renders the same bytes, so a restart
+/// reconciliation can regenerate a missing artifact and verify it against
+/// `brief_digest` byte-for-byte. The brief carries explicit pointers to the
+/// retained evidence (ids + digests) only — never a raw transcript, never a
+/// credential, and never a truncation of the recorded gates (oversize
+/// required data refuses at commit instead).
+pub fn lane_checkpoint_brief(row: &LaneCheckpointRow) -> Result<String, StateError> {
+    let snapshot = Val::parse_json(&row.snapshot).map_err(|_| {
+        state_error(
+            "state.corrupt",
+            format!(
+                "checkpoint {} snapshot is not parseable canonical JSON",
+                row.checkpoint_id
+            ),
+        )
+    })?;
+    let Val::Obj(obj) = &snapshot else {
+        return Err(state_error(
+            "state.corrupt",
+            format!("checkpoint {} snapshot is not an object", row.checkpoint_id),
+        ));
+    };
+    let text =
+        |key: &str| -> String { obj.get(key).and_then(Val::as_str).unwrap_or("").to_string() };
+    let int = |key: &str| -> i64 { obj.get(key).and_then(Val::as_int).unwrap_or(0) };
+    let mut brief = String::new();
+    brief.push_str(&format!(
+        "lane checkpoint {} (replacement {})\n",
+        row.checkpoint_id, row.replacement_id
+    ));
+    brief.push_str(&format!(
+        "lane: {} generation {} role {}\n",
+        text("lane_id"),
+        int("generation"),
+        text("role")
+    ));
+    brief.push_str(&format!("task: {}\n", text("task")));
+    brief.push_str(&format!("worktree: {}\n", text("worktree")));
+    brief.push_str(&format!("branch: {}\n", text("branch")));
+    brief.push_str(&format!("head: {}\n", text("head")));
+    brief.push_str(&format!("base: {}\n", text("base")));
+    for key in ["dirty", "untracked"] {
+        let count = obj
+            .get(key)
+            .and_then(|value| value.get("count"))
+            .and_then(Val::as_int)
+            .unwrap_or(0);
+        let digest = obj
+            .get(key)
+            .and_then(|value| value.get("digest"))
+            .and_then(Val::as_str)
+            .unwrap_or("");
+        brief.push_str(&format!("{key}: {count} file(s) sha256 {digest}\n"));
+    }
+    let report = obj.get("report");
+    brief.push_str(&format!(
+        "report: round {}, reviewed sha {}\n",
+        report
+            .and_then(|value| value.get("round"))
+            .and_then(Val::as_int)
+            .unwrap_or(0),
+        report
+            .and_then(|value| value.get("reviewed_sha"))
+            .and_then(Val::as_str)
+            .unwrap_or("")
+    ));
+    let gates = obj
+        .get("gates")
+        .and_then(Val::as_array)
+        .cloned()
+        .unwrap_or_default();
+    brief.push_str(&format!("gates: {}\n", gates.len()));
+    for gate in &gates {
+        brief.push_str(&format!(
+            "- {}: {}\n",
+            gate.get("name").and_then(Val::as_str).unwrap_or(""),
+            gate.get("status").and_then(Val::as_str).unwrap_or("")
+        ));
+    }
+    let children = obj
+        .get("children")
+        .and_then(Val::as_array)
+        .cloned()
+        .unwrap_or_default();
+    brief.push_str(&format!("children: {}\n", children.len()));
+    for child in &children {
+        brief.push_str(&format!(
+            "- {}: {}\n",
+            child.get("command").and_then(Val::as_str).unwrap_or(""),
+            child.get("state").and_then(Val::as_str).unwrap_or("")
+        ));
+    }
+    let execution = obj.get("execution");
+    let execution_active = execution
+        .and_then(|value| value.get("active"))
+        .and_then(Val::as_bool)
+        .unwrap_or(false);
+    let ack = execution.and_then(|value| value.get("ack"));
+    match ack {
+        Some(Val::Obj(_)) if execution_active => {
+            let ack = ack.expect("checked above");
+            brief.push_str(&format!(
+                "execution: active; ack {} session {} at {}\n",
+                ack.get("kind").and_then(Val::as_str).unwrap_or(""),
+                ack.get("session").and_then(Val::as_str).unwrap_or(""),
+                ack.get("at").and_then(Val::as_str).unwrap_or("")
+            ));
+        }
+        _ => {
+            brief.push_str("execution: inactive\n");
+        }
+    }
+    if let Some(orchestration) = obj.get("orchestration") {
+        let count = |key: &str| -> usize {
+            orchestration
+                .get(key)
+                .and_then(Val::as_array)
+                .map(|items| items.len())
+                .unwrap_or(0)
+        };
+        brief.push_str(&format!(
+            "orchestration: workers {}, reviewers {}, pending events {}\n",
+            count("workers"),
+            count("reviewers"),
+            count("pending_events")
+        ));
+    }
+    brief.push_str(&format!(
+        "outstanding operations: {}\n",
+        obj.get("outstanding_operations")
+            .and_then(|value| value.get("count"))
+            .and_then(Val::as_int)
+            .unwrap_or(0)
+    ));
+    brief.push_str(&format!(
+        "evidence: snapshot sha256 {}; observations sha256 {} == {}\n",
+        row.digest, row.observation_digest, row.reobservation_digest
+    ));
+    brief.push_str(&format!("record: lane_checkpoints/{}\n", row.checkpoint_id));
+    Ok(brief)
+}
+
 /// Prune audit rows beyond the retention bound, always keeping the chain
 /// genesis (seq 0) so verification keeps its anchor.
 fn prune_audit_locked(
@@ -3390,22 +4581,33 @@ const M0005_ID: &str = "m0005_lane_replacements_v5";
 const M0005_APPLIES_FROM: i64 = 4;
 const M0005_APPLIES_TO: i64 = 5;
 
+/// m0006 adds the lane checkpoint table (issue #74): the atomic,
+/// restart-safe capture that completes the `quiescing` → `checkpointed`
+/// transition for one replacement record. The snapshot column is the
+/// durable authority; the compact brief is a deterministic derivation of
+/// it (regenerated, never trusted from the request).
+const M0006_ID: &str = "m0006_lane_checkpoints_v6";
+const M0006_APPLIES_FROM: i64 = 5;
+const M0006_APPLIES_TO: i64 = 6;
+
 /// Ordered migration chain (id, applies_from, applies_to). The runner in
 /// [`State::open`] applies every pending migration before serving.
-const MIGRATIONS: [(&str, i64, i64); 5] = [
+const MIGRATIONS: [(&str, i64, i64); 6] = [
     (M0001_ID, M0001_APPLIES_FROM, M0001_APPLIES_TO),
     (M0002_ID, M0002_APPLIES_FROM, M0002_APPLIES_TO),
     (M0003_ID, M0003_APPLIES_FROM, M0003_APPLIES_TO),
     (M0004_ID, M0004_APPLIES_FROM, M0004_APPLIES_TO),
     (M0005_ID, M0005_APPLIES_FROM, M0005_APPLIES_TO),
+    (M0006_ID, M0006_APPLIES_FROM, M0006_APPLIES_TO),
 ];
 
-/// Ordered migration-chain identifiers (`m0001`..`m0005`), exposed for the
+/// Ordered migration-chain identifiers (`m0001`..`m0006`), exposed for the
 /// release provenance chain (issue #10): `herdr-fleet --version` prints
 /// them so a release archive's provenance record can bind the exact
 /// state-schema migration chain of the binary it ships.
 pub fn migration_chain_ids() -> &'static [&'static str] {
-    const IDS: [&str; MIGRATIONS.len()] = [M0001_ID, M0002_ID, M0003_ID, M0004_ID, M0005_ID];
+    const IDS: [&str; MIGRATIONS.len()] =
+        [M0001_ID, M0002_ID, M0003_ID, M0004_ID, M0005_ID, M0006_ID];
     &IDS
 }
 
@@ -3470,6 +4672,28 @@ ALTER TABLE schedules ADD COLUMN doc TEXT NOT NULL DEFAULT '';
 ALTER TABLE schedules ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
 ";
 
+/// m0006 lane checkpoint table (issue #74). One checkpoint per replacement
+/// record (`UNIQUE (replacement_id)` — a second capture is refused, never
+/// merged); the snapshot is the durable capture authority, `digest` binds
+/// the canonical snapshot bytes, and `brief_digest` binds the generated
+/// brief artifact (which lives beside the state database and is
+/// regenerated — never trusted from a request or a torn write).
+const M0006_SQL: &str = "\
+CREATE TABLE lane_checkpoints (
+    checkpoint_id TEXT PRIMARY KEY,
+    replacement_id TEXT NOT NULL UNIQUE,
+    lane_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    observation_digest TEXT NOT NULL,
+    reobservation_digest TEXT NOT NULL,
+    snapshot TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    brief_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+";
+
 /// Ordered lane replacement phases (issue #73): one replacement moves
 /// through exactly this chain; every transition is a transactional
 /// compare-and-set on the current phase.
@@ -3519,7 +4743,62 @@ pub mod replacement_code {
     pub const INVALIDATED: &str = "refusal.replacement.invalidated";
     /// Cancellation is only legal before retirement.
     pub const RETIRED: &str = "refusal.replacement.retired";
+    /// The lane is inside the quiescing window of an existing handoff
+    /// (issue #74): a new replacement slot for the lane is fenced until the
+    /// handoff resolves or is cancelled.
+    pub const FENCED: &str = "refusal.replacement.fenced";
 }
+
+/// Typed refusal codes for lane checkpoints (issue #74). Same dotted
+/// `refusal.*` vocabulary as the replacement codes; produced by the state
+/// layer so RPC responses carry them unchanged.
+pub mod checkpoint_code {
+    /// A checkpoint already exists for this replacement (no second capture
+    /// can exist; the id is deterministic per replacement).
+    pub const EXISTS: &str = "refusal.checkpoint.exists";
+    /// The two observations of the lane disagree: the state changed during
+    /// capture, so the checkpoint refuses to commit either view.
+    pub const CHANGED: &str = "refusal.checkpoint.changed";
+    /// An observed side-effecting child command is active or ambiguous:
+    /// checkpoint completion is held (nothing is signalled, killed, or
+    /// cleaned up to obtain a snapshot).
+    pub const HELD: &str = "refusal.checkpoint.held";
+    /// Required data (the generated brief) exceeds the enforced size bound:
+    /// a typed hold — required gates are never silently truncated.
+    pub const OVERSIZE: &str = "refusal.checkpoint.oversize";
+    /// Active external harness execution without a supported quiescence
+    /// acknowledgment (or an acknowledgment supplied while execution is not
+    /// active, or an unsupported acknowledgment kind).
+    pub const ACK: &str = "refusal.checkpoint.ack";
+    /// Orchestrator references are invalid: a referenced worker/reviewer
+    /// record does not exist, has the wrong role, or the orchestration
+    /// block is missing/misplaced for the record's role.
+    pub const REFERENCES: &str = "refusal.checkpoint.references";
+    /// Required snapshot data is missing or malformed. Missing evidence is
+    /// never silently omitted: the field must be present and valid or the
+    /// checkpoint refuses.
+    pub const INCOMPLETE: &str = "refusal.checkpoint.incomplete";
+}
+
+/// Content bounds for one checkpoint observation. Every field is bounded
+/// up front; the generated brief additionally enforces a total size bound
+/// (oversize required data refuses typed, it is never truncated).
+/// Maximum gate-list entries recorded.
+pub const CHECKPOINT_GATES_MAX: usize = 24;
+/// Maximum observed child commands recorded.
+pub const CHECKPOINT_CHILDREN_MAX: usize = 16;
+/// Maximum worker/reviewer references per orchestrator checkpoint.
+pub const CHECKPOINT_REFERENCES_MAX: usize = 8;
+/// Enforced byte bound of the generated brief artifact.
+pub const CHECKPOINT_BRIEF_MAX_BYTES: usize = 3072;
+/// Supported quiescence-acknowledgment kinds (closed set; anything else is
+/// an unsupported acknowledgment and refuses).
+pub const CHECKPOINT_ACK_KINDS: [&str; 1] = ["session-quiesced"];
+/// Closed observed child-command states. `active` and `ambiguous` hold
+/// checkpoint completion.
+pub const CHECKPOINT_CHILD_STATES: [&str; 3] = ["exited", "active", "ambiguous"];
+/// Closed gate statuses recorded in one snapshot.
+pub const CHECKPOINT_GATE_STATUSES: [&str; 4] = ["pending", "running", "passed", "failed"];
 
 /// The phase that legally follows `phase` (`None` for the terminal
 /// `adopted`, or an unknown phase).
@@ -3544,6 +4823,15 @@ fn phase_before_retirement(phase: &str) -> bool {
 pub fn replacement_id_for(lane_id: &str, generation: i64) -> String {
     let digest = sha256_hex(format!("hf-lane-replacement/v1|{lane_id}|{generation}").as_bytes());
     format!("rp_{}", &digest[..16])
+}
+
+/// The deterministic checkpoint id for one replacement record: `ck_` + 16
+/// hex of sha256 over `hf-lane-checkpoint/v1|<replacement_id>`. Same
+/// replacement → same id, so a crash-then-retry and a restart observe the
+/// identical artifact identity (at most one checkpoint per replacement).
+pub fn checkpoint_id_for(replacement_id: &str) -> String {
+    let digest = sha256_hex(format!("hf-lane-checkpoint/v1|{replacement_id}").as_bytes());
+    format!("ck_{}", &digest[..16])
 }
 
 /// m0005 lane replacement tables (issue #73). `lane_replacements` holds one
@@ -3852,6 +5140,36 @@ fn run_m0005(conn: &mut Connection) -> Result<(), StateError> {
         .map_err(|err| StateError::from_sqlite("migrate m0005: user_version", err))?;
     tx.commit()
         .map_err(|err| StateError::from_sqlite("migrate m0005: commit", err))?;
+    Ok(())
+}
+
+/// Run migration m0006 in one transaction: the lane checkpoint table
+/// (issue #74 atomic capture record). Purely additive — no existing table
+/// or row is touched, so stored grants and replacement records are never
+/// reinterpreted by the upgrade.
+fn run_m0006(conn: &mut Connection) -> Result<(), StateError> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| StateError::from_sqlite("migrate m0006: begin", err))?;
+    let checksum = sha256_hex(M0006_SQL.as_bytes());
+    tx.execute_batch(M0006_SQL)
+        .map_err(|err| StateError::from_sqlite("migrate m0006", err))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (migration_id, applies_from, applies_to, checksum, applied_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            M0006_ID,
+            M0006_APPLIES_FROM,
+            M0006_APPLIES_TO,
+            checksum,
+            time::rfc3339_now()
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("migrate m0006: bookkeeping", err))?;
+    tx.pragma_update(None, "user_version", M0006_APPLIES_TO)
+        .map_err(|err| StateError::from_sqlite("migrate m0006: user_version", err))?;
+    tx.commit()
+        .map_err(|err| StateError::from_sqlite("migrate m0006: commit", err))?;
     Ok(())
 }
 
@@ -4713,21 +6031,23 @@ mod tests {
         assert_eq!(grant.status, "active");
         assert_eq!(grant.state_epoch, 1);
         assert_eq!(state.current_epoch().expect("epoch"), 1);
-        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(SCHEMA_VERSION, 6);
         {
-            let conn = state.lock("test: m0005 bookkeeping").expect("lock");
-            let recorded: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
-                    params![M0005_ID],
-                    |row| row.get(0),
-                )
-                .expect("bookkeeping");
-            assert_eq!(recorded, 1, "m0005 recorded in schema_migrations");
+            let conn = state.lock("test: m0005/m0006 bookkeeping").expect("lock");
+            for migration_id in [M0005_ID, M0006_ID] {
+                let recorded: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                        params![migration_id],
+                        |row| row.get(0),
+                    )
+                    .expect("bookkeeping");
+                assert_eq!(recorded, 1, "{migration_id} recorded in schema_migrations");
+            }
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .expect("user_version");
-            assert_eq!(version, 5);
+            assert_eq!(version, 6);
         }
     }
 
@@ -4902,6 +6222,1052 @@ mod tests {
                 .len(),
             4,
             "history durable across restart"
+        );
+    }
+    /// A valid synthetic checkpoint observation for a lane-7 implementer
+    /// record on `worktrees/issues/74`. Every required field is explicitly
+    /// present — the contract refuses missing evidence instead of omitting
+    /// it (issue #74).
+    fn sample_checkpoint_observation() -> Val {
+        object(vec![
+            ("role", string("implementer")),
+            ("task", string("issue-74 checkpoint capture")),
+            ("worktree", string("worktrees/issues/74")),
+            ("branch", string("issue-74-checkpoint")),
+            ("head", string(&"a".repeat(40))),
+            ("base", string(&"b".repeat(40))),
+            (
+                "dirty",
+                object(vec![
+                    ("count", integer(3)),
+                    ("digest", string(&"c".repeat(64))),
+                ]),
+            ),
+            (
+                "untracked",
+                object(vec![
+                    ("count", integer(2)),
+                    ("digest", string(&"d".repeat(64))),
+                ]),
+            ),
+            (
+                "report",
+                object(vec![
+                    ("round", integer(2)),
+                    ("reviewed_sha", string(&"e".repeat(40))),
+                ]),
+            ),
+            (
+                "gates",
+                Val::Arr(vec![
+                    object(vec![
+                        ("name", string("focused")),
+                        ("status", string("pending")),
+                    ]),
+                    object(vec![("name", string("full")), ("status", string("passed"))]),
+                ]),
+            ),
+            (
+                "children",
+                Val::Arr(vec![object(vec![
+                    ("command", string("cargo test --locked")),
+                    ("state", string("exited")),
+                ])]),
+            ),
+            (
+                "execution",
+                object(vec![("active", bool_(false)), ("ack", null())]),
+            ),
+        ])
+    }
+
+    /// Request + advance one replacement to the quiescing boundary.
+    fn quiescing_replacement(state: &State, lane: &str, at: &str) -> LaneReplacementRow {
+        let row = state
+            .request_lane_replacement(
+                lane,
+                1,
+                "sess-0001",
+                "proc-0001",
+                "implementer",
+                "worktrees/issues/74",
+                "checkpoint capture",
+                at,
+            )
+            .expect("request");
+        state
+            .advance_lane_replacement(&row.replacement_id, "requested", 1, at)
+            .expect("advance to quiescing")
+    }
+
+    fn edit_checkpoint_observation(mut observation: Val, key: &str, value: Option<Val>) -> Val {
+        if let Val::Obj(map) = &mut observation {
+            match value {
+                Some(value) => {
+                    map.insert(key.to_string(), value);
+                }
+                None => {
+                    map.remove(key);
+                }
+            }
+        }
+        observation
+    }
+
+    fn edit_checkpoint_observation_nested(
+        observation: Val,
+        outer: &str,
+        key: &str,
+        value: Option<Val>,
+    ) -> Val {
+        let mut observation = observation;
+        if let Val::Obj(map) = &mut observation
+            && let Some(Val::Obj(inner)) = map.get_mut(outer)
+        {
+            match value {
+                Some(value) => {
+                    inner.insert(key.to_string(), value);
+                }
+                None => {
+                    inner.remove(key);
+                }
+            }
+        }
+        observation
+    }
+
+    #[test]
+    fn lane_checkpoint_migration_preserves_replacement_rows() {
+        // Issue #74: the m0006 upgrade is purely additive. A database
+        // written at schema v5 (m0001..m0005) with a stored replacement
+        // record and its history upgrades in place; the record, its event
+        // history and the next allowed transition are exactly what they
+        // were, and the new checkpoint table starts empty.
+        let path = temp_db("checkpoint-upgrade.db");
+        {
+            let mut conn = Connection::open(&path).expect("open raw");
+            run_initial_migration(&mut conn).expect("m0001");
+            run_m0002(&mut conn).expect("m0002");
+            run_m0003(&mut conn).expect("m0003");
+            run_m0004(&mut conn).expect("m0004");
+            run_m0005(&mut conn).expect("m0005");
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("user_version");
+            assert_eq!(version, 5, "raw fixture lands at schema v5");
+            let replacement_id = replacement_id_for("lane-7", 1);
+            conn.execute(
+                "INSERT INTO lane_replacements (replacement_id, lane_id, generation,
+                    successor_generation, phase, outcome, outcome_reason, source_session,
+                    source_process, role, worktree, reason, created_at, updated_at)
+                 VALUES (?1, 'lane-7', 1, 2, 'quiescing', 'pending', '', 'sess-0001',
+                    'proc-0001', 'implementer', 'worktrees/issues/74', 'host rotation window',
+                    '2026-09-12T00:00:00Z', '2026-09-12T00:00:00Z')",
+                params![replacement_id],
+            )
+            .expect("stored replacement insert");
+            conn.execute(
+                "INSERT INTO lane_replacement_events (seq, replacement_id, from_phase, to_phase,
+                    from_outcome, to_outcome, reason, at)
+                 VALUES (1, ?1, NULL, 'requested', NULL, 'pending', 'host rotation window',
+                    '2026-09-12T00:00:00Z')",
+                params![replacement_id],
+            )
+            .expect("stored event insert");
+            conn.execute(
+                "INSERT INTO lane_replacement_events (seq, replacement_id, from_phase, to_phase,
+                    from_outcome, to_outcome, reason, at)
+                 VALUES (2, ?1, 'requested', 'quiescing', 'pending', 'pending', '',
+                    '2026-09-12T00:00:00Z')",
+                params![replacement_id],
+            )
+            .expect("stored event insert");
+        }
+        let state = State::open(&path, Retention::default()).expect("upgrade open");
+        let row = state
+            .lane_replacement_by_id(&replacement_id_for("lane-7", 1))
+            .expect("read")
+            .expect("the stored replacement survives the upgrade");
+        assert_eq!(row.phase, "quiescing");
+        assert_eq!(row.outcome, "pending");
+        assert_eq!(row.successor_generation, 2);
+        let events = state
+            .lane_replacement_events(&row.replacement_id)
+            .expect("history");
+        assert_eq!(events.len(), 2, "the stored history is preserved");
+        assert_eq!(
+            state
+                .lane_checkpoint_by_replacement(&row.replacement_id)
+                .expect("checkpoint read"),
+            None,
+            "the new checkpoint table starts empty"
+        );
+        // The preserved next transition still works after the upgrade.
+        let advanced = state
+            .advance_lane_replacement(&row.replacement_id, "quiescing", 1, "2026-09-12T01:00:00Z")
+            .expect("advance after upgrade");
+        assert_eq!(advanced.phase, "checkpointed");
+        {
+            let conn = state.lock("test: m0006 bookkeeping").expect("lock");
+            let recorded: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                    params![M0006_ID],
+                    |row| row.get(0),
+                )
+                .expect("bookkeeping");
+            assert_eq!(recorded, 1, "m0006 recorded in schema_migrations");
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("user_version");
+            assert_eq!(version, 6);
+        }
+    }
+
+    #[test]
+    fn lane_checkpoint_commit_is_atomic_and_binds_outstanding_operations() {
+        // Issue #74 AC3/AC5/AC7 at the state layer: one transaction commits
+        // the checkpoint row, the record's quiescing -> checkpointed
+        // transition and its history; the snapshot binds the lane facts and
+        // the daemon-observed outstanding operations (the capture's own
+        // claim excluded); the brief is a byte-deterministic derivation of
+        // the committed row.
+        let path = temp_db("checkpoint-commit.db");
+        let at = "2026-09-12T00:00:00Z";
+        let state = State::open(&path, Retention::default()).expect("open");
+        let record = quiescing_replacement(&state, "lane-7", at);
+
+        // An unrelated in-flight claim is an outstanding operation.
+        state
+            .journal_intent(
+                "mutate.backup.create",
+                "backups:demo",
+                "ik_outstanding-000001",
+                &"b".repeat(16),
+                "backup.create",
+                None,
+                None,
+                &sample_request_line("ik_outstanding-000001"),
+            )
+            .expect("outstanding claim");
+
+        let observation = sample_checkpoint_observation();
+        let (checkpoint, updated, brief) = state
+            .commit_lane_checkpoint(
+                &record.replacement_id,
+                1,
+                &observation,
+                &observation,
+                "ik_capture-0000000001",
+                at,
+            )
+            .expect("commit");
+        assert_eq!(updated.phase, "checkpointed");
+        assert_eq!(updated.outcome, "pending");
+        assert_eq!(
+            checkpoint.checkpoint_id,
+            checkpoint_id_for(&record.replacement_id)
+        );
+        assert_eq!(
+            checkpoint.observation_digest,
+            checkpoint.reobservation_digest
+        );
+        assert_eq!(
+            checkpoint.digest,
+            sha256_hex(&canonical_bytes(
+                &Val::parse_json(&checkpoint.snapshot).expect("snapshot parses")
+            )),
+            "the digest binds the canonical snapshot bytes"
+        );
+        assert_eq!(
+            checkpoint.brief_digest,
+            sha256_hex(brief.as_bytes()),
+            "the brief digest binds the generated bytes"
+        );
+        assert_eq!(
+            lane_checkpoint_brief(&checkpoint).expect("regenerate"),
+            brief,
+            "brief regeneration is byte-for-byte deterministic"
+        );
+        assert!(brief.len() <= CHECKPOINT_BRIEF_MAX_BYTES);
+        assert!(brief.contains(&format!(
+            "record: lane_checkpoints/{}",
+            checkpoint.checkpoint_id
+        )));
+        assert!(
+            brief.contains("outstanding operations: 1"),
+            "the brief counts outstanding operations: {brief}"
+        );
+        assert!(
+            brief.contains("- focused: pending") && brief.contains("- full: passed"),
+            "every recorded gate is listed (never silently truncated): {brief}"
+        );
+
+        let snapshot = Val::parse_json(&checkpoint.snapshot).expect("snapshot");
+        assert_eq!(
+            snapshot.get("role").and_then(Val::as_str),
+            Some("implementer")
+        );
+        assert_eq!(
+            snapshot.get("task").and_then(Val::as_str),
+            Some("issue-74 checkpoint capture")
+        );
+        let expected_head = "a".repeat(40);
+        let expected_base = "b".repeat(40);
+        assert_eq!(
+            snapshot.get("head").and_then(Val::as_str),
+            Some(expected_head.as_str())
+        );
+        assert_eq!(
+            snapshot.get("base").and_then(Val::as_str),
+            Some(expected_base.as_str())
+        );
+        assert_eq!(
+            snapshot.get("state_epoch").and_then(Val::as_int),
+            Some(1),
+            "the snapshot binds the state epoch"
+        );
+        assert_eq!(snapshot.get("captured_at").and_then(Val::as_str), Some(at));
+        assert_eq!(
+            snapshot
+                .get("gates")
+                .and_then(Val::as_array)
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            snapshot
+                .get("children")
+                .and_then(Val::as_array)
+                .map(|items| items.len()),
+            Some(1)
+        );
+        let outstanding = snapshot
+            .get("outstanding_operations")
+            .expect("outstanding operations");
+        assert_eq!(outstanding.get("count").and_then(Val::as_int), Some(1));
+        let operations = outstanding
+            .get("operations")
+            .and_then(Val::as_array)
+            .expect("operations");
+        assert_eq!(operations.len(), 1);
+        assert_eq!(
+            operations[0].get("key").and_then(Val::as_str),
+            Some("ik_outstanding-000001"),
+            "the outstanding claim is recorded (the capture's own key excluded)"
+        );
+
+        // One replacement carries at most one checkpoint: a second capture
+        // refuses while touching nothing.
+        let second = state
+            .commit_lane_checkpoint(
+                &record.replacement_id,
+                1,
+                &observation,
+                &observation,
+                "ik_capture-0000000002",
+                at,
+            )
+            .expect_err("second capture refused");
+        assert_eq!(second.code, checkpoint_code::EXISTS);
+
+        // Read-back is the durable authority, and the record's history
+        // carries the quiescing -> checkpointed transition.
+        assert_eq!(
+            state
+                .lane_checkpoint_by_replacement(&record.replacement_id)
+                .expect("read")
+                .expect("row"),
+            checkpoint
+        );
+        let events = state
+            .lane_replacement_events(&record.replacement_id)
+            .expect("events");
+        let last = events.last().expect("last event");
+        assert_eq!(last.from_phase.as_deref(), Some("quiescing"));
+        assert_eq!(last.to_phase, "checkpointed");
+    }
+
+    #[test]
+    fn lane_checkpoint_observation_contract_refuses_incomplete_and_changed_views() {
+        // Issue #74 AC5: two observations must agree; every required field
+        // must be present and valid. Missing evidence is never silently
+        // omitted and an inconsistent view refuses the checkpoint.
+        let path = temp_db("checkpoint-contract.db");
+        let at = "2026-09-12T00:00:00Z";
+        let state = State::open(&path, Retention::default()).expect("open");
+        let record = quiescing_replacement(&state, "lane-7", at);
+        let observation = sample_checkpoint_observation();
+
+        let cases: Vec<(&str, &str, Val, Val)> = vec![
+            (
+                "changed view",
+                checkpoint_code::CHANGED,
+                observation.clone(),
+                edit_checkpoint_observation(
+                    observation.clone(),
+                    "head",
+                    Some(string(&"f".repeat(40))),
+                ),
+            ),
+            (
+                "missing dirty digest",
+                checkpoint_code::INCOMPLETE,
+                edit_checkpoint_observation_nested(observation.clone(), "dirty", "digest", None),
+                edit_checkpoint_observation_nested(observation.clone(), "dirty", "digest", None),
+            ),
+            (
+                "missing report block",
+                checkpoint_code::INCOMPLETE,
+                edit_checkpoint_observation(observation.clone(), "report", None),
+                edit_checkpoint_observation(observation.clone(), "report", None),
+            ),
+            (
+                "missing gate status",
+                checkpoint_code::INCOMPLETE,
+                edit_checkpoint_observation(
+                    observation.clone(),
+                    "gates",
+                    Some(Val::Arr(vec![object(vec![("name", string("focused"))])])),
+                ),
+                edit_checkpoint_observation(
+                    observation.clone(),
+                    "gates",
+                    Some(Val::Arr(vec![object(vec![("name", string("focused"))])])),
+                ),
+            ),
+            (
+                "unknown field",
+                checkpoint_code::INCOMPLETE,
+                edit_checkpoint_observation(
+                    observation.clone(),
+                    "transcript",
+                    Some(string("raw transcript is never accepted")),
+                ),
+                edit_checkpoint_observation(
+                    observation.clone(),
+                    "transcript",
+                    Some(string("raw transcript is never accepted")),
+                ),
+            ),
+            (
+                "role does not bind the record",
+                checkpoint_code::INCOMPLETE,
+                edit_checkpoint_observation(observation.clone(), "role", Some(string("reviewer"))),
+                edit_checkpoint_observation(observation.clone(), "role", Some(string("reviewer"))),
+            ),
+            (
+                "worktree does not bind the record",
+                checkpoint_code::INCOMPLETE,
+                edit_checkpoint_observation(
+                    observation.clone(),
+                    "worktree",
+                    Some(string("worktrees/issues/999")),
+                ),
+                edit_checkpoint_observation(
+                    observation.clone(),
+                    "worktree",
+                    Some(string("worktrees/issues/999")),
+                ),
+            ),
+            (
+                "invalid head identity",
+                checkpoint_code::INCOMPLETE,
+                edit_checkpoint_observation(
+                    observation.clone(),
+                    "head",
+                    Some(string("not-a-commit")),
+                ),
+                edit_checkpoint_observation(
+                    observation.clone(),
+                    "head",
+                    Some(string("not-a-commit")),
+                ),
+            ),
+        ];
+        for (index, (label, expected, obs, reobs)) in cases.into_iter().enumerate() {
+            let err = state
+                .commit_lane_checkpoint(
+                    &record.replacement_id,
+                    1,
+                    &obs,
+                    &reobs,
+                    &format!("ik_contract-{index:08}"),
+                    at,
+                )
+                .expect_err(label);
+            assert_eq!(err.code, expected, "{label}: {}", err.message);
+        }
+        // No refusal left partial state: no checkpoint, record untouched.
+        assert_eq!(
+            state
+                .lane_checkpoint_by_replacement(&record.replacement_id)
+                .expect("read"),
+            None
+        );
+        let untouched = state
+            .lane_replacement_by_id(&record.replacement_id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(untouched.phase, "quiescing");
+        assert_eq!(untouched.outcome, "pending");
+
+        // The valid observation still commits afterwards.
+        state
+            .commit_lane_checkpoint(
+                &record.replacement_id,
+                1,
+                &observation,
+                &observation,
+                "ik_contract-valid-0001",
+                at,
+            )
+            .expect("valid capture");
+    }
+
+    #[test]
+    fn lane_checkpoint_acknowledgment_and_child_observation_gate_active_execution() {
+        // Issue #74 AC1/AC2: active external harness execution requires a
+        // supported quiescence acknowledgment AND a process/child
+        // observation; active or ambiguous side-effecting children HOLD
+        // completion (nothing is signalled or killed to obtain a snapshot).
+        let path = temp_db("checkpoint-ack.db");
+        let at = "2026-09-12T00:00:00Z";
+        let state = State::open(&path, Retention::default()).expect("open");
+        let record = quiescing_replacement(&state, "lane-7", at);
+        let base = sample_checkpoint_observation();
+
+        let active_no_ack = edit_checkpoint_observation(
+            base.clone(),
+            "execution",
+            Some(object(vec![("active", bool_(true)), ("ack", null())])),
+        );
+        let unsupported_ack = edit_checkpoint_observation(
+            base.clone(),
+            "execution",
+            Some(object(vec![
+                ("active", bool_(true)),
+                (
+                    "ack",
+                    object(vec![
+                        ("kind", string("pane-text")),
+                        ("session", string("sess-0001")),
+                        ("at", string(at)),
+                    ]),
+                ),
+            ])),
+        );
+        let ack_while_inactive = edit_checkpoint_observation(
+            base.clone(),
+            "execution",
+            Some(object(vec![
+                ("active", bool_(false)),
+                (
+                    "ack",
+                    object(vec![
+                        ("kind", string("session-quiesced")),
+                        ("session", string("sess-0001")),
+                        ("at", string(at)),
+                    ]),
+                ),
+            ])),
+        );
+        let active_child = edit_checkpoint_observation(
+            base.clone(),
+            "children",
+            Some(Val::Arr(vec![object(vec![
+                ("command", string("git push origin issue-74-checkpoint")),
+                ("state", string("active")),
+            ])])),
+        );
+        let ambiguous_child = edit_checkpoint_observation(
+            base.clone(),
+            "children",
+            Some(Val::Arr(vec![object(vec![
+                ("command", string("cargo build --release")),
+                ("state", string("ambiguous")),
+            ])])),
+        );
+
+        for (index, (label, expected, obs)) in [
+            (
+                "active execution without acknowledgment",
+                checkpoint_code::ACK,
+                active_no_ack,
+            ),
+            (
+                "unsupported acknowledgment kind",
+                checkpoint_code::ACK,
+                unsupported_ack,
+            ),
+            (
+                "acknowledgment while execution is inactive",
+                checkpoint_code::ACK,
+                ack_while_inactive,
+            ),
+            (
+                "active side-effecting child",
+                checkpoint_code::HELD,
+                active_child,
+            ),
+            (
+                "ambiguous side-effecting child",
+                checkpoint_code::HELD,
+                ambiguous_child,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let err = state
+                .commit_lane_checkpoint(
+                    &record.replacement_id,
+                    1,
+                    &obs,
+                    &obs,
+                    &format!("ik_gate-{index:08}"),
+                    at,
+                )
+                .expect_err(label);
+            assert_eq!(err.code, expected, "{label}: {}", err.message);
+        }
+        assert_eq!(
+            state
+                .lane_checkpoint_by_replacement(&record.replacement_id)
+                .expect("read"),
+            None,
+            "held/refused captures commit nothing"
+        );
+
+        // A supported acknowledgment with an observed (exited) child commits.
+        let supported = edit_checkpoint_observation(
+            base,
+            "execution",
+            Some(object(vec![
+                ("active", bool_(true)),
+                (
+                    "ack",
+                    object(vec![
+                        ("kind", string("session-quiesced")),
+                        ("session", string("sess-0001")),
+                        ("at", string(at)),
+                    ]),
+                ),
+            ])),
+        );
+        let (checkpoint, _, _) = state
+            .commit_lane_checkpoint(
+                &record.replacement_id,
+                1,
+                &supported,
+                &supported,
+                "ik_gate-valid-0000001",
+                at,
+            )
+            .expect("supported acknowledgment commits");
+        let snapshot = Val::parse_json(&checkpoint.snapshot).expect("snapshot");
+        assert_eq!(
+            snapshot
+                .get("execution")
+                .and_then(|value| value.get("active"))
+                .and_then(Val::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn lane_checkpoint_oversize_required_data_holds_typed() {
+        // Issue #74 AC6: the generated brief enforces a byte bound; oversize
+        // REQUIRED data (here: the maximal recorded child list plus maximal
+        // task text) yields a typed hold — required data is never truncated.
+        let path = temp_db("checkpoint-oversize.db");
+        let at = "2026-09-12T00:00:00Z";
+        let state = State::open(&path, Retention::default()).expect("open");
+        let record = quiescing_replacement(&state, "lane-7", at);
+        let base = sample_checkpoint_observation();
+
+        // Fit within every per-field bound but exceed the brief byte bound.
+        let long_children: Vec<Val> = (0..CHECKPOINT_CHILDREN_MAX)
+            .map(|_| {
+                object(vec![
+                    ("command", string(&"x".repeat(160))),
+                    ("state", string("exited")),
+                ])
+            })
+            .collect();
+        let oversize = edit_checkpoint_observation(
+            edit_checkpoint_observation(base.clone(), "task", Some(string(&"t".repeat(200)))),
+            "children",
+            Some(Val::Arr(long_children)),
+        );
+        let err = state
+            .commit_lane_checkpoint(
+                &record.replacement_id,
+                1,
+                &oversize,
+                &oversize,
+                "ik_oversize-00000001",
+                at,
+            )
+            .expect_err("oversize holds");
+        assert_eq!(err.code, checkpoint_code::OVERSIZE, "{}", err.message);
+        assert_eq!(
+            state
+                .lane_checkpoint_by_replacement(&record.replacement_id)
+                .expect("read"),
+            None
+        );
+
+        // A compliant observation still commits (the hold is not durable).
+        state
+            .commit_lane_checkpoint(
+                &record.replacement_id,
+                1,
+                &base,
+                &base,
+                "ik_oversize-00000002",
+                at,
+            )
+            .expect("reduced capture commits");
+    }
+
+    #[test]
+    fn lane_replacement_requests_are_fenced_inside_the_quiescing_window() {
+        // Issue #74 AC1: quiescing fences new daemon-mediated actions for
+        // the source generation — no second replacement slot for a lane
+        // whose handoff is inside the quiescing window. The fence lifts
+        // when the handoff resolves or is cancelled.
+        let path = temp_db("checkpoint-fence.db");
+        let at = "2026-09-12T00:00:00Z";
+        let state = State::open(&path, Retention::default()).expect("open");
+        let record = quiescing_replacement(&state, "lane-7", at);
+
+        let fenced = state
+            .request_lane_replacement(
+                "lane-7",
+                2,
+                "sess-0002",
+                "proc-0002",
+                "implementer",
+                "worktrees/issues/74",
+                "second generation while mid-handoff",
+                at,
+            )
+            .expect_err("new generation fenced");
+        assert_eq!(fenced.code, replacement_code::FENCED, "{}", fenced.message);
+        assert!(
+            fenced.message.contains(&record.replacement_id),
+            "the fence names the holding record: {}",
+            fenced.message
+        );
+        // The same lane generation keeps its own (more specific) refusal.
+        let duplicate = state
+            .request_lane_replacement(
+                "lane-7",
+                1,
+                "sess-0002",
+                "proc-0002",
+                "implementer",
+                "worktrees/issues/74",
+                "duplicate",
+                at,
+            )
+            .expect_err("duplicate refused");
+        assert_eq!(duplicate.code, replacement_code::EXISTS);
+        // A different lane is not fenced.
+        state
+            .request_lane_replacement(
+                "lane-8",
+                1,
+                "sess-0002",
+                "proc-0002",
+                "implementer",
+                "worktrees/issues/74",
+                "different lane",
+                at,
+            )
+            .expect("other lanes are unaffected");
+
+        // The window stays up while the record is checkpointed (still
+        // inside the handoff)...
+        let observation = sample_checkpoint_observation();
+        state
+            .commit_lane_checkpoint(
+                &record.replacement_id,
+                1,
+                &observation,
+                &observation,
+                "ik_fence-0000000001",
+                at,
+            )
+            .expect("capture");
+        let still_fenced = state
+            .request_lane_replacement(
+                "lane-7",
+                2,
+                "sess-0002",
+                "proc-0002",
+                "implementer",
+                "worktrees/issues/74",
+                "still mid-handoff",
+                at,
+            )
+            .expect_err("checkpointed is still inside the window");
+        assert_eq!(still_fenced.code, replacement_code::FENCED);
+
+        // ...and lifts when the handoff is cancelled.
+        state
+            .cancel_lane_replacement(&record.replacement_id, "operator abort", at)
+            .expect("cancel");
+        state
+            .request_lane_replacement(
+                "lane-7",
+                2,
+                "sess-0002",
+                "proc-0002",
+                "implementer",
+                "worktrees/issues/74",
+                "successor request after cancellation",
+                at,
+            )
+            .expect("the fence lifted");
+    }
+
+    #[test]
+    fn lane_checkpoint_references_bind_existing_orchestrator_lanes() {
+        // Issue #74 AC4: an orchestrator checkpoint references EXISTING
+        // worker/reviewer identities and pending completion events without
+        // altering those lanes; bogus or role-mismatched references refuse.
+        let path = temp_db("checkpoint-orchestrator.db");
+        let at = "2026-09-12T00:00:00Z";
+        let state = State::open(&path, Retention::default()).expect("open");
+        let orchestrator = state
+            .request_lane_replacement(
+                "lane-orch",
+                1,
+                "sess-0001",
+                "proc-0001",
+                "orchestrator",
+                "worktrees/issues/74",
+                "orchestrator handoff",
+                at,
+            )
+            .expect("orchestrator request");
+        state
+            .advance_lane_replacement(&orchestrator.replacement_id, "requested", 1, at)
+            .expect("advance");
+        let worker = quiescing_replacement(&state, "lane-8", at);
+        let reviewer = state
+            .request_lane_replacement(
+                "lane-9",
+                1,
+                "sess-0001",
+                "proc-0001",
+                "reviewer",
+                "worktrees/issues/74",
+                "reviewer lane",
+                at,
+            )
+            .expect("reviewer request");
+
+        let worker_before = state
+            .lane_replacement_by_id(&worker.replacement_id)
+            .expect("read")
+            .expect("row");
+        let worker_events_before = state
+            .lane_replacement_events(&worker.replacement_id)
+            .expect("history");
+        let reviewer_before = state
+            .lane_replacement_by_id(&reviewer.replacement_id)
+            .expect("read")
+            .expect("row");
+
+        let mut observation = sample_checkpoint_observation();
+        if let Val::Obj(map) = &mut observation {
+            map.insert("role".to_string(), string("orchestrator"));
+            map.insert(
+                "orchestration".to_string(),
+                object(vec![
+                    ("workers", Val::Arr(vec![string(&worker.replacement_id)])),
+                    (
+                        "reviewers",
+                        Val::Arr(vec![string(&reviewer.replacement_id)]),
+                    ),
+                    (
+                        "pending_events",
+                        Val::Arr(vec![string("worker-finished:lane-8")]),
+                    ),
+                ]),
+            );
+        }
+
+        let (checkpoint, _, _) = state
+            .commit_lane_checkpoint(
+                &orchestrator.replacement_id,
+                1,
+                &observation,
+                &observation,
+                "ik_orch-0000000001",
+                at,
+            )
+            .expect("orchestrator capture");
+        let snapshot = Val::parse_json(&checkpoint.snapshot).expect("snapshot");
+        let orchestration = snapshot.get("orchestration").expect("orchestration");
+        assert_eq!(
+            orchestration
+                .get("workers")
+                .and_then(Val::as_array)
+                .map(|items| items.len()),
+            Some(1)
+        );
+        assert_eq!(
+            orchestration
+                .get("reviewers")
+                .and_then(Val::as_array)
+                .map(|items| items.len()),
+            Some(1)
+        );
+        assert_eq!(
+            orchestration
+                .get("pending_events")
+                .and_then(Val::as_array)
+                .map(|items| items.len()),
+            Some(1)
+        );
+
+        // Referencing lanes never alters them: rows and history identical.
+        assert_eq!(
+            state
+                .lane_replacement_by_id(&worker.replacement_id)
+                .expect("read")
+                .expect("row"),
+            worker_before
+        );
+        assert_eq!(
+            state
+                .lane_replacement_events(&worker.replacement_id)
+                .expect("history"),
+            worker_events_before
+        );
+        assert_eq!(
+            state
+                .lane_replacement_by_id(&reviewer.replacement_id)
+                .expect("read")
+                .expect("row"),
+            reviewer_before
+        );
+
+        // A second orchestrator lane for the refusal cases.
+        let second = state
+            .request_lane_replacement(
+                "lane-orch-2",
+                1,
+                "sess-0001",
+                "proc-0001",
+                "orchestrator",
+                "worktrees/issues/74",
+                "second orchestrator",
+                at,
+            )
+            .expect("second orchestrator");
+        state
+            .advance_lane_replacement(&second.replacement_id, "requested", 1, at)
+            .expect("advance");
+
+        let with_orchestration = |orchestration: Val| -> Val {
+            let mut observation = sample_checkpoint_observation();
+            if let Val::Obj(map) = &mut observation {
+                map.insert("role".to_string(), string("orchestrator"));
+                map.insert("orchestration".to_string(), orchestration);
+            }
+            observation
+        };
+        let cases: Vec<(&str, Val)> = vec![
+            (
+                "worker reference does not exist",
+                with_orchestration(object(vec![
+                    (
+                        "workers",
+                        Val::Arr(vec![string(&replacement_id_for("lane-404", 1))]),
+                    ),
+                    ("reviewers", Val::Arr(vec![])),
+                    ("pending_events", Val::Arr(vec![])),
+                ])),
+            ),
+            (
+                "reviewer reference names an implementer record",
+                with_orchestration(object(vec![
+                    ("workers", Val::Arr(vec![])),
+                    ("reviewers", Val::Arr(vec![string(&worker.replacement_id)])),
+                    ("pending_events", Val::Arr(vec![])),
+                ])),
+            ),
+            (
+                "orchestrator checkpoint without references",
+                edit_checkpoint_observation(
+                    edit_checkpoint_observation(
+                        sample_checkpoint_observation(),
+                        "role",
+                        Some(string("orchestrator")),
+                    ),
+                    "orchestration",
+                    None,
+                ),
+            ),
+        ];
+        for (index, (label, observation)) in cases.into_iter().enumerate() {
+            let err = state
+                .commit_lane_checkpoint(
+                    &second.replacement_id,
+                    1,
+                    &observation,
+                    &observation,
+                    &format!("ik_orch-refs-{index:04}"),
+                    at,
+                )
+                .expect_err(label);
+            assert_eq!(
+                err.code,
+                checkpoint_code::REFERENCES,
+                "{label}: {}",
+                err.message
+            );
+        }
+        assert_eq!(
+            state
+                .lane_checkpoint_by_replacement(&second.replacement_id)
+                .expect("read"),
+            None
+        );
+
+        // A non-orchestrator (implementer) checkpoint carrying orchestration
+        // references refuses: references belong to orchestrator lanes only.
+        let plain = quiescing_replacement(&state, "lane-10", at);
+        let with_references = edit_checkpoint_observation(
+            sample_checkpoint_observation(),
+            "orchestration",
+            Some(object(vec![
+                ("workers", Val::Arr(vec![])),
+                ("reviewers", Val::Arr(vec![])),
+                ("pending_events", Val::Arr(vec![])),
+            ])),
+        );
+        let err = state
+            .commit_lane_checkpoint(
+                &plain.replacement_id,
+                1,
+                &with_references,
+                &with_references,
+                "ik_orch-refs-9001",
+                at,
+            )
+            .expect_err("non-orchestrator references refuse");
+        assert_eq!(err.code, checkpoint_code::REFERENCES, "{}", err.message);
+        assert_eq!(
+            state
+                .lane_checkpoint_by_replacement(&plain.replacement_id)
+                .expect("read"),
+            None
         );
     }
 }
