@@ -1110,8 +1110,10 @@ pub const SUPPORTED_FAMILIES: [Family; 17] = [
 /// Closed RPC method set (spec-daemon.md; mirrored by the fixture probe).
 /// The five `schedules.*` lifecycle methods beyond `schedules.list` are
 /// added by issue #9 (recurring non-destructive schedules: create/pause/
-/// resume/delete + one fresh coalesced evaluation per tick).
-pub const RPC_METHODS: [&str; 18] = [
+/// resume/delete + one fresh coalesced evaluation per tick). The five
+/// `lane.replacement.*` methods are added by issue #73 (request-only lane
+/// replacement records: request/advance/hold/cancel + one status read).
+pub const RPC_METHODS: [&str; 23] = [
     "capabilities",
     "doctor",
     "status",
@@ -1125,6 +1127,11 @@ pub const RPC_METHODS: [&str; 18] = [
     "schedules.resume",
     "schedules.delete",
     "schedules.evaluate",
+    "lane.replacement.request",
+    "lane.replacement.advance",
+    "lane.replacement.hold",
+    "lane.replacement.cancel",
+    "lane.replacement.status",
     "state.epoch",
     "backup.create",
     "restore.begin",

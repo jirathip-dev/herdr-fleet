@@ -100,6 +100,31 @@ to journal fails closed — the mutation does not start.
   genesis); there is no purge/truncate surface anywhere
   (static probe in tests/no_network_surface.rs).
 
+## Handoff additions (issue #73)
+
+- **Migration `m0005_lane_replacements_v5`** (0 → 5 chain) adds the lane
+  replacement record tables: `lane_replacements` (one record per logical
+  lane generation, `UNIQUE (lane_id, generation)`, with the typed phases
+  `requested` → `quiescing` → `checkpointed` → `retired` → `starting` →
+  `adopting` → `adopted`, explicit `pending`/`held`/`ambiguous`/`cancelled`
+  outcomes, and the bound source session/process/role/worktree/reason
+  identity) and `lane_replacement_events` (the transactional transition
+  history committed with each record write). `SCHEMA_VERSION` is 5. The
+  migration is purely additive — no existing table or row is touched, so
+  stored grants are never reinterpreted by the upgrade.
+- **Request-only semantics**: the `lane.replacement.*` RPCs (see
+  spec-daemon.md) write durable records and journal their intents through
+  the same claim machinery as every daemon mutation; nothing on the surface
+  spawns, kills, or touches Git, and no grant is required, issued, or
+  consumed. Transitions are transactional compare-and-set (stale
+  generation, invalid order and replayed expectations cannot advance); a
+  `held` record refuses advancement durably across restarts; restart
+  reconciliation marks an interrupted transition `ambiguous` (external
+  reconciliation required); and cancellation before retirement invalidates
+  a pending replacement while leaving the original lane generation
+  untouched. An agent may request its own retirement but can never
+  authorize its own replacement effects.
+
 ## Fixture map
 
 Accept: `migration.valid.json` (0→1, checksummed), `audit.valid.jsonl`

@@ -41,8 +41,8 @@ $ cargo build --release --locked
 $ ./target/release/herdr-fleet --version        # exit 0
 herdr-fleet 0.1.0
 ...
-state schema version: 4
-migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4
+state schema version: 5
+migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4, m0005_lane_replacements_v5
 document schema families: hf-config/v1, hf-policy/v1, hf-output/v1, hf-error/v1, ...
 ```
 

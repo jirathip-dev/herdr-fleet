@@ -77,7 +77,7 @@ release process activates (docs/RELEASING.md), then semver applies.
   per-user launchd/systemd environment checks and unit-plan rendering —
   plans only, never installing/starting/stopping/querying the host service
   manager.
-- State layer: SQLite migrations m0001-m0004, audit/event JSONL journals
+- State layer: SQLite migrations m0001-m0005, audit/event JSONL journals
   with mirror rebuild, backup/restore hooks, per-user path resolution.
 - Socket RPC: `hf-rpc-request/v1`/`hf-rpc-response/v1` closed method set,
   typed refusal codes, `events.subscribe` stream.
@@ -158,6 +158,27 @@ release process activates (docs/RELEASING.md), then semver applies.
 - The doctor minimum remains 0.8.2 because the required mixed-version matrix
   is red; documentation distinguishes that CLI floor from server protocol
   compatibility rather than claiming or working around interoperability.
+
+### Added (issue #73 — Lane replacement records)
+
+- Request-only lane replacement records: one durable record per logical
+  lane generation (`lane.replacement.request|advance|hold|cancel|status`
+  RPCs, m0005/schema v5) with explicit phases (requested → quiescing →
+  checkpointed → retired → starting → adopting → adopted) and explicit
+  `held` (parked: advancement refused) / `ambiguous` (interrupted
+  transition: external reconciliation required) / `cancelled` (invalidated
+  before retirement) outcomes.
+- Records bind source session/process identity, role, worktree and reason;
+  missing/invalid identities refuse instead of inferring an empty lane.
+  Transitions are transactional compare-and-set (stale generation, invalid
+  order and replayed expectations cannot advance) and the transition
+  history is committed atomically with each record write and preserved
+  across daemon restarts.
+- The surface has no spawn/kill/Git effect and no authority uplift (no
+  grants are required, issued, or consumed); an agent may request its own
+  retirement but can never authorize its own replacement effects.
+  Retirement execution, automatic triggers and successor execution remain
+  out of scope.
 
 ### Changed
 
