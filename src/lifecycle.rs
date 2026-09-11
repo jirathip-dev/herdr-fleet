@@ -1210,4 +1210,32 @@ mod tests {
         assert!(!dest.exists(), "partial archive removed on failure");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn archive_tree_refuses_an_existing_destination_without_touching_it() {
+        // Deterministic boundary for the destination-exists refusal (issue
+        // #99): the daemon names archive destinations with second-granular
+        // wall-clock time, so a repeat archive can collide with an existing
+        // destination. Pre-creating `dest` exercises the refusal here
+        // without any clock dependence.
+        let dir = sandbox_dir("dest-exists");
+        let src = dir.join("lane");
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::write(src.join("real.txt"), "real").expect("real");
+        let dest = dir.join("archive-out");
+        std::fs::create_dir_all(dest.join("nested")).expect("dest");
+        std::fs::write(dest.join("nested/pre-existing.txt"), "untouched").expect("pre-existing");
+
+        let err = archive_tree(&src, &dest).expect_err("existing destination must refuse");
+        assert_eq!(err.code, archive_code::FAILED);
+        // The pre-existing destination content is untouched: nothing is
+        // copied in and no manifest is written over it.
+        assert_eq!(
+            std::fs::read_to_string(dest.join("nested/pre-existing.txt")).expect("read"),
+            "untouched"
+        );
+        assert!(!dest.join("real.txt").exists());
+        assert!(!dest.join("manifest.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
