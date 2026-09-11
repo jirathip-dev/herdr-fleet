@@ -174,6 +174,51 @@ to journal fails closed — the mutation does not start.
   of blindly parking the record — the record's transition commits
   atomically with the row, so the record is never in doubt.
 
+## Retirement additions (issue #75)
+
+- **The binding (the plan/grant unit of this slice)**: a retirement
+  request carries `binding` = {lane generation, source session identity,
+  source process identity, committed checkpoint digest}. `begin_lane_retirement`
+  validates it against the durable record and the checkpoint that completes
+  it in one read BEFORE any effect: a changed generation, session, process
+  or checkpoint digest refuses with `refusal.retirement.binding` (and
+  nothing is signalled), a `held` record refuses as the paused state
+  (`refusal.replacement.held`), a cancelled/ambiguous record refuses
+  (`refusal.replacement.invalidated` / `refusal.replacement.ambiguous`),
+  and a record that has not reached the `checkpointed` boundary refuses
+  with `refusal.replacement.order`. The request is journaled as a claim
+  like every other daemon mutation, so the exact binding (including the
+  checkpoint digest) is durable in the claim's request line and the audit
+  journal.
+- **Immediate pre-stop quiescence recheck**: the same request carries
+  `recheck` = {observed_at, session, process, children[] (command + state
+  from the closed `exited`/`active`/`ambiguous` set), active}. Every child
+  must be observed `exited` and external execution must not be active
+  (`refusal.retirement.held` otherwise), a process identity that is missing
+  or not a process identity is an unknown identity and holds, and an
+  observed identity that differs from the record refuses as a binding
+  mismatch. A hold writes nothing: nothing is signalled, killed, or cleaned
+  up to obtain quiescence and no process group is ever addressed.
+- **Atomic retirement commit**: `commit_lane_retirement` writes the
+  record's `checkpointed` → `retired` transition and its transition-history
+  row in ONE transaction, fenced on the exact generation/phase/outcome and
+  on the committed checkpoint digest (a missed fence is classified typed
+  and changes nothing). The bounded evidence summary is recorded as the
+  transition reason (never truncated). No new table is added: the phase
+  transition is the commit marker.
+- **Held, not escalated**: a graceful stop whose delivery cannot be
+  confirmed, a confirmation that cannot prove absence, or a retirement
+  that cannot commit after the stop parks the record `ambiguous` (external
+  reconciliation required) with the no-repeat decision recorded; there is
+  no SIGKILL, no broad pattern, no process-group signal and no authority
+  escalation anywhere on the path.
+- **Restart reconciliation**: an interrupted `lane.retire` claim is
+  reconciled against the backend confirmation read-back — exact absence
+  (process absent AND registration released for the bound session and
+  generation) completes the retirement, and every other outcome parks the
+  record `ambiguous`. The stop is issued at most once: reconciliation never
+  repeats a signal, and never against a reused identity.
+
 ## Fixture map
 
 Accept: `migration.valid.json` (0→1, checksummed), `audit.valid.jsonl`

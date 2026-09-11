@@ -553,6 +553,7 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "lane.replacement.status" => method_lane_replacement_status(shared, request),
         "lane.checkpoint.create" => method_lane_checkpoint_create(shared, request),
         "lane.checkpoint.status" => method_lane_checkpoint_status(shared, request),
+        "lane.retire" => method_lane_retire(shared, request),
         "grants.list" => method_grants_list(shared, request),
         "journal.tail" => method_journal_tail(shared, request),
         "grants.revoke" => method_grants_revoke(shared, request),
@@ -2948,6 +2949,439 @@ fn method_lane_checkpoint_status(shared: &Arc<Shared>, request: &Request) -> Str
     ok_response(&request.id, object(vec![("checkpoint", checkpoint_val)]))
 }
 
+/// `lane.retire`: gracefully retire ONE checkpointed source session (issue
+/// #75). The request binds the record's lane generation, source
+/// session/process identity and the committed checkpoint digest (the
+/// binding document); a changed identity, checkpoint or paused state refuses
+/// BEFORE any effect (and before the claim). The retirement then re-validates
+/// the immediate pre-stop quiescence recheck (unknown child activity or an
+/// unknown process identity HOLDS), issues exactly ONE bounded graceful stop
+/// through the workspace (Herdr) session adapter row, and confirms the
+/// retirement from backend evidence — the process is absent AND the
+/// ownership/registration is released for the bound session and generation —
+/// never from pane text or a label. This path has no SIGKILL, no broad
+/// pattern, no process-group signal and no authority escalation: a stop or a
+/// confirmation that cannot prove the outcome holds and parks the record
+/// `ambiguous` for external reconciliation. Child lanes are never addressed:
+/// only the record's own bound session identity is.
+fn method_lane_retire(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "lane.retire requires params: replacement_id, binding, recheck, harness",
+        );
+    };
+    let replacement_id = match required_str(Some(params), "replacement_id") {
+        Some(text) if crate::formats::is_replacement_id(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.retire requires params.replacement_id (rp_ id)",
+            );
+        }
+    };
+    if !matches!(params.get("binding"), Some(Val::Obj(_))) {
+        return err_response(
+            &request.id,
+            crate::state::retirement_code::BINDING,
+            "lane.retire requires params.binding (object: generation, session, process, \
+             checkpoint_digest)",
+        );
+    }
+    if !matches!(params.get("recheck"), Some(Val::Obj(_))) {
+        return err_response(
+            &request.id,
+            crate::state::retirement_code::HELD,
+            "lane.retire requires params.recheck (the immediate pre-stop quiescence recheck)",
+        );
+    }
+    let harness = match params.get("harness") {
+        Some(harness @ Val::Obj(_)) => harness,
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.retire requires params.harness (object: key, kind[, executable, \
+                 capabilities])",
+            );
+        }
+    };
+    let profile = match retirement_profile(harness) {
+        Ok(profile) => profile,
+        Err((code, message)) => return err_response(&request.id, code, message),
+    };
+    // The retirement's only wired adapter path is the workspace/Herdr session
+    // rows (the bounded stop and the confirmation read). A profile that does
+    // not declare both required capabilities is an unsupported adapter and
+    // refuses BEFORE the claim — no state changes and nothing is signalled.
+    for capability in [
+        crate::adapters::Op::Interrupt.capability(),
+        crate::adapters::Op::Observe.capability(),
+    ] {
+        if !profile.supports(capability) {
+            return err_response(
+                &request.id,
+                crate::adapters::CODE_UNKNOWN_CAPABILITY,
+                format!(
+                    "harness profile {:?} does not declare the {capability:?} capability that \
+                     the retirement path requires; unsupported adapters are refused",
+                    profile.key
+                ),
+            );
+        }
+    }
+    let target = format!("lane-retire:{replacement_id}");
+    match journal_mutation(shared, request, "mutate.lane.retire", &target) {
+        Intent::Claimed { key } => {
+            crash_point("lane-retire.after-intent");
+            let bound = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                state
+                    .begin_lane_retirement(params)
+                    .map_err(|err| (err.code, err.message))
+            };
+            let plan = match bound {
+                Ok(plan) => plan,
+                Err((code, message)) => {
+                    return finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.retire",
+                        false,
+                        null(),
+                        Some((code, message)),
+                    );
+                }
+            };
+            let target = crate::adapters::RetirementTarget {
+                session: plan.record.source_session.clone(),
+                process: plan.record.source_process.clone(),
+            };
+            let env = crate::config::adapter_environment();
+            // The ONE bounded graceful stop request this slice ever issues.
+            let stop = crate::adapters::retirement_stop(
+                &profile,
+                &target,
+                &env,
+                crate::adapters::ADAPTER_TIMEOUT,
+            );
+            crash_point("lane-retire.after-stop");
+            if stop.status != "succeeded" {
+                let detail = stop
+                    .message
+                    .clone()
+                    .or_else(|| stop.detail.clone())
+                    .unwrap_or_else(|| "no diagnostic".to_string());
+                if stop.code == Some(crate::adapters::CODE_UNAVAILABLE) {
+                    // The stop row never ran: nothing was signalled and the
+                    // record is untouched (a retry with a fresh key is safe).
+                    return finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.retire",
+                        false,
+                        null(),
+                        Some((crate::adapters::CODE_UNAVAILABLE, detail)),
+                    );
+                }
+                return park_retirement(
+                    shared,
+                    request,
+                    &key,
+                    params,
+                    &format!(
+                        "the bounded graceful stop of session {:?} did not confirm ({}); the \
+                         delivery is unknown and NO further signal is attempted",
+                        target.session, detail
+                    ),
+                    crate::state::retirement_code::HELD,
+                    format!(
+                        "the graceful stop of session {:?} did not confirm ({}); the retirement \
+                         holds (no SIGKILL, no broad pattern, no process-group signal) and \
+                         external reconciliation is required",
+                        target.session, detail
+                    ),
+                );
+            }
+            let evidence = crate::adapters::retirement_evidence(
+                &profile,
+                &target,
+                plan.record.generation,
+                &env,
+                crate::adapters::ADAPTER_TIMEOUT,
+            );
+            match evidence {
+                Ok(crate::adapters::RetirementEvidence::Retired) => {
+                    let reason = format!(
+                        "retired after one bounded graceful stop: backend process absent and \
+                         registration released for session {:?} generation {} (checkpoint {} \
+                         digest {}; recheck observed {})",
+                        target.session,
+                        plan.record.generation,
+                        plan.checkpoint.checkpoint_id,
+                        &plan.checkpoint.digest[..16],
+                        plan.recheck_observed_at
+                    );
+                    let committed = {
+                        let state = match shared.lock_state() {
+                            Ok(state) => state,
+                            Err(message) => {
+                                return err_response(&request.id, "state.unavailable", message);
+                            }
+                        };
+                        state
+                            .commit_lane_retirement(
+                                &plan.record.replacement_id,
+                                plan.record.generation,
+                                &plan.checkpoint.digest,
+                                &reason,
+                                &time::rfc3339_now(),
+                            )
+                            .map_err(|err| (err.code, err.message))
+                    };
+                    let row = match committed {
+                        Ok(row) => row,
+                        Err((code, message)) => {
+                            // The stop happened but the transition could not
+                            // commit: the record is parked for external
+                            // reconciliation and NO signal is repeated.
+                            return park_retirement(
+                                shared,
+                                request,
+                                &key,
+                                params,
+                                &format!(
+                                    "the retirement transition could not commit after the \
+                                     graceful stop ({code}: {message}); no signal is repeated"
+                                ),
+                                crate::state::retirement_code::HELD,
+                                format!(
+                                    "the graceful stop of session {:?} was issued but the \
+                                     retirement could not commit ({code}: {message}); external \
+                                     reconciliation is required",
+                                    target.session
+                                ),
+                            );
+                        }
+                    };
+                    let retirement = object(vec![
+                        ("replacement", crate::state::lane_replacement_val(&row)),
+                        ("checkpoint_id", string(&plan.checkpoint.checkpoint_id)),
+                        ("checkpoint_digest", string(&plan.checkpoint.digest)),
+                        ("session", string(&plan.record.source_session)),
+                        ("process", string(&plan.record.source_process)),
+                        (
+                            "stop",
+                            object(vec![
+                                ("status", string(stop.status)),
+                                ("bounded", bool_(true)),
+                                (
+                                    "elapsed_ms",
+                                    integer(stop.elapsed_ms.min(i64::MAX as u64) as i64),
+                                ),
+                            ]),
+                        ),
+                        (
+                            "evidence",
+                            object(vec![
+                                ("process", string("absent")),
+                                ("registration", string("released")),
+                                ("generation", integer(plan.record.generation)),
+                                ("observed_at", string(&time::rfc3339_now())),
+                            ]),
+                        ),
+                    ]);
+                    finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.retire",
+                        true,
+                        object(vec![("retirement", retirement)]),
+                        None,
+                    )
+                }
+                Ok(crate::adapters::RetirementEvidence::Held { detail }) => park_retirement(
+                    shared,
+                    request,
+                    &key,
+                    params,
+                    &format!(
+                        "the post-stop confirmation could not prove absence ({}); no signal is \
+                         repeated",
+                        detail
+                    ),
+                    crate::state::retirement_code::HELD,
+                    format!(
+                        "the retirement of session {:?} could not be confirmed ({}); nothing \
+                         further is signalled and external reconciliation is required",
+                        target.session, detail
+                    ),
+                ),
+                Ok(crate::adapters::RetirementEvidence::Reused { detail }) => park_retirement(
+                    shared,
+                    request,
+                    &key,
+                    params,
+                    &format!(
+                        "the post-stop confirmation observed a reused identity ({}); no signal \
+                         is repeated against it",
+                        detail
+                    ),
+                    crate::state::retirement_code::REUSED,
+                    format!(
+                        "the retirement of session {:?} fails closed: backend evidence shows a \
+                         reused identity ({}); no signal is repeated and external reconciliation \
+                         is required",
+                        target.session, detail
+                    ),
+                ),
+                Err(err) => park_retirement(
+                    shared,
+                    request,
+                    &key,
+                    params,
+                    &format!(
+                        "the post-stop confirmation read-back failed ({}: {}); no signal is \
+                         repeated",
+                        err.code, err.message
+                    ),
+                    crate::state::retirement_code::HELD,
+                    format!(
+                        "the retirement of session {:?} could not be confirmed ({}: {}); nothing \
+                         further is signalled and external reconciliation is required",
+                        target.session, err.code, err.message
+                    ),
+                ),
+            }
+        }
+        Intent::Replay { response } => replay(shared, &response),
+        Intent::Refused { code, message } => err_response(&request.id, code, message),
+    }
+}
+
+/// Park a record `ambiguous` after a retirement whose stop delivery or
+/// confirmation is in doubt, then answer the typed refusal. The park is the
+/// explicit "external reconciliation required" outcome; no further signal is
+/// ever attempted (never against a reused identity).
+fn park_retirement(
+    shared: &Arc<Shared>,
+    request: &Request,
+    key: &str,
+    params: &Val,
+    park_reason: &str,
+    code: &'static str,
+    message: String,
+) -> String {
+    match shared.lock_state() {
+        Ok(state) => {
+            if let Err(err) =
+                state.mark_replacement_ambiguous(params, park_reason, &time::rfc3339_now())
+            {
+                shared.log.write(
+                    "error",
+                    "lane.retire.park_failed",
+                    &format!("{}: {}", err.code, err.message),
+                );
+                return err_response(&request.id, err.code, err.message);
+            }
+        }
+        Err(lock_message) => {
+            return err_response(&request.id, "state.unavailable", lock_message);
+        }
+    }
+    finish_mutation(
+        shared,
+        request,
+        key,
+        "lane.retire",
+        false,
+        null(),
+        Some((code, message)),
+    )
+}
+
+/// Build the retirement adapter profile from the request's `harness` binding
+/// (the planner shape: an official kind, or an explicit declarative `argv`
+/// declaration carrying its own executable and closed capability set).
+/// Unknown kinds and malformed declarations refuse; nothing is inferred.
+fn retirement_profile(harness: &Val) -> Result<crate::adapters::Profile, (&'static str, String)> {
+    use crate::adapters::{HarnessKind, Profile};
+    let key = match harness.get("key").and_then(Val::as_str) {
+        Some(key) if crate::formats::is_actor(key) => key.to_string(),
+        _ => {
+            return Err((
+                "refusal.malformed",
+                "lane.retire requires params.harness.key (actor identity)".to_string(),
+            ));
+        }
+    };
+    let kind_name = match harness.get("kind").and_then(Val::as_str) {
+        Some(kind) => kind,
+        _ => {
+            return Err((
+                "refusal.malformed",
+                "lane.retire requires params.harness.kind (an adapter kind)".to_string(),
+            ));
+        }
+    };
+    let Some(kind) = HarnessKind::parse(kind_name) else {
+        return Err((
+            crate::adapters::CODE_UNKNOWN_HARNESS,
+            format!(
+                "unknown harness kind {kind_name:?}; supported kinds: {}",
+                HarnessKind::OFFICIAL
+                    .iter()
+                    .map(|kind| kind.name())
+                    .chain(std::iter::once("argv"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    };
+    if kind == HarnessKind::Argv {
+        let executable = match harness.get("executable").and_then(Val::as_str) {
+            Some(executable) => executable,
+            _ => {
+                return Err((
+                    "refusal.malformed",
+                    "an argv harness binding requires params.harness.executable (a bare \
+                     executable name)"
+                        .to_string(),
+                ));
+            }
+        };
+        let capabilities: Vec<&str> = match harness.get("capabilities") {
+            Some(Val::Arr(items)) => items.iter().filter_map(Val::as_str).collect(),
+            _ => {
+                return Err((
+                    crate::adapters::CODE_UNKNOWN_CAPABILITY,
+                    "an argv harness binding must declare params.harness.capabilities (an \
+                     explicit capability set)"
+                        .to_string(),
+                ));
+            }
+        };
+        return Profile::argv(
+            key,
+            executable,
+            &capabilities,
+            std::collections::BTreeMap::new(),
+        )
+        .map_err(|err| (err.code, err.message));
+    }
+    Profile::official(kind, key).map_err(|err| (err.code, err.message))
+}
+
 fn method_journal_tail(shared: &Arc<Shared>, request: &Request) -> String {
     let params = request.params.as_ref();
     let after_seq = params
@@ -3867,6 +4301,18 @@ fn reconcile_claims(
                 {
                     reconcile_lane_checkpoint(state, log, checkpoints_dir, params)?;
                 }
+                // Issue #75: an interrupted lane.retire claim reconciles
+                // EXACT ABSENCE through the confirmation read-back. The stop
+                // is issued at most once: reconciliation never repeats a
+                // signal — it either completes the retirement (absence
+                // proven) or parks the record ambiguous. A reused identity is
+                // never signalled.
+                if claim.method == "lane.retire"
+                    && let Ok(doc) = Val::parse_json(&claim.request_line)
+                    && let Some(params) = doc.get("params")
+                {
+                    reconcile_lane_retire(state, log, params)?;
+                }
             }
             Err(err) => {
                 return Err(daemon_error(
@@ -4045,6 +4491,159 @@ fn reconcile_lane_checkpoint(
         ),
     );
     Ok(())
+}
+
+/// Restart reconciliation for one interrupted `lane.retire` claim (issue #75
+/// AC6). The retirement's graceful stop is issued AT MOST ONCE: this path
+/// never repeats a signal — it reads the backend confirmation row and:
+///
+/// - absence proven (the process is absent AND the registration is released
+///   for the bound session/generation): the interrupted retirement completed,
+///   so the `checkpointed` → `retired` transition is committed with a
+///   reconciled evidence summary.
+/// - the bound session is still present, a reused identity owns it, or the
+///   read-back is unavailable: the record is parked `ambiguous` for external
+///   reconciliation (never a second signal, never against a reused identity).
+///
+/// A record that already committed its retirement (phase `retired`) needs no
+/// reconciliation at all.
+fn reconcile_lane_retire(state: &State, log: &DaemonLog, params: &Val) -> Result<(), DaemonError> {
+    let Some(replacement_id) = params
+        .get("replacement_id")
+        .and_then(Val::as_str)
+        .filter(|text| crate::formats::is_replacement_id(text))
+    else {
+        return Ok(());
+    };
+    let row = state
+        .lane_replacement_by_id(replacement_id)
+        .map_err(|err| {
+            daemon_error(
+                "daemon.reconcile",
+                format!("retirement reconciliation: {}: {}", err.code, err.message),
+            )
+        })?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    if row.phase == "retired" {
+        log.write(
+            "warn",
+            "reconcile.lane.retire",
+            &format!(
+                "replacement {replacement_id} committed its retirement before the interrupt; \
+                 no signal was repeated and the claim stays ambiguous"
+            ),
+        );
+        return Ok(());
+    }
+    if row.phase != "checkpointed" || row.outcome != "pending" {
+        log.write(
+            "info",
+            "reconcile.lane.retire",
+            &format!(
+                "replacement {replacement_id} is at {}/{}; the interrupted retirement claim \
+                 needs no retirement reconciliation",
+                row.phase, row.outcome
+            ),
+        );
+        return Ok(());
+    }
+    let park = |reason: String| -> Result<(), DaemonError> {
+        state
+            .mark_replacement_ambiguous(params, &reason, &time::rfc3339_now())
+            .map_err(|err| {
+                daemon_error(
+                    "daemon.reconcile",
+                    format!("retirement reconciliation: {}: {}", err.code, err.message),
+                )
+            })?;
+        log.write("warn", "reconcile.lane.retire", &reason);
+        Ok(())
+    };
+    let Some(harness) = params.get("harness") else {
+        return park(format!(
+            "interrupted retirement of {replacement_id} carries no harness binding; the record \
+             is parked ambiguous (no signal was repeated)"
+        ));
+    };
+    let profile = match retirement_profile(harness) {
+        Ok(profile) => profile,
+        Err((code, message)) => {
+            return park(format!(
+                "interrupted retirement of {replacement_id} cannot rebuild its harness profile \
+                 ({code}: {message}); the record is parked ambiguous (no signal was repeated)"
+            ));
+        }
+    };
+    let checkpoint_digest = match state.lane_checkpoint_by_replacement(replacement_id) {
+        Ok(Some(checkpoint)) if checkpoint.generation == row.generation => checkpoint.digest,
+        Ok(_) => {
+            return park(format!(
+                "interrupted retirement of {replacement_id} has no committed checkpoint for its \
+                 generation; the record is parked ambiguous (no signal was repeated)"
+            ));
+        }
+        Err(err) => {
+            return Err(daemon_error(
+                "daemon.reconcile",
+                format!("retirement reconciliation: {}: {}", err.code, err.message),
+            ));
+        }
+    };
+    let target = crate::adapters::RetirementTarget {
+        session: row.source_session.clone(),
+        process: row.source_process.clone(),
+    };
+    let env = crate::config::adapter_environment();
+    let evidence = crate::adapters::retirement_evidence(
+        &profile,
+        &target,
+        row.generation,
+        &env,
+        crate::adapters::ADAPTER_TIMEOUT,
+    );
+    match evidence {
+        Ok(crate::adapters::RetirementEvidence::Retired) => {
+            let reason = format!(
+                "reconciled after an interrupted retirement: exact absence verified (backend \
+                 process absent; registration released for session {:?} generation {}); no \
+                 signal was repeated",
+                target.session, row.generation
+            );
+            match state.commit_lane_retirement(
+                replacement_id,
+                row.generation,
+                &checkpoint_digest,
+                &reason,
+                &time::rfc3339_now(),
+            ) {
+                Ok(_) => {
+                    log.write("warn", "reconcile.lane.retire", &reason);
+                    Ok(())
+                }
+                Err(err) => park(format!(
+                    "interrupted retirement of {replacement_id} verified exact absence but the \
+                     transition could not commit ({}: {}); the record is parked ambiguous (no \
+                     signal was repeated)",
+                    err.code, err.message
+                )),
+            }
+        }
+        Ok(crate::adapters::RetirementEvidence::Held { detail }) => park(format!(
+            "interrupted retirement of {replacement_id} cannot prove exact absence ({detail}); \
+             the record is parked ambiguous and no signal was repeated"
+        )),
+        Ok(crate::adapters::RetirementEvidence::Reused { detail }) => park(format!(
+            "interrupted retirement of {replacement_id} observed a reused identity ({detail}); \
+             the record is parked ambiguous and no signal was repeated against it"
+        )),
+        Err(err) => park(format!(
+            "interrupted retirement of {replacement_id} could not read the backend confirmation \
+             ({}: {}); the record is parked ambiguous and no signal was repeated",
+            err.code, err.message
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------

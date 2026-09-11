@@ -28,12 +28,14 @@ remain usable without it; SQLite owns state; no network control API).
   `schedules.delete`, `schedules.evaluate`, `lane.replacement.request`,
   `lane.replacement.advance`, `lane.replacement.hold`,
   `lane.replacement.cancel`, `lane.replacement.status`,
-  `lane.checkpoint.create`, `lane.checkpoint.status`, `state.epoch`,
-  `backup.create`, `restore.begin`, `journal.tail`, `events.subscribe`
-  (issues #5/#9/#73/#74 add the event stream, the lifecycle methods, the
-  request-only lane replacement surface, and the safe-boundary checkpoint
-  surface over the socket; the closed set above is mirrored by the Rust
-  schema validator and the fixture oracle).
+  `lane.checkpoint.create`, `lane.checkpoint.status`, `lane.retire`,
+  `state.epoch`, `backup.create`, `restore.begin`, `journal.tail`,
+  `events.subscribe`
+  (issues #5/#9/#73/#74/#75 add the event stream, the lifecycle methods, the
+  request-only lane replacement surface, the safe-boundary checkpoint
+  surface, and the guarded single-session retirement over the socket; the
+  closed set above is mirrored by the Rust schema validator and the fixture
+  oracle).
 - `apply` **requires** `params.idempotency_key` (`ik_` format): an apply
   without a key is refused at parse time (`rpc/request.malformed.json`).
   Replaying the same request id + idempotency key returns the recorded
@@ -151,6 +153,65 @@ issues, or consumes a grant.
   complete checkpoint or the new complete one), and an artifact without a
   committed record fails closed (the replacement is parked `ambiguous` —
   never adopted or silently deleted).
+
+## Lane retirement method (issue #75)
+
+The guarded retirement of ONE checkpointed source session (spec-state.md
+"Retirement additions"): the effect consumes the durable handoff the
+checkpoint surface left behind and retires exactly the session the record
+binds. `lane.retire` journals through the same claim machinery as every
+daemon mutation (it requires `params.idempotency_key`); no method on this
+surface spawns a successor, cleans up a process tree, restarts a fleet,
+touches Git, or requires/issues/consumes a grant.
+
+- `lane.retire` requires `params.replacement_id`, `params.binding`
+  ({generation, session, process, checkpoint_digest}), `params.recheck`
+  (the immediate pre-stop quiescence recheck:
+  {observed_at, session, process, children[{command, state}], active}) and
+  `params.harness` (the adapter profile binding: `key` + `kind`, plus
+  `executable` and `capabilities` for the declarative `argv` kind). The
+  binding and the recheck are validated against the durable record and its
+  committed checkpoint BEFORE any effect: a changed generation, session,
+  process or checkpoint digest refuses (`refusal.retirement.binding`), the
+  paused (`held`) state refuses (`refusal.replacement.held`), and
+  unknown/active child activity or an unknown process identity holds
+  (`refusal.retirement.held`). A refusal before the effect signals nothing
+  and changes nothing.
+- The retirement's only wired adapter path is the workspace (Herdr) session
+  rows. A profile that does not declare both the `interrupt` and `observe`
+  capabilities is an unsupported adapter and refuses with
+  `unknown.capability` BEFORE the claim; an unknown kind refuses with
+  `unknown.harness`.
+- The graceful stop is ONE bounded request (`session interrupt <session>
+  --json`, the adapter deadline). It is never retried and never escalated:
+  there is no SIGKILL, no broad pattern, no process-group signal and no
+  authority uplift on this path. A stop whose delivery cannot be confirmed
+  answers `refusal.retirement.held` and parks the record `ambiguous`; a
+  stop that never ran (the workspace executable is unavailable) refuses
+  with `refusal.unavailable.harness` and leaves the record untouched.
+- The retirement is confirmed by backend evidence ONLY: the confirmation
+  read-back (`session show <session> --json`) must show the backend process
+  absent AND the ownership/registration released for the bound session and
+  generation. A pane text or a `done`/`retired` label is never read, so a
+  label alone can never confirm a retirement; a different process under the
+  bound session, a read-back naming another session, or a stale
+  registration fails closed (`refusal.retirement.reused`) and parks the
+  record `ambiguous`; missing, unknown or unparsable evidence holds
+  (`refusal.retirement.held`). Child lanes are never addressed: only the
+  record's own bound session identity is.
+- On success the response carries `retirement` = the updated replacement
+  record (phase `retired`), the committed checkpoint id + digest, the bound
+  session/process, the bounded stop evidence (status, elapsed) and the
+  confirmation evidence (process absent, registration released,
+  generation). Replays (same id + key) return the recorded response and
+  never repeat the stop.
+- Restart reconciliation for an interrupted `lane.retire` claim reconciles
+  EXACT ABSENCE through the confirmation read-back: verified absence
+  completes the `checkpointed` → `retired` transition with a reconciled
+  evidence summary, and every other outcome (still present, reused
+  identity, unreadable backend) parks the record `ambiguous`. The stop is
+  issued at most once — reconciliation never repeats a signal, and never
+  against a reused identity.
 
 ## Responses: `hf-rpc-response/v1`
 
