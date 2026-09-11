@@ -77,7 +77,7 @@ release process activates (docs/RELEASING.md), then semver applies.
   per-user launchd/systemd environment checks and unit-plan rendering —
   plans only, never installing/starting/stopping/querying the host service
   manager.
-- State layer: SQLite migrations m0001-m0005, audit/event JSONL journals
+- State layer: SQLite migrations m0001-m0006, audit/event JSONL journals
   with mirror rebuild, backup/restore hooks, per-user path resolution.
 - Socket RPC: `hf-rpc-request/v1`/`hf-rpc-response/v1` closed method set,
   typed refusal codes, `events.subscribe` stream.
@@ -179,6 +179,36 @@ release process activates (docs/RELEASING.md), then semver applies.
   retirement but can never authorize its own replacement effects.
   Retirement execution, automatic triggers and successor execution remain
   out of scope.
+
+### Added (issue #74 — Safe-boundary checkpoints)
+
+- One safe-boundary checkpoint operation for a lane replacement at the
+  `quiescing` boundary (`lane.checkpoint.create` / `lane.checkpoint.status`
+  RPCs, `lane_checkpoints` table via m0006/schema v6): the capture validates
+  TWO observations of the lane (canonically identical, or the checkpoint
+  refuses with `refusal.checkpoint.changed`), requires a supported
+  quiescence acknowledgment AND a process/child observation for active
+  external harness execution (`refusal.checkpoint.ack` — daemon fencing
+  alone is not claimed to stop arbitrary shell actions), holds completion
+  on active/ambiguous side-effecting child commands (`refusal.checkpoint.held`
+  — nothing is ever signalled, killed, or cleaned up to obtain a snapshot),
+  refuses missing evidence (`refusal.checkpoint.incomplete`), and yields a
+  typed hold when required data exceeds the enforced brief bound
+  (`refusal.checkpoint.oversize` — required gates are never silently
+  truncated).
+- Quiescing fences new replacement slots for the lane
+  (`refusal.replacement.fenced`) until the handoff resolves or is cancelled;
+  capture is only admitted at the quiescing boundary; one replacement
+  carries at most one checkpoint (`refusal.checkpoint.exists`).
+- The checkpoint row and the record's `quiescing` → `checkpointed`
+  transition commit in ONE transaction; the compact brief (≤ 3 KiB) is
+  generated deterministically from the durable record, carries explicit
+  evidence pointers only, and is regenerated (digest-verified) by restart
+  reconciliation when a crash lands between the commit and the artifact
+  write. An artifact without a committed record fails closed. Orchestrator
+  checkpoints reference existing worker/reviewer records and pending
+  completion events without altering them. No spawn/kill/Git effect, no
+  grant, no scheduler, and no automatic trigger exists on the surface.
 
 ### Changed
 

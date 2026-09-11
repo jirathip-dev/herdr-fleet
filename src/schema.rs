@@ -1113,7 +1113,9 @@ pub const SUPPORTED_FAMILIES: [Family; 17] = [
 /// resume/delete + one fresh coalesced evaluation per tick). The five
 /// `lane.replacement.*` methods are added by issue #73 (request-only lane
 /// replacement records: request/advance/hold/cancel + one status read).
-pub const RPC_METHODS: [&str; 23] = [
+/// The `lane.checkpoint.*` methods are added by issue #74 (one atomic
+/// checkpoint capture after verified quiescence + one status read).
+pub const RPC_METHODS: [&str; 25] = [
     "capabilities",
     "doctor",
     "status",
@@ -1132,6 +1134,8 @@ pub const RPC_METHODS: [&str; 23] = [
     "lane.replacement.hold",
     "lane.replacement.cancel",
     "lane.replacement.status",
+    "lane.checkpoint.create",
+    "lane.checkpoint.status",
     "state.epoch",
     "backup.create",
     "restore.begin",

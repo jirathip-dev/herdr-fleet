@@ -151,6 +151,14 @@ pub fn is_replacement_id(text: &str) -> bool {
         && is_lower_hex(&text[PREFIX.len()..], 16)
 }
 
+/// Lane checkpoint id: `ck_` + 16 lowercase hex (issue #74).
+pub fn is_checkpoint_id(text: &str) -> bool {
+    const PREFIX: &str = "ck_";
+    text.len() == PREFIX.len() + 16
+        && text.starts_with(PREFIX)
+        && is_lower_hex(&text[PREFIX.len()..], 16)
+}
+
 /// Repository-relative worktree reference (issue #73 AC2):
 /// `[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*` with no `.`/`..` components and
 /// no leading slash — host-absolute paths and traversal never validate, so
@@ -306,6 +314,14 @@ mod tests {
         assert!(!is_replacement_id("rp_0123456789abcde"), "15 hex");
         assert!(!is_replacement_id("rp_0123456789ABCDEF"), "lowercase only");
         assert!(!is_replacement_id("0123456789abcdef"));
+
+        // Issue #74: checkpoint ids share the 16-hex identity shape.
+        assert!(is_checkpoint_id("ck_0123456789abcdef"));
+        assert!(!is_checkpoint_id("ck_0123456789abcde"), "15 hex");
+        assert!(
+            !is_checkpoint_id("rp_0123456789abcdef"),
+            "ck_ prefix required"
+        );
 
         assert!(is_worktree_ref("worktrees/issues/73"));
         assert!(is_worktree_ref("lane-7"));

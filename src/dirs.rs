@@ -114,6 +114,9 @@ pub struct DaemonPaths {
     pub events_mirror_path: PathBuf,
     /// Backup artifact directory (daemon-owned backups only).
     pub backups_dir: PathBuf,
+    /// Lane checkpoint brief artifact directory (issue #74; daemon-owned,
+    /// derived briefs only — the durable capture lives in the database).
+    pub checkpoints_dir: PathBuf,
     /// Allowlisted structured daemon log (JSONL).
     pub log_path: PathBuf,
 }
@@ -167,6 +170,7 @@ impl DaemonPaths {
             audit_mirror_path: state_root.join("journal").join("audit.jsonl"),
             events_mirror_path: state_root.join("journal").join("events.jsonl"),
             backups_dir: state_root.join("backups"),
+            checkpoints_dir: state_root.join("checkpoints"),
             log_path: state_root.join("daemon.log"),
         })
     }
@@ -174,7 +178,7 @@ impl DaemonPaths {
     /// Create the daemon-owned directories with per-user permissions
     /// (0700). Refuses to follow an existing symlink for any directory.
     pub fn prepare(&self) -> Result<(), PathError> {
-        for dir in [&self.state_dir, &self.backups_dir] {
+        for dir in [&self.state_dir, &self.backups_dir, &self.checkpoints_dir] {
             create_private_dir(dir)?;
         }
         if let Some(journal_dir) = self.audit_mirror_path.parent() {

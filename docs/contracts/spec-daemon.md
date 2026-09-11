@@ -27,11 +27,13 @@ remain usable without it; SQLite owns state; no network control API).
   `schedules.create`, `schedules.pause`, `schedules.resume`,
   `schedules.delete`, `schedules.evaluate`, `lane.replacement.request`,
   `lane.replacement.advance`, `lane.replacement.hold`,
-  `lane.replacement.cancel`, `lane.replacement.status`, `state.epoch`,
+  `lane.replacement.cancel`, `lane.replacement.status`,
+  `lane.checkpoint.create`, `lane.checkpoint.status`, `state.epoch`,
   `backup.create`, `restore.begin`, `journal.tail`, `events.subscribe`
-  (issues #5/#9/#73 add the event stream, the lifecycle methods, and the
-  request-only lane replacement surface over the socket; the closed set
-  above is mirrored by the Rust schema validator and the fixture oracle).
+  (issues #5/#9/#73/#74 add the event stream, the lifecycle methods, the
+  request-only lane replacement surface, and the safe-boundary checkpoint
+  surface over the socket; the closed set above is mirrored by the Rust
+  schema validator and the fixture oracle).
 - `apply` **requires** `params.idempotency_key` (`ik_` format): an apply
   without a key is refused at parse time (`rpc/request.malformed.json`).
   Replaying the same request id + idempotency key returns the recorded
@@ -101,6 +103,54 @@ effects.
 - Restart reconciliation marks a record whose transition was interrupted
   `ambiguous` (the claim machinery and the record agree); external
   reconciliation is required before it can advance.
+
+## Lane checkpoint methods (issue #74)
+
+The safe-boundary checkpoint operation (spec-state.md "Checkpoint
+additions"): ONE atomic capture of a lane's verified-quiescent state,
+committed at the replacement's `quiescing` boundary. Both methods journal
+through the same claim machinery as every daemon mutation
+(`lane.checkpoint.create` requires `params.idempotency_key`); no method on
+this surface spawns, kills, signals, or touches Git, and none requires,
+issues, or consumes a grant.
+
+- `lane.checkpoint.create` captures one checkpoint for
+  `params.replacement_id` at `params.generation` and commits the
+  checkpoint record together with the record's `quiescing` →
+  `checkpointed` transition in one transaction. It requires TWO
+  observations of the lane (`params.observation` and
+  `params.reobservation`): the two must be canonically identical, or the
+  checkpoint refuses (`refusal.checkpoint.changed`). The observation is a
+  closed document — role, task, worktree (bound to the record), branch,
+  head, base, dirty/untracked inventory with their 64-hex integrity
+  digests, report round + reviewed sha, bounded pending gates, bounded
+  observed child commands, and the execution/acknowledgment block. Missing
+  or invalid required evidence refuses (`refusal.checkpoint.incomplete` —
+  never silently omitted); active external harness execution requires a
+  supported quiescence acknowledgment AND a process/child observation
+  (`refusal.checkpoint.ack` — daemon fencing alone is not claimed to stop
+  arbitrary shell actions); observed side-effecting children that are
+  active or ambiguous HOLD completion (`refusal.checkpoint.held` — nothing
+  is signalled, killed, or cleaned up to obtain a snapshot); orchestrator
+  records require `params.observation.orchestration` referencing EXISTING
+  worker/reviewer replacement records and bounded pending completion
+  events (`refusal.checkpoint.references`), which the capture never
+  alters; and required data whose generated brief would exceed the
+  enforced 3 KiB bound is a typed hold (`refusal.checkpoint.oversize`).
+  The response carries the committed checkpoint (snapshot + digests), the
+  generated brief text, its artifact path, and the updated replacement
+  record. Replays (same id + key) return the recorded response; a second
+  capture for the same replacement refuses (`refusal.checkpoint.exists`).
+- `lane.checkpoint.status` reads the durable checkpoint for
+  `params.replacement_id` (snapshot, digests, and the derived brief
+  artifact pointer). Read-only — no claim and no journal write; a
+  replacement without a committed checkpoint is a typed `state.not_found`.
+- Restart reconciliation treats the committed checkpoint row as the commit
+  marker: the derived brief artifact is (re)generated from the durable row
+  and verified against `brief_digest` (so a restart yields the previous
+  complete checkpoint or the new complete one), and an artifact without a
+  committed record fails closed (the replacement is parked `ambiguous` —
+  never adopted or silently deleted).
 
 ## Responses: `hf-rpc-response/v1`
 
