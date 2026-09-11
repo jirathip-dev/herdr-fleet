@@ -66,8 +66,8 @@ facts the binary was built against:
 ```console
 herdr-fleet 0.1.0
 herdr-fleet: typed, plan-first companion CLI for operating Herdr coding-agent fleets (read-only core; no daemon, no live fleet mutations)
-state schema version: 6
-migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4, m0005_lane_replacements_v5, m0006_lane_checkpoints_v6
+state schema version: 7
+migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4, m0005_lane_replacements_v5, m0006_lane_checkpoints_v6, m0007_lane_successors_v7
 document schema families: hf-config/v1, hf-policy/v1, hf-output/v1, hf-error/v1, ...
 ```
 
@@ -233,7 +233,7 @@ $ herdr-fleet daemon status --json   # from another terminal: exit 0
 {"command":"daemon status","data":{"daemon":{"pid":<pid>,
  "started_at":"<ts>","version":"0.1.0"},
  "freshness":"fresh","state":{"active_grants":0,"epoch":1,"event_seq":0,
- "journal_seq":0,"pending_claims":0,"poisoned":false,"schema_version":6}},
+ "journal_seq":0,"pending_claims":0,"poisoned":false,"schema_version":7}},
  "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
 ```
 
@@ -344,7 +344,7 @@ prints and the daemon speaks conforms to the versioned corpus in
 [docs/contracts/README.md](docs/contracts/README.md) — schema registry,
 spec-cli/config/plans/capabilities, spec-daemon/state/workflow, capability-map,
 compatibility, and benchmarks. `herdr-fleet --version` prints the exact schema
-facts a build binds (`state schema version: 6`; migration chain m0001–m0006;
+facts a build binds (`state schema version: 7`; migration chain m0001–m0007;
 17 document schema families from `hf-config/v1` to `hf-schedule/v1`).
 
 **Command surface** — mirrors `herdr-fleet --help` on the release binary

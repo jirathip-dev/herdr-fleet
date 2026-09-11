@@ -159,6 +159,14 @@ pub fn is_checkpoint_id(text: &str) -> bool {
         && is_lower_hex(&text[PREFIX.len()..], 16)
 }
 
+/// Lane successor id: `su_` + 16 lowercase hex (issue #76).
+pub fn is_successor_id(text: &str) -> bool {
+    const PREFIX: &str = "su_";
+    text.len() == PREFIX.len() + 16
+        && text.starts_with(PREFIX)
+        && is_lower_hex(&text[PREFIX.len()..], 16)
+}
+
 /// Repository-relative worktree reference (issue #73 AC2):
 /// `[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*` with no `.`/`..` components and
 /// no leading slash — host-absolute paths and traversal never validate, so

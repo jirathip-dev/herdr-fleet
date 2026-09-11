@@ -1097,6 +1097,7 @@ fn prompt_args(profile: &Profile) -> Result<Vec<String>, AdapterError> {
 /// [`WORKSPACE_EXECUTABLE`]; fake executables in tests pin the shape).
 fn workspace_args(op: Op, session_id: &str) -> Vec<String> {
     let subcommand = match op {
+        Op::Start => "start",
         Op::Observe | Op::Identity => "show",
         Op::Interrupt => "interrupt",
         Op::Outcome => "outcome",
@@ -1832,6 +1833,371 @@ pub fn classify_retirement_evidence(
 fn retirement_result(
     profile: &Profile,
     target: &RetirementTarget,
+    op: Op,
+    status: &'static str,
+    code: Option<&'static str>,
+    message: Option<String>,
+    payload: Option<Val>,
+    detail: Option<String>,
+    started: std::time::Instant,
+) -> OpResult {
+    OpResult {
+        profile_key: profile.key.clone(),
+        session_id: target.session.clone(),
+        op,
+        status,
+        code,
+        message: message.map(|m| redact(&m)),
+        payload,
+        detail: detail.map(|d| redact(&d)),
+        elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session successors (issue #76): the bounded fresh start and the closed
+// verification evidence grammar
+// ---------------------------------------------------------------------------
+
+/// One successor start target: the successor session the workspace (Herdr)
+/// session rows address and the exact identity the verification read-back
+/// must prove (fresh session identity, role, harness profile, the SAME
+/// worktree, the kickoff receipt). All parts are bound from the durable
+/// record and the request binding — never from read-back text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuccessorTarget {
+    /// The successor session identity (the `<session>` argument of the
+    /// workspace `session <verb> <session> --json` rows).
+    pub session: String,
+    /// The doctrine role the successor must run.
+    pub role: String,
+    /// Harness profile key the start/read-back runs under.
+    pub profile_key: String,
+    /// Harness profile kind the start/read-back runs under.
+    pub profile_kind: String,
+    /// The SAME repository-relative worktree the read-back cwd must name.
+    pub worktree: String,
+    /// The kickoff receipt (64-hex sha256) the read-back must echo.
+    pub kickoff_receipt: String,
+    /// The retired source process identity (never a valid successor
+    /// process: a reused identity fails closed).
+    pub source_process: String,
+}
+
+/// The closed verdict of one successor confirmation read-back. The fresh
+/// successor is confirmed by the adapter-observed identity parts; a spawned
+/// process alone is never enough.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SuccessorEvidence {
+    /// The successor is verified: fresh session identity, role/profile/cwd,
+    /// the kickoff receipt and the adapter-observed readiness all match.
+    Verified {
+        /// The adapter-observed backend process identity.
+        process: String,
+        /// The adapter-observed readiness state (`ready`).
+        readiness: String,
+    },
+    /// The evidence cannot prove the boundary yet (missing/incomplete
+    /// evidence or a not-ready state): hold — nothing further is attempted
+    /// and a bounded same-nonce retry may re-verify.
+    Held {
+        /// Bounded human detail (redacted).
+        detail: String,
+    },
+    /// The evidence contradicts the start with a reused or wrong identity:
+    /// fail closed.
+    Reused {
+        /// Bounded human detail (redacted).
+        detail: String,
+    },
+}
+
+/// Run the successor start row — the ONE bounded fresh-session start
+/// request this slice issues: `herdr session start <session> --json` under
+/// [`WORKSPACE_EXECUTABLE`] with the caller's deadline. `succeeded` means
+/// the workspace accepted the start request; a `refused` result means the
+/// request was never delivered, `failed`/`ambiguous` mean the delivery is
+/// unknown. Nothing here replays a transcript, resets a worktree, or
+/// retries: a delivery that does not confirm is parked by the caller.
+pub fn successor_start(
+    profile: &Profile,
+    target: &SuccessorTarget,
+    env: &BTreeMap<String, String>,
+    timeout: Duration,
+) -> OpResult {
+    let started = std::time::Instant::now();
+    if !profile.supports(Op::Start.capability()) {
+        return successor_result(
+            profile,
+            target,
+            Op::Start,
+            "refused",
+            Some(CODE_UNKNOWN_CAPABILITY),
+            Some(format!(
+                "harness profile {:?} does not declare the {:?} capability required to start \
+                 a successor session; unsupported adapters are refused",
+                profile.key,
+                Op::Start.capability()
+            )),
+            None,
+            None,
+            started,
+        );
+    }
+    let args = workspace_args(Op::Start, &target.session);
+    match run_typed(WORKSPACE_EXECUTABLE, &args, timeout, env, None) {
+        ProcessOutcome::Ok(text) => match Val::parse_json(&text) {
+            Ok(_) => successor_result(
+                profile,
+                target,
+                Op::Start,
+                "succeeded",
+                None,
+                None,
+                Some(object(vec![("started", bool_(true))])),
+                None,
+                started,
+            ),
+            Err(message) => successor_result(
+                profile,
+                target,
+                Op::Start,
+                "refused",
+                Some(CODE_MALFORMED),
+                Some("workspace start row returned unparsable JSON".to_string()),
+                None,
+                Some(diagnostics(&format!("{message}: {text}"))),
+                started,
+            ),
+        },
+        ProcessOutcome::Failed(err) => successor_result(
+            profile,
+            target,
+            Op::Start,
+            err.status(),
+            Some(err.code),
+            Some(err.message),
+            None,
+            Some(err.detail),
+            started,
+        ),
+    }
+}
+
+/// Run the successor confirmation read row and classify its closed evidence
+/// grammar: the workspace `session show <session> --json` row, read back
+/// after the start. A failure to read (unavailable/unparsable backend) is a
+/// typed adapter error — the caller holds; the classification itself
+/// returns the three closed verdicts (see [`SuccessorEvidence`]).
+pub fn successor_evidence(
+    profile: &Profile,
+    target: &SuccessorTarget,
+    env: &BTreeMap<String, String>,
+    timeout: Duration,
+) -> Result<SuccessorEvidence, AdapterError> {
+    if !profile.supports(Op::Observe.capability()) {
+        return Err(AdapterError::refusal(
+            CODE_UNKNOWN_CAPABILITY,
+            format!(
+                "harness profile {:?} does not declare the {:?} capability required to \
+                 verify a successor; unsupported adapters are refused",
+                profile.key,
+                Op::Observe.capability()
+            ),
+        ));
+    }
+    let args = workspace_args(Op::Observe, &target.session);
+    let text = match run_typed(WORKSPACE_EXECUTABLE, &args, timeout, env, None) {
+        ProcessOutcome::Ok(text) => text,
+        ProcessOutcome::Failed(err) => {
+            let retryable = err.status() == "ambiguous";
+            return Err(AdapterError::failure(err.code, err.message, retryable));
+        }
+    };
+    let doc = Val::parse_json(&text).map_err(|message| {
+        AdapterError::refusal(
+            CODE_MALFORMED,
+            format!("successor confirmation read-back returned unparsable JSON: {message}"),
+        )
+    })?;
+    classify_successor_evidence(&doc, target)
+}
+
+/// Classify one successor confirmation read-back document against the bound
+/// target. The closed evidence grammar is:
+///
+/// ```json
+/// {"session_id": "<bound successor>",
+///  "process": "<backend process identity>",
+///  "role": "<bound role>",
+///  "profile": {"key": "<bound key>", "kind": "<bound kind>"},
+///  "cwd": "<bound worktree>",
+///  "kickoff_receipt": "<bound 64-hex receipt>",
+///  "readiness": "ready"}
+/// ```
+///
+/// Every part is required: the read-back cannot substitute a label for the
+/// identity/role/profile/cwd/kickoff/readiness evidence. Missing or
+/// incomplete evidence holds; a positive contradiction (another session,
+/// the retired source process answering, a wrong role/profile/worktree, or
+/// a mis-echoed receipt) is a reused identity and fails closed.
+pub fn classify_successor_evidence(
+    doc: &Val,
+    target: &SuccessorTarget,
+) -> Result<SuccessorEvidence, AdapterError> {
+    match doc.get("session_id").and_then(Val::as_str) {
+        None => {
+            return Ok(SuccessorEvidence::Held {
+                detail: "the confirmation read-back carries no session identity (an unknown \
+                         session identity holds)"
+                    .to_string(),
+            });
+        }
+        Some(session) if session != target.session => {
+            return Ok(SuccessorEvidence::Reused {
+                detail: format!(
+                    "the confirmation read-back names session {session:?} for the bound \
+                     successor {:?} (reused pane/session identity)",
+                    target.session
+                ),
+            });
+        }
+        Some(_) => {}
+    };
+    let process = match doc.get("process").and_then(Val::as_str) {
+        None => {
+            return Ok(SuccessorEvidence::Held {
+                detail: "the confirmation read-back carries no process evidence (a spawned \
+                         process alone is not an adopted successor)"
+                    .to_string(),
+            });
+        }
+        Some(process) if !crate::formats::is_actor(process) => {
+            return Ok(SuccessorEvidence::Held {
+                detail: "the confirmation read-back process evidence is not a process identity \
+                         (an unknown process identity holds)"
+                    .to_string(),
+            });
+        }
+        Some(process) if process == target.source_process => {
+            return Ok(SuccessorEvidence::Reused {
+                detail: format!(
+                    "the retired source process {process:?} answers for the successor session \
+                     {:?} (reused process identity); the successor cannot be verified",
+                    target.session
+                ),
+            });
+        }
+        Some(process) => process.to_string(),
+    };
+    match doc.get("role").and_then(Val::as_str) {
+        None => {
+            return Ok(SuccessorEvidence::Held {
+                detail: "the confirmation read-back carries no role evidence (an unknown role \
+                         holds)"
+                    .to_string(),
+            });
+        }
+        Some(role) if role != target.role => {
+            return Ok(SuccessorEvidence::Reused {
+                detail: format!(
+                    "the confirmation read-back runs role {role:?}, not the bound role {:?}",
+                    target.role
+                ),
+            });
+        }
+        Some(_) => {}
+    }
+    let profile = match doc.get("profile") {
+        Some(Val::Obj(map)) => map,
+        _ => {
+            return Ok(SuccessorEvidence::Held {
+                detail: "the confirmation read-back carries no profile evidence".to_string(),
+            });
+        }
+    };
+    match (
+        profile.get("key").and_then(Val::as_str),
+        profile.get("kind").and_then(Val::as_str),
+    ) {
+        (Some(key), Some(kind)) if key == target.profile_key && kind == target.profile_kind => {}
+        (Some(key), Some(kind)) => {
+            return Ok(SuccessorEvidence::Reused {
+                detail: format!(
+                    "the confirmation read-back runs profile {key:?}/{kind:?}, not the bound \
+                     profile {:?}/{:?}",
+                    target.profile_key, target.profile_kind
+                ),
+            });
+        }
+        _ => {
+            return Ok(SuccessorEvidence::Held {
+                detail: "the profile evidence is incomplete (an unknown profile holds)".to_string(),
+            });
+        }
+    }
+    match doc.get("cwd").and_then(Val::as_str) {
+        None => {
+            return Ok(SuccessorEvidence::Held {
+                detail: "the confirmation read-back carries no cwd evidence (an unknown \
+                         worktree holds)"
+                    .to_string(),
+            });
+        }
+        Some(cwd) if cwd != target.worktree => {
+            return Ok(SuccessorEvidence::Reused {
+                detail: format!(
+                    "the confirmation read-back runs in worktree {cwd:?}, not the SAME \
+                     worktree {:?} (a successor never forks to another worktree)",
+                    target.worktree
+                ),
+            });
+        }
+        Some(_) => {}
+    }
+    match doc.get("kickoff_receipt").and_then(Val::as_str) {
+        None => {
+            return Ok(SuccessorEvidence::Held {
+                detail: "the confirmation read-back carries no kickoff receipt (a missing \
+                         kickoff acknowledgment holds)"
+                    .to_string(),
+            });
+        }
+        Some(receipt) if receipt != target.kickoff_receipt => {
+            return Ok(SuccessorEvidence::Reused {
+                detail: "the confirmation read-back echoed another kickoff receipt (a stale \
+                         or replayed kickoff cannot confirm a successor)"
+                    .to_string(),
+            });
+        }
+        Some(_) => {}
+    }
+    let readiness = match doc.get("readiness").and_then(Val::as_str) {
+        None => {
+            return Ok(SuccessorEvidence::Held {
+                detail: "the confirmation read-back carries no readiness evidence (a spawned \
+                         process alone is not an adopted successor)"
+                    .to_string(),
+            });
+        }
+        Some(readiness) => readiness.to_string(),
+    };
+    if readiness != "ready" {
+        return Ok(SuccessorEvidence::Held {
+            detail: format!(
+                "the successor is observed {readiness:?}, not adapter-observed `ready`; the \
+                 boundary holds until the adapter observes readiness"
+            ),
+        });
+    }
+    Ok(SuccessorEvidence::Verified { process, readiness })
+}
+
+/// Build a successor result with the wall time already measured.
+#[allow(clippy::too_many_arguments)]
+fn successor_result(
+    profile: &Profile,
+    target: &SuccessorTarget,
     op: Op,
     status: &'static str,
     code: Option<&'static str>,

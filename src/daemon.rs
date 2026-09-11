@@ -554,6 +554,9 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "lane.checkpoint.create" => method_lane_checkpoint_create(shared, request),
         "lane.checkpoint.status" => method_lane_checkpoint_status(shared, request),
         "lane.retire" => method_lane_retire(shared, request),
+        "lane.start" => method_lane_start(shared, request),
+        "lane.adopt" => method_lane_adopt(shared, request),
+        "lane.successor.consume" => method_lane_successor_consume(shared, request),
         "grants.list" => method_grants_list(shared, request),
         "journal.tail" => method_journal_tail(shared, request),
         "grants.revoke" => method_grants_revoke(shared, request),
@@ -2745,10 +2748,18 @@ fn method_lane_replacement_status(shared: &Arc<Shared>, request: &Request) -> St
         .iter()
         .map(crate::state::lane_replacement_event_val)
         .collect();
+    // The committed successor boundary (issue #76) is part of the record's
+    // status: null until a start commits it, then the durable successor row.
+    let successor = match state.lane_successor_by_replacement(&replacement_id) {
+        Ok(Some(row)) => crate::state::lane_successor_val(&row),
+        Ok(None) => null(),
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
     ok_response(
         &request.id,
         object(vec![
             ("replacement", crate::state::lane_replacement_val(&row)),
+            ("successor", successor),
             ("history", Val::Arr(history)),
         ]),
     )
@@ -3380,6 +3391,1217 @@ fn retirement_profile(harness: &Val) -> Result<crate::adapters::Profile, (&'stat
         .map_err(|err| (err.code, err.message));
     }
     Profile::official(kind, key).map_err(|err| (err.code, err.message))
+}
+
+/// `lane.start`: commit ONE successor owner boundary and start a FRESH
+/// successor session on the SAME logical lane/worktree (issue #76), then
+/// verify it through the adapters before it can ever be adopted.
+///
+/// The request binds the record's lane generation, the committed checkpoint
+/// digest and the ONE startup nonce (`binding`), the successor session and
+/// kickoff receipt (`successor`) and the adapter profile (`harness`). The
+/// record must have committed its verified retirement (`retired`); a
+/// changed generation, checkpoint digest, paused/ambiguous/cancelled record
+/// or missing evidence refuses BEFORE any effect. The existing admission
+/// gate applies first: a capacity/resource/host-proof refusal is a typed
+/// hold that spawns nothing and never disables admission.
+///
+/// One generation/nonce owns startup: the successor row and the
+/// `retired` → `starting` transition commit in ONE transaction BEFORE any
+/// spawn, so a simultaneous or replayed start can never create a second
+/// successor. The spawn is ONE bounded `session start <session> --json`
+/// row (no transcript replay, no reset, no cleanup); a start that never ran
+/// leaves the boundary undelivered for a bounded same-nonce retry, and any
+/// unconfirmed delivery parks the record for external reconciliation. The
+/// follow-up `session show <session> --json` read-back must prove the fresh
+/// session identity, role, harness profile, the SAME worktree, the kickoff
+/// receipt and adapter-observed readiness — a spawned process alone is
+/// never adopted. Only the closed verification verdict commits the
+/// `starting` → `adopting` boundary.
+fn method_lane_start(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "lane.start requires params: replacement_id, binding, successor, harness[, \
+             admission]",
+        );
+    };
+    let replacement_id = match required_str(Some(params), "replacement_id") {
+        Some(text) if crate::formats::is_replacement_id(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.start requires params.replacement_id (rp_ id)",
+            );
+        }
+    };
+    if !matches!(params.get("binding"), Some(Val::Obj(_))) {
+        return err_response(
+            &request.id,
+            crate::state::successor_code::BINDING,
+            "lane.start requires params.binding (object: generation, checkpoint_digest, \
+             nonce)",
+        );
+    }
+    if !matches!(params.get("successor"), Some(Val::Obj(_))) {
+        return err_response(
+            &request.id,
+            crate::state::successor_code::BINDING,
+            "lane.start requires params.successor (object: session, kickoff_receipt)",
+        );
+    }
+    let harness = match params.get("harness") {
+        Some(harness @ Val::Obj(_)) => harness,
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.start requires params.harness (object: key, kind[, executable, \
+                 capabilities])",
+            );
+        }
+    };
+    let profile = match retirement_profile(harness) {
+        Ok(profile) => profile,
+        Err((code, message)) => return err_response(&request.id, code, message),
+    };
+    // The start/verify path is the workspace (Herdr) session rows: the SAME
+    // single adapter path the retirement uses. A profile that does not
+    // declare both required capabilities is an unsupported adapter and
+    // refuses BEFORE the claim.
+    for capability in [
+        crate::adapters::Op::Start.capability(),
+        crate::adapters::Op::Observe.capability(),
+    ] {
+        if !profile.supports(capability) {
+            return err_response(
+                &request.id,
+                crate::adapters::CODE_UNKNOWN_CAPABILITY,
+                format!(
+                    "harness profile {:?} does not declare the {capability:?} capability that \
+                     the successor start path requires; unsupported adapters are refused",
+                    profile.key
+                ),
+            );
+        }
+    }
+    let target = format!("lane-start:{replacement_id}");
+    match journal_mutation(shared, request, "mutate.lane.start", &target) {
+        Intent::Claimed { key } => {
+            crash_point("lane-start.after-intent");
+            let bound = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                state
+                    .begin_lane_successor(params)
+                    .map_err(|err| (err.code, err.message))
+            };
+            let plan = match bound {
+                Ok(plan) => plan,
+                Err((code, message)) => {
+                    return finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.start",
+                        false,
+                        null(),
+                        Some((code, message)),
+                    );
+                }
+            };
+            // Existing concurrency/resource gates apply BEFORE anything is
+            // committed or spawned: a capacity refusal is a typed hold, the
+            // record is untouched and a bounded explicit retry stays legal.
+            if let Err((code, message)) =
+                successor_admission(params, &profile.key, &plan.record.worktree)
+            {
+                return finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "lane.start",
+                    false,
+                    null(),
+                    Some((code, message)),
+                );
+            }
+            let env = crate::config::adapter_environment();
+            // The source-absence recheck: source and successor must never
+            // both be live/ambiguous (AC3). Refused BEFORE any successor
+            // effect: nothing is spawned and no state changes.
+            let source_target = crate::adapters::RetirementTarget {
+                session: plan.record.source_session.clone(),
+                process: plan.record.source_process.clone(),
+            };
+            match crate::adapters::retirement_evidence(
+                &profile,
+                &source_target,
+                plan.record.generation,
+                &env,
+                crate::adapters::ADAPTER_TIMEOUT,
+            ) {
+                Ok(crate::adapters::RetirementEvidence::Retired) => {}
+                Ok(crate::adapters::RetirementEvidence::Held { detail }) => {
+                    return finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.start",
+                        false,
+                        null(),
+                        Some((
+                            crate::state::successor_code::SOURCE_LIVE,
+                            format!(
+                                "the bound source session {:?} is still present or its \
+                                 absence cannot be proven ({}); source and successor must \
+                                 never both be live — nothing was spawned",
+                                source_target.session, detail
+                            ),
+                        )),
+                    );
+                }
+                Ok(crate::adapters::RetirementEvidence::Reused { detail }) => {
+                    return finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.start",
+                        false,
+                        null(),
+                        Some((
+                            crate::state::retirement_code::REUSED,
+                            format!(
+                                "the source-absence recheck observed a reused identity for \
+                                 session {:?} ({}); nothing was spawned and external \
+                                 reconciliation is required",
+                                source_target.session, detail
+                            ),
+                        )),
+                    );
+                }
+                Err(err) => {
+                    // A read-back that never ran (the workspace executable is
+                    // unavailable) signals nothing and changes nothing — the
+                    // same refusal the retirement path uses. Every other
+                    // unreadable/unknown source state holds.
+                    let code = if err.code == crate::adapters::CODE_UNAVAILABLE {
+                        crate::adapters::CODE_UNAVAILABLE
+                    } else {
+                        crate::state::successor_code::SOURCE_LIVE
+                    };
+                    return finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.start",
+                        false,
+                        null(),
+                        Some((
+                            code,
+                            format!(
+                                "the source-absence recheck could not read the source session \
+                                 {:?} ({}: {}); nothing was spawned",
+                                source_target.session, err.code, err.message
+                            ),
+                        )),
+                    );
+                }
+            }
+            // ONE generation/nonce owns startup: commit the owner boundary
+            // BEFORE any spawn (a simultaneous/replayed start loses the
+            // UNIQUE fence). An existing undelivered boundary is a bounded
+            // same-nonce retry; an existing delivered one re-verifies only.
+            let successor = match plan.existing.clone() {
+                Some(existing) if existing.delivery == "delivered" => existing,
+                Some(_) => {
+                    let noted = {
+                        let state = match shared.lock_state() {
+                            Ok(state) => state,
+                            Err(message) => {
+                                return err_response(&request.id, "state.unavailable", message);
+                            }
+                        };
+                        state
+                            .note_lane_successor_attempt(
+                                &plan.record.replacement_id,
+                                &plan.nonce,
+                                &time::rfc3339_now(),
+                            )
+                            .map_err(|err| (err.code, err.message))
+                    };
+                    match noted {
+                        Ok(row) => row,
+                        Err((code, message)) => {
+                            return finish_mutation(
+                                shared,
+                                request,
+                                &key,
+                                "lane.start",
+                                false,
+                                null(),
+                                Some((code, message)),
+                            );
+                        }
+                    }
+                }
+                None => {
+                    let committed = {
+                        let state = match shared.lock_state() {
+                            Ok(state) => state,
+                            Err(message) => {
+                                return err_response(&request.id, "state.unavailable", message);
+                            }
+                        };
+                        state
+                            .commit_lane_successor_start(
+                                &plan.record.replacement_id,
+                                plan.record.generation,
+                                &plan.checkpoint.digest,
+                                &plan.nonce,
+                                &plan.session,
+                                &plan.kickoff_receipt,
+                                &profile.key,
+                                profile.kind.name(),
+                                &time::rfc3339_now(),
+                            )
+                            .map_err(|err| (err.code, err.message))
+                    };
+                    match committed {
+                        Ok((successor, _record)) => successor,
+                        Err((code, message)) => {
+                            return finish_mutation(
+                                shared,
+                                request,
+                                &key,
+                                "lane.start",
+                                false,
+                                null(),
+                                Some((code, message)),
+                            );
+                        }
+                    }
+                }
+            };
+            crash_point("lane-start.after-boundary");
+            let successor_target = crate::adapters::SuccessorTarget {
+                session: successor.session.clone(),
+                role: successor.role.clone(),
+                profile_key: successor.profile_key.clone(),
+                profile_kind: successor.profile_kind.clone(),
+                worktree: successor.worktree.clone(),
+                kickoff_receipt: successor.kickoff_receipt.clone(),
+                source_process: plan.record.source_process.clone(),
+            };
+            let mut spawn_evidence = null();
+            if successor.delivery == "none" {
+                let spawn = crate::adapters::successor_start(
+                    &profile,
+                    &successor_target,
+                    &env,
+                    crate::adapters::ADAPTER_TIMEOUT,
+                );
+                crash_point("lane-start.after-spawn");
+                if spawn.status != "succeeded" {
+                    let detail = spawn
+                        .message
+                        .clone()
+                        .or_else(|| spawn.detail.clone())
+                        .unwrap_or_else(|| "no diagnostic".to_string());
+                    if spawn.code == Some(crate::adapters::CODE_UNAVAILABLE) {
+                        // The start row never ran: nothing was delivered.
+                        // The boundary stays undelivered for a bounded
+                        // same-nonce retry.
+                        return finish_mutation(
+                            shared,
+                            request,
+                            &key,
+                            "lane.start",
+                            false,
+                            null(),
+                            Some((
+                                crate::adapters::CODE_UNAVAILABLE,
+                                format!(
+                                    "the fresh successor start of session {:?} never ran \
+                                     ({}); nothing was spawned and the boundary stays \
+                                     undelivered for a bounded same-nonce retry",
+                                    successor_target.session, detail
+                                ),
+                            )),
+                        );
+                    }
+                    return park_successor(
+                        shared,
+                        request,
+                        &key,
+                        params,
+                        &format!(
+                            "the spawn of session {:?} did not confirm ({}); the delivery is \
+                             unknown and NO further spawn is attempted",
+                            successor_target.session, detail
+                        ),
+                        crate::state::successor_code::HELD,
+                        format!(
+                            "the successor start of session {:?} could not be confirmed \
+                             ({}); the record holds and external reconciliation is required",
+                            successor_target.session, detail
+                        ),
+                    );
+                }
+                spawn_evidence = object(vec![
+                    ("status", string(spawn.status)),
+                    ("bounded", bool_(true)),
+                    (
+                        "elapsed_ms",
+                        integer(spawn.elapsed_ms.min(i64::MAX as u64) as i64),
+                    ),
+                ]);
+                let marked = {
+                    let state = match shared.lock_state() {
+                        Ok(state) => state,
+                        Err(message) => {
+                            return err_response(&request.id, "state.unavailable", message);
+                        }
+                    };
+                    state
+                        .mark_lane_successor_delivered(
+                            &plan.record.replacement_id,
+                            &plan.nonce,
+                            &time::rfc3339_now(),
+                        )
+                        .map_err(|err| (err.code, err.message))
+                };
+                match marked {
+                    Ok(_) => {}
+                    Err((code, message)) => {
+                        return finish_mutation(
+                            shared,
+                            request,
+                            &key,
+                            "lane.start",
+                            false,
+                            null(),
+                            Some((code, message)),
+                        );
+                    }
+                }
+            }
+            // Adapter-observed verification: a spawned process alone is not
+            // ADOPTED.
+            let evidence = crate::adapters::successor_evidence(
+                &profile,
+                &successor_target,
+                &env,
+                crate::adapters::ADAPTER_TIMEOUT,
+            );
+            match evidence {
+                Ok(crate::adapters::SuccessorEvidence::Verified { process, readiness }) => {
+                    let reason = format!(
+                        "successor verified after one bounded spawn: fresh session {:?} \
+                         process {} role {:?} profile {}/{} cwd {:?} kickoff receipt echoed, \
+                         adapter-observed {readiness} (nonce {})",
+                        successor_target.session,
+                        process,
+                        successor_target.role,
+                        successor_target.profile_key,
+                        successor_target.profile_kind,
+                        successor_target.worktree,
+                        plan.nonce
+                    );
+                    let committed = {
+                        let state = match shared.lock_state() {
+                            Ok(state) => state,
+                            Err(message) => {
+                                return err_response(&request.id, "state.unavailable", message);
+                            }
+                        };
+                        state
+                            .commit_lane_successor_verified(
+                                &plan.record.replacement_id,
+                                &plan.nonce,
+                                &process,
+                                &readiness,
+                                &reason,
+                                &time::rfc3339_now(),
+                            )
+                            .map_err(|err| (err.code, err.message))
+                    };
+                    let (successor_row, record) = match committed {
+                        Ok(pair) => pair,
+                        Err((code, message)) => {
+                            return finish_mutation(
+                                shared,
+                                request,
+                                &key,
+                                "lane.start",
+                                false,
+                                null(),
+                                Some((code, message)),
+                            );
+                        }
+                    };
+                    let start = object(vec![
+                        (
+                            "successor",
+                            crate::state::lane_successor_val(&successor_row),
+                        ),
+                        ("replacement", crate::state::lane_replacement_val(&record)),
+                        (
+                            "verification",
+                            object(vec![
+                                ("session", string(&successor_target.session)),
+                                ("process", string(&process)),
+                                ("readiness", string(&readiness)),
+                                ("same_worktree", string(&successor_target.worktree)),
+                                ("observed_at", string(&time::rfc3339_now())),
+                            ]),
+                        ),
+                        ("spawn", spawn_evidence),
+                    ]);
+                    finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.start",
+                        true,
+                        object(vec![("start", start)]),
+                        None,
+                    )
+                }
+                Ok(crate::adapters::SuccessorEvidence::Held { detail }) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "lane.start",
+                    false,
+                    null(),
+                    Some((
+                        crate::state::successor_code::HELD,
+                        format!(
+                            "the successor of session {:?} is not yet verified ({}); the \
+                                 boundary holds and a bounded same-nonce retry can re-verify \
+                                 (nothing further is spawned blind)",
+                            successor_target.session, detail
+                        ),
+                    )),
+                ),
+                Ok(crate::adapters::SuccessorEvidence::Reused { detail }) => park_successor(
+                    shared,
+                    request,
+                    &key,
+                    params,
+                    &format!(
+                        "the successor verification observed a reused or wrong identity \
+                         ({}); no further spawn is attempted",
+                        detail
+                    ),
+                    crate::state::successor_code::REUSED,
+                    format!(
+                        "the successor start of session {:?} fails closed: the adapter \
+                         evidence contradicts the bound identity ({}); external \
+                         reconciliation is required",
+                        successor_target.session, detail
+                    ),
+                ),
+                Err(err) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "lane.start",
+                    false,
+                    null(),
+                    Some((
+                        crate::state::successor_code::HELD,
+                        format!(
+                            "the successor verification read-back failed ({}: {}); the \
+                             boundary holds and nothing further is spawned",
+                            err.code, err.message
+                        ),
+                    )),
+                ),
+            }
+        }
+        Intent::Replay { response } => replay(shared, &response),
+        Intent::Refused { code, message } => err_response(&request.id, code, message),
+    }
+}
+
+/// `lane.adopt`: verify and record ADOPTION of the committed successor
+/// (issue #76). The adoption re-queries the lane and compares the fresh
+/// result against the recorded handoff state before the `adopting` →
+/// `adopted` transition can commit:
+///
+/// - the committed successor is re-verified through the adapter read-back
+///   (a successor that is no longer observable holds; a reused identity
+///   fails closed) and the source absence is rechecked (both live/ambiguous
+///   blocks advancement);
+/// - worktree heads, dirty/untracked inventory, reports, gates and live
+///   children must match the recorded snapshot. ANY difference is the
+///   RECONCILIATION verdict: the record is parked for external
+///   reconciliation — never a blind replay, never a stale PASS reuse;
+/// - the transition, the adoption evidence and (for orchestrator
+///   replacements) the preserved worker/reviewer orchestration block commit
+///   in ONE transaction. PAUSED (`held`) between transitions prevents the
+///   activation: a booted successor stays fenced.
+fn method_lane_adopt(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "lane.adopt requires params: replacement_id, binding, observation, reobservation, \
+             harness",
+        );
+    };
+    let replacement_id = match required_str(Some(params), "replacement_id") {
+        Some(text) if crate::formats::is_replacement_id(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.adopt requires params.replacement_id (rp_ id)",
+            );
+        }
+    };
+    if !matches!(params.get("binding"), Some(Val::Obj(_))) {
+        return err_response(
+            &request.id,
+            crate::state::successor_code::BINDING,
+            "lane.adopt requires params.binding (object: generation, successor_id, session)",
+        );
+    }
+    for key in ["observation", "reobservation"] {
+        if !matches!(params.get(key), Some(Val::Obj(_))) {
+            return err_response(
+                &request.id,
+                crate::state::successor_code::BINDING,
+                format!("lane.adopt requires params.{key} (the fresh re-query of the lane)"),
+            );
+        }
+    }
+    let harness = match params.get("harness") {
+        Some(harness @ Val::Obj(_)) => harness,
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.adopt requires params.harness (object: key, kind[, executable, \
+                 capabilities])",
+            );
+        }
+    };
+    let profile = match retirement_profile(harness) {
+        Ok(profile) => profile,
+        Err((code, message)) => return err_response(&request.id, code, message),
+    };
+    if !profile.supports(crate::adapters::Op::Observe.capability()) {
+        return err_response(
+            &request.id,
+            crate::adapters::CODE_UNKNOWN_CAPABILITY,
+            format!(
+                "harness profile {:?} does not declare the {:?} capability that the adoption \
+                 path requires; unsupported adapters are refused",
+                profile.key,
+                crate::adapters::Op::Observe.capability()
+            ),
+        );
+    }
+    let target = format!("lane-adopt:{replacement_id}");
+    match journal_mutation(shared, request, "mutate.lane.adopt", &target) {
+        Intent::Claimed { key } => {
+            crash_point("lane-adopt.after-intent");
+            let bound = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                state
+                    .begin_lane_adoption(params)
+                    .map_err(|err| (err.code, err.message))
+            };
+            let plan = match bound {
+                Ok(plan) => plan,
+                Err((code, message)) => {
+                    return finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.adopt",
+                        false,
+                        null(),
+                        Some((code, message)),
+                    );
+                }
+            };
+            let env = crate::config::adapter_environment();
+            let successor_target = crate::adapters::SuccessorTarget {
+                session: plan.successor.session.clone(),
+                role: plan.successor.role.clone(),
+                profile_key: plan.successor.profile_key.clone(),
+                profile_kind: plan.successor.profile_kind.clone(),
+                worktree: plan.successor.worktree.clone(),
+                kickoff_receipt: plan.successor.kickoff_receipt.clone(),
+                source_process: plan.record.source_process.clone(),
+            };
+            // The committed successor must still verify: a booted successor
+            // that stopped answering holds; a reused identity fails closed.
+            match crate::adapters::successor_evidence(
+                &profile,
+                &successor_target,
+                &env,
+                crate::adapters::ADAPTER_TIMEOUT,
+            ) {
+                Ok(crate::adapters::SuccessorEvidence::Verified { .. }) => {}
+                Ok(crate::adapters::SuccessorEvidence::Held { detail }) => {
+                    return finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.adopt",
+                        false,
+                        null(),
+                        Some((
+                            crate::state::successor_code::HELD,
+                            format!(
+                                "the committed successor of session {:?} is not verifiable \
+                                 now ({}); the adoption holds and the successor stays fenced",
+                                successor_target.session, detail
+                            ),
+                        )),
+                    );
+                }
+                Ok(crate::adapters::SuccessorEvidence::Reused { detail }) => {
+                    return park_successor(
+                        shared,
+                        request,
+                        &key,
+                        params,
+                        &format!(
+                            "the adoption re-verification observed a reused or wrong identity \
+                             ({}); no effect is attempted against it",
+                            detail
+                        ),
+                        crate::state::successor_code::REUSED,
+                        format!(
+                            "the adoption of session {:?} fails closed: the adapter evidence \
+                             contradicts the committed successor identity ({}); external \
+                             reconciliation is required",
+                            successor_target.session, detail
+                        ),
+                    );
+                }
+                Err(err) => {
+                    return finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.adopt",
+                        false,
+                        null(),
+                        Some((
+                            crate::state::successor_code::HELD,
+                            format!(
+                                "the adoption re-verification read-back failed ({}: {}); the \
+                                 adoption holds",
+                                err.code, err.message
+                            ),
+                        )),
+                    );
+                }
+            }
+            // Source absence is rechecked: source and successor both
+            // live/ambiguous blocks advancement.
+            let source_target = crate::adapters::RetirementTarget {
+                session: plan.record.source_session.clone(),
+                process: plan.record.source_process.clone(),
+            };
+            match crate::adapters::retirement_evidence(
+                &profile,
+                &source_target,
+                plan.record.generation,
+                &env,
+                crate::adapters::ADAPTER_TIMEOUT,
+            ) {
+                Ok(crate::adapters::RetirementEvidence::Retired) => {}
+                Ok(crate::adapters::RetirementEvidence::Held { detail }) => {
+                    return finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.adopt",
+                        false,
+                        null(),
+                        Some((
+                            crate::state::successor_code::SOURCE_LIVE,
+                            format!(
+                                "the bound source session {:?} is still present or its \
+                                 absence cannot be proven ({}); source and successor must \
+                                 never both be live — the adoption is blocked",
+                                source_target.session, detail
+                            ),
+                        )),
+                    );
+                }
+                Ok(crate::adapters::RetirementEvidence::Reused { detail }) => {
+                    return finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.adopt",
+                        false,
+                        null(),
+                        Some((
+                            crate::state::retirement_code::REUSED,
+                            format!(
+                                "the adoption source recheck observed a reused identity for \
+                                 session {:?} ({}); the adoption is blocked",
+                                source_target.session, detail
+                            ),
+                        )),
+                    );
+                }
+                Err(err) => {
+                    let code = if err.code == crate::adapters::CODE_UNAVAILABLE {
+                        crate::adapters::CODE_UNAVAILABLE
+                    } else {
+                        crate::state::successor_code::SOURCE_LIVE
+                    };
+                    return finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.adopt",
+                        false,
+                        null(),
+                        Some((
+                            code,
+                            format!(
+                                "the adoption source recheck could not read session {:?} \
+                                 ({}: {}); the adoption is blocked",
+                                source_target.session, err.code, err.message
+                            ),
+                        )),
+                    );
+                }
+            }
+            // The fresh re-query is compared against the recorded handoff
+            // state: ANY difference is the reconciliation verdict.
+            if !plan.differences.is_empty() {
+                return park_successor(
+                    shared,
+                    request,
+                    &key,
+                    params,
+                    &format!(
+                        "the adoption re-query differs from the recorded handoff state in \
+                         {}; reconciliation is required (a blind replay or a stale PASS is \
+                         never adopted)",
+                        plan.differences.join(", ")
+                    ),
+                    crate::state::successor_code::DIFFERS,
+                    format!(
+                        "the adoption of session {:?} found {} different from the recorded \
+                         handoff state ({}); external reconciliation is required",
+                        successor_target.session,
+                        plan.differences.join(", "),
+                        plan.differences.join(", ")
+                    ),
+                );
+            }
+            let reason = format!(
+                "adopted successor {} (session {:?}, process {}) on the SAME worktree {:?}; \
+                 the fresh re-query matched the recorded handoff state and the source \
+                 absence was rechecked",
+                plan.successor.successor_id,
+                successor_target.session,
+                plan.successor.process,
+                plan.successor.worktree
+            );
+            let committed = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                state
+                    .commit_lane_adoption(
+                        &plan.record.replacement_id,
+                        plan.record.generation,
+                        &plan.successor.successor_id,
+                        &plan.successor.session,
+                        &plan.observation,
+                        &plan.differences,
+                        &reason,
+                        &time::rfc3339_now(),
+                    )
+                    .map_err(|err| (err.code, err.message))
+            };
+            let (successor_row, record) = match committed {
+                Ok(pair) => pair,
+                Err((code, message)) => {
+                    return finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.adopt",
+                        false,
+                        null(),
+                        Some((code, message)),
+                    );
+                }
+            };
+            let adoption = object(vec![
+                (
+                    "successor",
+                    crate::state::lane_successor_val(&successor_row),
+                ),
+                ("replacement", crate::state::lane_replacement_val(&record)),
+                (
+                    "adoption",
+                    object(vec![
+                        ("session", string(&successor_target.session)),
+                        ("successor_id", string(&plan.successor.successor_id)),
+                        ("worktree", string(&successor_target.worktree)),
+                        ("observation_digest", string(&successor_row.adoption_digest)),
+                        (
+                            "differences",
+                            Val::Arr(plan.differences.iter().map(|field| string(field)).collect()),
+                        ),
+                        ("observed_at", string(&time::rfc3339_now())),
+                    ]),
+                ),
+            ]);
+            finish_mutation(
+                shared,
+                request,
+                &key,
+                "lane.adopt",
+                true,
+                object(vec![("adoption", adoption)]),
+                None,
+            )
+        }
+        Intent::Replay { response } => replay(shared, &response),
+        Intent::Refused { code, message } => err_response(&request.id, code, message),
+    }
+}
+
+/// `lane.successor.consume`: consume recorded worker completions EXACTLY
+/// ONCE after adoption (issue #76 AC6). Every event must be a recorded
+/// pending completion of the replacement's orchestrator checkpoint and every
+/// worker a referenced worker lane; the consumption is recorded durably on
+/// the successor row atomically, so a restart replays the identical consumed
+/// set. A replayed request returns the recorded response and a second
+/// consumption of the same event refuses — a duplicate reviewer dispatch can
+/// never be produced. This path records; it never dispatches, spawns, or
+/// signals anything.
+fn method_lane_successor_consume(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "lane.successor.consume requires params: replacement_id, successor_id, \
+             completions",
+        );
+    };
+    let replacement_id = match required_str(Some(params), "replacement_id") {
+        Some(text) if crate::formats::is_replacement_id(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.successor.consume requires params.replacement_id (rp_ id)",
+            );
+        }
+    };
+    let successor_id = match required_str(Some(params), "successor_id") {
+        Some(text) if crate::formats::is_successor_id(text) => text.to_string(),
+        _ => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                "lane.successor.consume requires params.successor_id (su_ id)",
+            );
+        }
+    };
+    let completions = match params.get("completions") {
+        Some(Val::Arr(items)) => {
+            let mut pairs: Vec<(String, String)> = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                let event = item.get("event").and_then(Val::as_str);
+                let worker = item.get("worker").and_then(Val::as_str);
+                match (event, worker) {
+                    (Some(event), Some(worker)) => {
+                        pairs.push((event.to_string(), worker.to_string()));
+                    }
+                    _ => {
+                        return err_response(
+                            &request.id,
+                            crate::state::successor_code::EVENT,
+                            format!("completions[{index}] must be an object: {{event, worker}}"),
+                        );
+                    }
+                }
+            }
+            pairs
+        }
+        _ => {
+            return err_response(
+                &request.id,
+                crate::state::successor_code::EVENT,
+                "lane.successor.consume requires params.completions (array of {event, \
+                 worker})",
+            );
+        }
+    };
+    let target = format!("lane-successor:{replacement_id}");
+    match journal_mutation(shared, request, "mutate.lane.successor.consume", &target) {
+        Intent::Claimed { key } => {
+            crash_point("lane-successor.after-intent");
+            let consumed = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                state
+                    .consume_lane_successor_completions(
+                        &replacement_id,
+                        &successor_id,
+                        &completions,
+                        &time::rfc3339_now(),
+                    )
+                    .map_err(|err| (err.code, err.message))
+            };
+            match consumed {
+                Ok((successor_row, consumed_events)) => {
+                    let record = {
+                        let state = match shared.lock_state() {
+                            Ok(state) => state,
+                            Err(message) => {
+                                return err_response(&request.id, "state.unavailable", message);
+                            }
+                        };
+                        state.lane_replacement_by_id(&replacement_id)
+                    };
+                    let record = match record {
+                        Ok(Some(record)) => crate::state::lane_replacement_val(&record),
+                        _ => null(),
+                    };
+                    finish_mutation(
+                        shared,
+                        request,
+                        &key,
+                        "lane.successor.consume",
+                        true,
+                        object(vec![
+                            (
+                                "successor",
+                                crate::state::lane_successor_val(&successor_row),
+                            ),
+                            ("replacement", record),
+                            (
+                                "consumed",
+                                Val::Arr(
+                                    consumed_events.iter().map(|event| string(event)).collect(),
+                                ),
+                            ),
+                        ]),
+                        None,
+                    )
+                }
+                Err((code, message)) => finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "lane.successor.consume",
+                    false,
+                    null(),
+                    Some((code, message)),
+                ),
+            }
+        }
+        Intent::Replay { response } => replay(shared, &response),
+        Intent::Refused { code, message } => err_response(&request.id, code, message),
+    }
+}
+
+/// Park a successor record `ambiguous` after a start/adoption whose
+/// delivery or evidence is in doubt, then answer the typed refusal. The
+/// park is the explicit "external reconciliation required" outcome; no
+/// further spawn is ever attempted (never against a reused identity).
+fn park_successor(
+    shared: &Arc<Shared>,
+    request: &Request,
+    key: &str,
+    params: &Val,
+    park_reason: &str,
+    code: &'static str,
+    message: String,
+) -> String {
+    match shared.lock_state() {
+        Ok(state) => {
+            if let Err(err) =
+                state.mark_replacement_ambiguous(params, park_reason, &time::rfc3339_now())
+            {
+                shared.log.write(
+                    "error",
+                    "lane.successor.park_failed",
+                    &format!("{}: {}", err.code, err.message),
+                );
+                return err_response(&request.id, err.code, err.message);
+            }
+        }
+        Err(lock_message) => {
+            return err_response(&request.id, "state.unavailable", lock_message);
+        }
+    }
+    finish_mutation(
+        shared,
+        request,
+        key,
+        "lane.start",
+        false,
+        null(),
+        Some((code, message)),
+    )
+}
+
+/// The existing fan-out admission gate for one successor start (issue #9
+/// AC1, reused verbatim through `check_fanout_admission`). A missing or
+/// stale host-resource proof, a missing cap axis, an exhausted cap or a
+/// monorepo overlap is a typed hold: NOTHING is committed, NOTHING is
+/// spawned, admission is never disabled, and the bounded retry is an
+/// explicit new request.
+fn successor_admission(
+    params: &Val,
+    harness_key: &str,
+    worktree: &str,
+) -> Result<(), (&'static str, String)> {
+    use crate::lifecycle::{ConcurrencyCaps, HostProof, LaneFootprint};
+    let admission = match params.get("admission") {
+        Some(Val::Obj(map)) => map,
+        None => {
+            return Err((
+                crate::lifecycle::code::PROOF_MISSING,
+                "lane.start requires params.admission with caps and a fresh host-resource \
+                 proof (unknown measurements refuse new work); nothing was spawned and a \
+                 bounded retry needs a fresh request"
+                    .to_string(),
+            ));
+        }
+        Some(_) => {
+            return Err((
+                "refusal.malformed",
+                "lane.start params.admission must be an object".to_string(),
+            ));
+        }
+    };
+    let caps = match admission.get("caps") {
+        Some(Val::Obj(map)) => map,
+        _ => {
+            return Err((
+                crate::lifecycle::code::CAP_MISSING,
+                "lane.start admission requires caps {global, repository, harness}".to_string(),
+            ));
+        }
+    };
+    let cap = |key: &str| -> Option<usize> {
+        caps.get(key)
+            .and_then(Val::as_int)
+            .and_then(|value| usize::try_from(value).ok())
+    };
+    let (Some(global), Some(per_repository_cap), Some(harness)) =
+        (cap("global"), cap("repository"), cap("harness"))
+    else {
+        return Err((
+            crate::lifecycle::code::CAP_MISSING,
+            "lane.start admission requires caps {global, repository, harness}".to_string(),
+        ));
+    };
+    let host_proof = admission
+        .get("host_proof")
+        .and_then(|proof| proof.get("measured_at"))
+        .and_then(Val::as_str)
+        .and_then(crate::time::unix_from_rfc3339);
+    let Some(measured_at_unix) = host_proof else {
+        return Err((
+            crate::lifecycle::code::PROOF_MISSING,
+            "lane.start admission requires a fresh host-resource proof \
+             (host_proof.measured_at)"
+                .to_string(),
+        ));
+    };
+    let repository = match admission.get("repository").and_then(Val::as_str) {
+        Some(repository) if !repository.is_empty() => repository.to_string(),
+        _ => {
+            return Err((
+                crate::lifecycle::code::CAP_MISSING,
+                "lane.start admission requires the repository identity axis".to_string(),
+            ));
+        }
+    };
+    let mut running: Vec<LaneFootprint> = Vec::new();
+    if let Some(items) = admission.get("running").and_then(Val::as_array) {
+        for lane in items {
+            let (Some(lane_repository), Some(scope)) = (
+                lane.get("repository").and_then(Val::as_str),
+                lane.get("scope").and_then(Val::as_str),
+            ) else {
+                return Err((
+                    "refusal.malformed",
+                    "admission.running entries must be objects: {repository, harness_key, \
+                     scope}"
+                        .to_string(),
+                ));
+            };
+            running.push(LaneFootprint {
+                repository: lane_repository.to_string(),
+                harness_key: lane
+                    .get("harness_key")
+                    .and_then(Val::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                scope: scope.to_string(),
+            });
+        }
+    }
+    let caps = ConcurrencyCaps {
+        global,
+        per_repository: per_repository_cap,
+        per_harness: harness,
+    };
+    let proposed = LaneFootprint {
+        repository,
+        harness_key: harness_key.to_string(),
+        scope: worktree.to_string(),
+    };
+    crate::lifecycle::check_fanout_admission(
+        &proposed,
+        &running,
+        &caps,
+        Some(HostProof { measured_at_unix }),
+        time::unix_now(),
+    )
+    .map_err(|err| {
+        (
+            err.code,
+            format!(
+                "{}; nothing was spawned and the record is untouched (a bounded explicit \
+                 retry stays legal)",
+                err.message
+            ),
+        )
+    })
 }
 
 fn method_journal_tail(shared: &Arc<Shared>, request: &Request) -> String {
@@ -4313,6 +5535,18 @@ fn reconcile_claims(
                 {
                     reconcile_lane_retire(state, log, params)?;
                 }
+                // Issue #76: an interrupted `lane.start` claim reconciles
+                // the startup nonce AND the process evidence before any
+                // retry: the committed (or observed) successor identity is
+                // re-read from the backend. Verified evidence completes the
+                // `starting` -> `adopting` boundary; every other outcome
+                // parks the record ambiguous and never re-spawns.
+                if claim.method == "lane.start"
+                    && let Ok(doc) = Val::parse_json(&claim.request_line)
+                    && let Some(params) = doc.get("params")
+                {
+                    reconcile_lane_successor(state, log, params)?;
+                }
             }
             Err(err) => {
                 return Err(daemon_error(
@@ -4646,10 +5880,207 @@ fn reconcile_lane_retire(state: &State, log: &DaemonLog, params: &Val) -> Result
     }
 }
 
+/// Restart reconciliation for one interrupted `lane.start` claim (issue #76
+/// AC7). The startup nonce AND the process evidence are reconciled BEFORE
+/// any retry:
+///
+/// - the successor row is the commit marker (the row and the
+///   `retired` → `starting` boundary commit in ONE transaction BEFORE any
+///   spawn), so a present row means a spawn MAY have been issued. The
+///   claim's nonce must own the row; a mismatch parks `ambiguous`.
+/// - the committed successor is re-read from the backend
+///   (`session show <session> --json`): verified evidence completes the
+///   `starting` → `adopting` boundary with a reconciled summary; every
+///   other outcome (not verifiable, reused identity, unreadable read-back)
+///   parks the record `ambiguous`. The spawn is NEVER repeated.
+/// - a row-absent claim never issued a spawn; the record is parked
+///   `ambiguous` — external reconciliation is required before any retry,
+///   so a replayed start can never duplicate a successor.
+///
+/// A record that already committed its successor boundary (phase `adopting`
+/// or `adopted`) needs no reconciliation at all.
+fn reconcile_lane_successor(
+    state: &State,
+    log: &DaemonLog,
+    params: &Val,
+) -> Result<(), DaemonError> {
+    let Some(replacement_id) = params
+        .get("replacement_id")
+        .and_then(Val::as_str)
+        .filter(|text| crate::formats::is_replacement_id(text))
+    else {
+        return Ok(());
+    };
+    let row = state
+        .lane_replacement_by_id(replacement_id)
+        .map_err(|err| {
+            daemon_error(
+                "daemon.reconcile",
+                format!("successor reconciliation: {}: {}", err.code, err.message),
+            )
+        })?;
+    let Some(record) = row else {
+        return Ok(());
+    };
+    if record.phase == "adopting" || record.phase == "adopted" {
+        log.write(
+            "info",
+            "reconcile.lane.start",
+            &format!(
+                "replacement {replacement_id} committed its successor boundary before the \
+                 interrupt (phase {}); no spawn was repeated",
+                record.phase
+            ),
+        );
+        return Ok(());
+    }
+    if record.phase != "starting" || record.outcome != "pending" {
+        log.write(
+            "info",
+            "reconcile.lane.start",
+            &format!(
+                "replacement {replacement_id} is at {}/{}; the interrupted start claim needs \
+                 no successor reconciliation",
+                record.phase, record.outcome
+            ),
+        );
+        return Ok(());
+    }
+    let park = |reason: String| -> Result<(), DaemonError> {
+        state
+            .mark_replacement_ambiguous(params, &reason, &time::rfc3339_now())
+            .map_err(|err| {
+                daemon_error(
+                    "daemon.reconcile",
+                    format!("successor reconciliation: {}: {}", err.code, err.message),
+                )
+            })?;
+        log.write("warn", "reconcile.lane.start", &reason);
+        Ok(())
+    };
+    let nonce = params
+        .get("binding")
+        .and_then(|binding| binding.get("nonce"))
+        .and_then(Val::as_str)
+        .unwrap_or("")
+        .to_string();
+    let successor = state
+        .lane_successor_by_replacement(replacement_id)
+        .map_err(|err| {
+            daemon_error(
+                "daemon.reconcile",
+                format!("successor reconciliation: {}: {}", err.code, err.message),
+            )
+        })?;
+    let Some(successor) = successor else {
+        // No row = the boundary never committed = no spawn was ever
+        // issued. Fail closed anyway: an explicit external reconciliation
+        // is required before any retry, so a replayed start can never
+        // duplicate a successor.
+        return park(format!(
+            "interrupted successor start of {replacement_id} (nonce {nonce:?}) never committed \
+             its successor boundary; no spawn is repeated and external reconciliation is \
+             required before any retry"
+        ));
+    };
+    if successor.nonce != nonce {
+        return park(format!(
+            "interrupted successor start of {replacement_id} carries nonce {nonce:?} but the \
+             committed successor {} is owned by another startup nonce; external reconciliation \
+             is required",
+            successor.successor_id
+        ));
+    }
+    let Some(harness) = params.get("harness") else {
+        return park(format!(
+            "interrupted successor start of {replacement_id} carries no harness binding; the \
+             record is parked ambiguous (no spawn was repeated)"
+        ));
+    };
+    let profile = match retirement_profile(harness) {
+        Ok(profile) => profile,
+        Err((code, message)) => {
+            return park(format!(
+                "interrupted successor start of {replacement_id} cannot rebuild its harness \
+                 profile ({code}: {message}); the record is parked ambiguous (no spawn was \
+                 repeated)"
+            ));
+        }
+    };
+    let target = crate::adapters::SuccessorTarget {
+        session: successor.session.clone(),
+        role: successor.role.clone(),
+        profile_key: successor.profile_key.clone(),
+        profile_kind: successor.profile_kind.clone(),
+        worktree: successor.worktree.clone(),
+        kickoff_receipt: successor.kickoff_receipt.clone(),
+        source_process: record.source_process.clone(),
+    };
+    let env = crate::config::adapter_environment();
+    match crate::adapters::successor_evidence(
+        &profile,
+        &target,
+        &env,
+        crate::adapters::ADAPTER_TIMEOUT,
+    ) {
+        Ok(crate::adapters::SuccessorEvidence::Verified { process, readiness }) => {
+            let reason = format!(
+                "reconciled after an interrupted start: the adapter observed the committed \
+                 successor {} process {} ({readiness}) with the bound identity, the SAME \
+                 worktree and the echoed kickoff receipt (nonce {nonce})",
+                successor.successor_id, process
+            );
+            match state.commit_lane_successor_verified(
+                replacement_id,
+                &nonce,
+                &process,
+                &readiness,
+                &reason,
+                &time::rfc3339_now(),
+            ) {
+                Ok(_) => {
+                    log.write(
+                        "info",
+                        "reconcile.lane.start",
+                        &format!(
+                            "interrupted successor start of {replacement_id} reconciled: the \
+                             committed successor {} is verified and the `starting` -> \
+                             `adopting` boundary completed (no spawn was repeated)",
+                            successor.successor_id
+                        ),
+                    );
+                    Ok(())
+                }
+                Err(err) => park(format!(
+                    "interrupted successor start of {replacement_id} verified the committed \
+                     successor but the boundary could not commit ({}: {}); the record is \
+                     parked ambiguous (no spawn was repeated)",
+                    err.code, err.message
+                )),
+            }
+        }
+        Ok(crate::adapters::SuccessorEvidence::Held { detail }) => park(format!(
+            "interrupted successor start of {replacement_id} cannot verify the committed \
+             successor {} ({detail}); the record is parked ambiguous and no spawn was repeated",
+            successor.successor_id
+        )),
+        Ok(crate::adapters::SuccessorEvidence::Reused { detail }) => park(format!(
+            "interrupted successor start of {replacement_id} observed a reused or wrong \
+             identity for the committed successor {} ({detail}); the record is parked \
+             ambiguous and no spawn was repeated against it",
+            successor.successor_id
+        )),
+        Err(err) => park(format!(
+            "interrupted successor start of {replacement_id} could not read the successor \
+             evidence ({}: {}); the record is parked ambiguous and no spawn was repeated",
+            err.code, err.message
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Crash-point injection (debug builds only; release ignores the env var)
 // ---------------------------------------------------------------------------
-
 /// Abort the daemon at a named journal boundary. Honored only when
 /// `cfg!(debug_assertions)` — release binaries never crash from this hook.
 fn crash_point(point: &str) {

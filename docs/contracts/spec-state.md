@@ -219,6 +219,70 @@ to journal fails closed — the mutation does not start.
   record `ambiguous`. The stop is issued at most once: reconciliation never
   repeats a signal, and never against a reused identity.
 
+## Successor additions (issue #76)
+
+- **The successor boundary**: `begin_lane_successor` validates one start
+  request (`replacement_id`, `binding` = {generation, checkpoint_digest,
+  nonce}, `successor` = {session, kickoff_receipt}, `harness`, `admission`)
+  and commits exactly ONE durable succession row (`lane_successors`,
+  m0007/schema v7, `UNIQUE (replacement_id)`) BEFORE any spawn. The
+  successor id is deterministic (`su_` + the first 16 hex of sha256 over
+  `hf-lane-successor/v1|<replacement_id>`), so a crash-then-retry, a restart
+  and a bounded same-nonce retry all address the identical successor. A
+  record that has not retired refuses `refusal.replacement.order`; a record
+  left ambiguous or cancelled refuses `refusal.replacement.ambiguous` /
+  `refusal.replacement.invalidated`; a held record refuses
+  `refusal.replacement.held`. A committed boundary owned by another nonce
+  refuses `refusal.successor.nonce` (one generation/nonce owns startup and a
+  second nonce can never take over a started successor), a mismatched
+  bound session refuses `refusal.successor.binding`, and any start after the
+  boundary committed refuses `refusal.successor.exists` (the adoption path
+  continues it). A missing committed checkpoint or a changed checkpoint
+  digest refuses `refusal.successor.binding` and nothing is invoked.
+- **Bounded startup, fresh by construction**: the start rechecks the source
+  absence first (a live or unreadable source refuses
+  `refusal.successor.source_live`; an unresolvable workspace executable
+  refuses `refusal.unavailable.harness`), then starts the successor session
+  over the workspace (Herdr) adapter row (`session start <session> --json`)
+  on the SAME logical lane and the record's worktree, and verifies the
+  successor from a fresh read-back — a booted process alone is never a
+  usable successor (`refusal.successor.held`), and a session or process
+  identity that is already owned refuses `refusal.successor.reused`. A
+  refused spawn leaves the committed boundary `delivery` = `none` for a
+  bounded same-nonce retry (the attempt counter refuses
+  `refusal.successor.attempts` when exhausted; a delivered successor
+  re-verifies instead of spawning again). Admission failures are the
+  lifecycle codes (`refusal.admission.proof_missing` / `proof_stale` /
+  `cap_missing` / `cap_global` / `cap_repository` / `cap_harness` /
+  `monorepo_overlap`) and hold with no child and no state change.
+- **Adoption**: `commit_lane_adoption` requires the fresh `observation` and
+  `reobservation` of the lane to be canonically identical
+  (`refusal.successor.binding` otherwise), compares the fresh observation
+  against the DURABLE checkpoint snapshot (head/base/dirty/untracked/report
+  scalars plus the sorted gates and children pairs) and refuses with
+  `refusal.successor.differs` naming the differing fields — the recorded
+  state is never replayed as success and reconciliation is required. The
+  record's `starting` → `adopting` … `adopted` transitions commit
+  atomically with their history row (the phase transition is the commit
+  marker) and the adoption evidence is digest-bound. A successor that is
+  not verifiably usable refuses `refusal.successor.held`; a verify failure
+  contradicted by a process-only observation parks the record `ambiguous`.
+- **Identity and completions**: the successor continues the retired
+  session's role and the record's role/worktree, and the orchestrator's
+  worker/reviewer references and pending completion events stay the
+  record's. `lane.successor.consume` records the consumption at most once
+  (`consumed_at`, `consumer`, `consumed_events`) and refuses a second
+  consumption (`refusal.successor.event_consumed`), an event that is not a
+  recorded pending completion of the replacement or a worker that is not a
+  referenced lane (`refusal.successor.event`), and a successor that has not
+  adopted (`refusal.replacement.order`).
+- **Restart reconciliation**: an interrupted `lane.start` claim is
+  reconciled by reading the successor back (the committed boundary is the
+  commit marker) — a verifiable successor completes the boundary, every
+  other read-back parks the record `ambiguous` and refuses the retry until
+  reconciliation resolves it, so a restart never spawns twice and never
+  silently writes off the boundary.
+
 ## Fixture map
 
 Accept: `migration.valid.json` (0→1, checksummed), `audit.valid.jsonl`
