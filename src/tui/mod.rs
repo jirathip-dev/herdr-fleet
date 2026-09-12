@@ -22,6 +22,7 @@
 
 pub mod board;
 pub mod live;
+pub mod operator;
 pub mod session;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
