@@ -31,6 +31,7 @@ use crate::observe::{
 };
 use crate::plan::{DOCTRINE_WORKFLOW_ID, PlanInput, render_plan};
 use crate::service::{self, LAUNCHD_LABEL, SYSTEMD_UNIT_NAME};
+use crate::state::{Retention, State};
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// Top-level usage text (also the `--help` output body).
@@ -53,6 +54,7 @@ USAGE:
     canter status [--config PATH] [--json]
     canter plan <repository> <issue> [--revision HEX40] [--config PATH] [--json]
     canter capabilities [--json]
+    canter board [--config PATH]
     canter daemon run [--socket PATH] [--config PATH]
     canter daemon status [--config PATH] [--json]
     canter lane preview --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY] [--socket PATH] [--config PATH] [--json]
@@ -77,6 +79,7 @@ COMMANDS:
     status           Observe configured repositories (read-only, bounded).
     plan             Render a deterministic read-only hf-plan/v1 plan.
     capabilities     Report the CLI's declared forge read capabilities.
+    board            Render the read-only operator board in this terminal.
     daemon           Run or probe the single-writer state daemon.
     lane             Preview, request, or inspect ONE explicit lane handoff
                      (preview/status are read-only; request records intent).
@@ -400,6 +403,7 @@ pub fn parse_invocation(args: &[String]) -> Result<Invocation, ParseError> {
         "doctor" => parse_flag_command("doctor", &rest),
         "status" => parse_flag_command("status", &rest),
         "capabilities" => parse_flag_command("capabilities", &rest),
+        "board" => parse_board(&rest),
         "plan" => parse_plan(&rest),
         "daemon" => parse_daemon(&rest),
         "service" => parse_service(&rest),
@@ -447,12 +451,60 @@ fn parse_flag_command(name: &str, args: &[&String]) -> Result<Invocation, ParseE
     })
 }
 
+/// `board`: the interactive operator surface (`--config PATH` only).
+///
+/// `board` renders into the invoking terminal, so it deliberately accepts no
+/// `--json`: the refusal is typed at parse time, and a malformed invocation
+/// touches nothing (no config, no state store, no terminal). `--config` is
+/// honoured because a configured `daemon.socket` is what lets the daemon
+/// paths be derived on hosts without `XDG_RUNTIME_DIR` — the board reads the
+/// same state store the daemon writes.
+fn parse_board(args: &[&String]) -> Result<Invocation, ParseError> {
+    let mut config_path: Option<PathBuf> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    ParseError::Usage("board: --config requires a path argument".to_string())
+                })?;
+                config_path = Some(PathBuf::from(value));
+            }
+            "-h" | "--help" => return Err(ParseError::Help(help_request("board"))),
+            "--json" => {
+                return Err(ParseError::Usage(
+                    "board: this command is an interactive terminal surface and does not accept --json"
+                        .to_string(),
+                ));
+            }
+            other => {
+                return Err(ParseError::Usage(format!(
+                    "board: unexpected argument {other:?}; run `canter board --help`"
+                )));
+            }
+        }
+        index += 1;
+    }
+    Ok(Invocation {
+        command: "board".to_string(),
+        json: false,
+        config_path,
+        plan: None,
+        config_action: None,
+        daemon_action: None,
+        service_action: None,
+        lane_action: None,
+    })
+}
+
 /// Per-command help texts.
 fn help_request(name: &str) -> String {
     match name {
         "doctor" => DOCTOR_USAGE.trim_end().to_string(),
         "status" => STATUS_USAGE.trim_end().to_string(),
         "capabilities" => CAPABILITIES_USAGE.trim_end().to_string(),
+        "board" => BOARD_USAGE.trim_end().to_string(),
         "plan" => PLAN_USAGE.trim_end().to_string(),
         "config" => CONFIG_USAGE.trim_end().to_string(),
         "daemon" => DAEMON_USAGE.trim_end().to_string(),
@@ -499,6 +551,27 @@ USAGE:
 Emits the hf-capability/v1 declaration for this read-only CLI: axis
 \"forge\", actor \"canter\", capabilities [\"read_refs\", \"read_issues\",
 \"read_checks\"]. No negotiation or shell guessing is performed.
+";
+
+const BOARD_USAGE: &str = "\
+canter board — render the read-only operator board in this terminal
+
+USAGE:
+    canter board [--config PATH]
+
+Renders the live board from the recorded work items and runs of the daemon
+state store (the bounded read model, no second database): wide four-group
+board, narrow single-group view, explicit too-small state, and keyboard-only
+controls (Tab focus, Up/Down select, Left/Right group, q quit). Terminal-
+default colours with an ANSI/monochrome fallback; freshness and completeness
+are shown as recorded, and a failed read is stated explicitly instead of
+guessed. Synthetic mode is a separate, explicitly labelled mode.
+
+The board never writes, never contacts the network, and does not require a
+running daemon: it reads the state store the daemon writes. `--config` is
+honoured for the daemon path derivation (a configured daemon.socket removes
+the XDG_RUNTIME_DIR requirement). This command is an interactive terminal
+surface and does not accept --json.
 ";
 
 const PLAN_USAGE: &str = "\
@@ -1473,6 +1546,7 @@ pub fn execute(invocation: &Invocation) -> CmdResult {
         "doctor" => execute_doctor(invocation),
         "status" => execute_status(invocation),
         "capabilities" => execute_capabilities(invocation),
+        "board" => execute_board(invocation),
         other => error_result(
             2,
             "usage.error",
@@ -1953,6 +2027,61 @@ fn execute_capabilities(_invocation: &Invocation) -> CmdResult {
         data,
         "canter forge capabilities: read_refs read_issues read_checks\n".to_string(),
     )
+}
+
+/// `board`: render the live operator board over the daemon state store.
+///
+/// Read-only by construction: the board reads the bounded read model (a pure
+/// projection over the state store, no second database, no per-row remote
+/// request) and the surface only changes local selection/focus. A state
+/// store that does not exist is reported typed — this command never creates
+/// one — and a terminal failure is reported as the session error it is.
+fn execute_board(invocation: &Invocation) -> CmdResult {
+    let config = match load_optional_config(invocation) {
+        Ok(config) => config,
+        Err(result) => return result,
+    };
+    // The socket override only affects the runtime root; passing the
+    // configured one keeps the derivation identical to the daemon's on hosts
+    // without an XDG runtime dir (the state store path is the same either
+    // way — the board reads the store, it never touches the socket).
+    let socket = effective_socket(None, config.as_ref());
+    let paths = match derive_paths(socket) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    if !paths.db_path.exists() {
+        return error_result(
+            1,
+            "board.no_state",
+            format!(
+                "no daemon state store at {}; run `canter daemon run` first (the board only reads recorded runs)",
+                paths.db_path.display()
+            ),
+            false,
+        );
+    }
+    let state = match State::open(&paths.db_path, Retention::default()) {
+        Ok(state) => state,
+        Err(err) => {
+            return error_result(
+                1,
+                err.code,
+                format!("board: state store unavailable: {}", err.message),
+                false,
+            );
+        }
+    };
+    let board = crate::tui::live::LiveBoard::new(&state);
+    match crate::tui::session::run(&board) {
+        Ok(()) => ok_result(object(vec![]), String::new()),
+        Err(err) => error_result(
+            1,
+            "board.session",
+            format!("board: terminal session failed: {err}"),
+            false,
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3764,6 +3893,7 @@ fn per_command_usage(command: &str) -> &'static str {
             "usage: canter plan <repository> <issue> [--revision HEX40] [--config PATH] [--json]"
         }
         "capabilities" => "usage: canter capabilities [--json]",
+        "board" => "usage: canter board [--config PATH]",
         "daemon" => {
             "usage: canter daemon run [--socket PATH] [--config PATH]\n       canter daemon status [--config PATH] [--json]"
         }
@@ -3883,6 +4013,31 @@ mod tests {
     fn unknown_flags_are_usage_errors() {
         assert!(parse_invocation(&["status".to_string(), "--spawn".to_string()]).is_err());
         assert!(parse_invocation(&["doctor".to_string(), "extra".to_string()]).is_err());
+    }
+
+    #[test]
+    fn board_parses_config_and_refuses_json_and_positionals() {
+        // The interactive surface takes `--config PATH` only: a malformed
+        // invocation is a typed usage error and never reaches the state
+        // store or the terminal.
+        let board = invocation(&["board", "--config", "canter.toml"]);
+        assert_eq!(board.command, "board");
+        assert!(!board.json);
+        assert_eq!(
+            board.config_path.as_deref(),
+            Some(std::path::Path::new("canter.toml"))
+        );
+        for args in [
+            vec!["board", "--json"],
+            vec!["board", "extra"],
+            vec!["board", "--config"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert!(
+                parse_invocation(&owned).is_err(),
+                "expected a typed refusal for {args:?}"
+            );
+        }
     }
 
     #[test]

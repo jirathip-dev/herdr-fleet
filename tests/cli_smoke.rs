@@ -118,6 +118,7 @@ fn every_documented_command_has_working_help() {
         "lane status",
         "queue submit",
         "queue status",
+        "board",
     ] {
         assert!(usage.contains(command), "USAGE must document `{command}`");
     }
@@ -128,12 +129,46 @@ fn every_documented_command_has_working_help() {
         &["plan", "--help"][..],
         &["capabilities", "--help"][..],
         &["queue", "--help"][..],
+        &["board", "--help"][..],
     ] {
         let out = run(args);
         assert!(out.status.success(), "{args:?} --help should exit 0");
         assert!(
             stdout_of(&out).contains("USAGE"),
             "{args:?} --help should print usage"
+        );
+    }
+}
+
+#[test]
+fn board_is_refused_typed_before_anything_is_touched() {
+    // `board` is an interactive terminal surface: it never accepts --json and
+    // never reaches the state store or the terminal on a malformed
+    // invocation (the refusal is a typed usage error, exit 2).
+    let out = run(&["board", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty(), "stdout stays empty");
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("board") && stderr.contains("--json"),
+        "the refusal must name the command and the flag: {stderr}"
+    );
+
+    for args in [
+        &["board", "--frobnicate"][..],
+        &["board", "extra"][..],
+        &["board", "--config"][..],
+    ] {
+        let out = run(args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?} should be a usage error"
+        );
+        assert!(out.stdout.is_empty(), "{args:?}: stdout stays empty");
+        assert!(
+            stderr_of(&out).contains("board"),
+            "{args:?}: the usage error must name the command"
         );
     }
 }
