@@ -14,9 +14,21 @@ yanked = "deny"
 [licenses]
 # Public repository: allow only permissive, OSI-approved licenses. Any
 # license outside this allowlist fails the check (deny-by-default).
+#
+# Ratatui operator surface (slice #90, Refs #90/#83): the mandatory
+# ratatui/crossterm closure cannot satisfy the two-license core allowlist —
+# unicode-ident (every proc-macro stack, incl. syn/proc-macro2 used by
+# ratatui's strum/derive_more/darling chain) carries a Unicode-3.0 clause,
+# and foldhash (the default hasher of the hashbrown 0.16 pinned by
+# ratatui-core's layout engine kasuari) is Zlib. Both are permissive,
+# OSI-approved licenses; they are required by the closure and cannot be
+# version-pinned away without downgrading shared crates, so they are
+# allowed explicitly here and nowhere wider.
 allow = [
     "Apache-2.0",
     "MIT",
+    "Unicode-3.0",
+    "Zlib",
 ]
 confidence-threshold = 0.8
 
@@ -26,7 +38,20 @@ ignore = false
 
 [bans]
 # A crate may appear only once (per semver-compatible version) in the tree.
+#
+# Ratatui operator surface (slice #90, Refs #90/#83): two semver-
+# incompatible requirement splits are unavoidable inside the ratatui/
+# crossterm closure — kasuari (ratatui-core's layout engine) pins
+# hashbrown 0.16 while the rest of the graph (indexmap/ratatui-core)
+# resolves 0.17, and the proc-macro stack splits syn 2 (strum_macros,
+# derive_more-impl) from syn 3 (darling, thiserror-impl). No single version
+# satisfies either pair. Skipped here at EXACT versions; any other
+# duplicate anywhere in the tree still fails.
 multiple-versions = "deny"
+skip = [
+    { name = "hashbrown", version = "=0.16.1" },
+    { name = "syn", version = "=2.0.119" },
+]
 wildcards = "deny"
 highlight = "all"
 
