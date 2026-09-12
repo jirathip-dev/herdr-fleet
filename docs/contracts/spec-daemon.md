@@ -31,7 +31,10 @@ remain usable without it; SQLite owns state; no network control API).
   `lane.checkpoint.create`, `lane.checkpoint.status`, `lane.retire`,
   `lane.start`, `lane.adopt`, `lane.successor.consume`,
   `state.epoch`, `backup.create`, `restore.begin`, `journal.tail`,
-  `events.subscribe`
+  `events.subscribe` (issue #77 adds no method: the target-profile plan
+  travels as an optional `params.profile` on `lane.replacement.request` and
+  `lane.start`, and returns on `lane.replacement.status` /
+  `lane.start` / `lane.adopt`)
   (issues #5/#9/#73/#74/#75 add the event stream, the lifecycle methods, the
   request-only lane replacement surface, the safe-boundary checkpoint
   surface, and the guarded single-session retirement over the socket; the
@@ -283,6 +286,23 @@ journals through the same claim machinery as every other mutation
 (`params.idempotency_key` required; a retry with the same key replays the
 recorded outcome and never repeats the spawn).
 
+- `lane.start` optionally requires `params.profile` when the record was
+  requested under an explicit profile-configuration revision (issue #77):
+  the SAME canonical `hf-profile-binding/v1` plan, validated and
+  revision-checked. A changed revision refuses `refusal.profile.revision`
+  (the configuration or a declared credential moved after the preview — a
+  newly reviewed plan is required), a missing or unexpected binding refuses
+  `refusal.profile.binding`, and the start must run the profile the plan
+  names. The successor read-back is verified against the plan: the intended
+  pair verifies, an AUTHORIZED fallback is accepted and reported
+  distinctly, an unexpected provider/model is fenced
+  (`refusal.successor.reused`, parked for reconciliation), a profile that
+  declares binding introspection but returns none holds
+  (`refusal.successor.held`, an honest capability hold), and a profile
+  without introspection evidence records the actual binding as `unknown` —
+  never a copy of the requested configuration. The verification result
+  carries `binding` = {status, revision, introspection, intended, actual,
+  source, configured_limits}.
 - `lane.start` requires `params.replacement_id`, `params.binding`
   (object: `generation`, `checkpoint_digest`, `nonce`), `params.successor`
   (object: `session`, `kickoff_receipt`), `params.harness` and
@@ -309,6 +329,9 @@ recorded outcome and never repeats the spawn).
   `params.successor.kickoff_receipt` is the closed kickoff binding: a
   64-hex digest of the kickoff receipt that the adapter read-back must
   echo, or the start refuses.
+- `lane.adopt` re-verifies the committed successor against the SAME durable
+  plan the start was fenced on (the profile binding is part of the adoption
+  evidence, issue #77).
 - `lane.adopt` requires `params.replacement_id`, `params.binding`
   (object: `generation`, `successor_id`, `session`), `params.observation`
   and `params.reobservation` (the fresh re-query, canonically identical or
@@ -327,6 +350,12 @@ recorded outcome and never repeats the spawn).
   (`refusal.successor.event_consumed`), an unknown/not-pending event
   (`refusal.successor.event`) or a successor that has not adopted
   (`refusal.replacement.order`).
+- `lane.replacement.request` accepts the optional `params.profile`
+  (`hf-profile-binding/v1`); a present document is validated with its
+  revision recomputed (`refusal.profile.binding` /
+  `refusal.profile.revision`) and committed with the record in ONE
+  transaction; `lane.replacement.status` returns the bound `profile` (the
+  canonical plan) or null.
 - Restart reconciliation: an interrupted `lane.start`/`lane.adopt` claim is
   reconciled against the successor read-back BEFORE any retry — a
   verifiable successor completes the boundary, every other read-back parks

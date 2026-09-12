@@ -88,6 +88,21 @@ def run_discrimination(probe) -> None:
     _check(code == probe.ACCEPT,
            "config harness provider/model pair must be accepted, got " + code)
 
+    # 1c. Config profile-planning keys (issue #77): shape rules bite in the
+    #     document validator; a non-boolean introspection flag, a non-scalar
+    #     limit value and a non-array fallback list are refused.
+    for label, extra in (
+        ("non-boolean introspection", b'binding_introspection = 5'),
+        ("non-scalar limit", b'limits = { context = [1] }'),
+        ("non-array fallback", b'fallback = "example-provider/example-model"'),
+    ):
+        p = _tamper_copy("config/config.valid.toml",
+                         lambda b, extra=extra: b.replace(b'env_allow = ["PATH", "HOME"]',
+                                                          b'env_allow = ["PATH", "HOME"]\n' + extra))
+        code, _msg = probe.validate_file(p, "hf-config")
+        _check(code == probe.REFUSE_MALFORMED,
+               "config harness {} must refuse-malformed, got {}".format(label, code))
+
     # 2. Policy: overlay may only tighten.
     p = _tamper_copy("policy/policy.valid.toml",
                      lambda b: b.replace(b'production_confirmation = "tty"',

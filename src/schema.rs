@@ -598,7 +598,17 @@ fn validate_config(obj: &Val) -> Verdict {
             if let Err(verdict) = require_keys(
                 entry,
                 &["kind", "executable", "env_allow"],
-                &["kind", "executable", "env_allow", "provider", "model"],
+                &[
+                    "kind",
+                    "executable",
+                    "env_allow",
+                    "provider",
+                    "model",
+                    "fallback",
+                    "secret_env",
+                    "limits",
+                    "binding_introspection",
+                ],
                 &where_,
             ) {
                 return verdict;
@@ -613,6 +623,54 @@ fn validate_config(obj: &Val) -> Verdict {
                 return verdict;
             }
             if let Err(verdict) = expect_str(entry, "model", &where_, None) {
+                return verdict;
+            }
+            // Issue #77 profile-planning keys: shape only (the decoder in
+            // config.rs validates the bare-token/allowlist semantics).
+            for key in ["fallback", "secret_env"] {
+                match entry.get(key) {
+                    None => {}
+                    Some(Val::Arr(items)) => {
+                        for item in items {
+                            if !matches!(item, Val::Str(_)) {
+                                return Verdict::refuse(
+                                    Refusal::Malformed,
+                                    format!("{where_}.{key} must be a [string]"),
+                                );
+                            }
+                        }
+                    }
+                    Some(other) => {
+                        return Verdict::refuse(
+                            Refusal::Malformed,
+                            format!(
+                                "{where_}.{key} must be an array of strings, got {}",
+                                other.type_name()
+                            ),
+                        );
+                    }
+                }
+            }
+            if let Some(limits) = entry.get("limits") {
+                let Val::Obj(limits) = limits else {
+                    return Verdict::refuse(
+                        Refusal::Malformed,
+                        format!("{where_}.limits must be a table of scalar values"),
+                    );
+                };
+                for (name, value) in limits {
+                    if !matches!(value, Val::Str(_) | Val::Int(_)) {
+                        return Verdict::refuse(
+                            Refusal::Malformed,
+                            format!(
+                                "{where_}.limits.{name} must be a string or integer, got {}",
+                                value.type_name()
+                            ),
+                        );
+                    }
+                }
+            }
+            if let Err(verdict) = expect_bool(entry, "binding_introspection", &where_) {
                 return verdict;
             }
             match entry.get("env_allow") {

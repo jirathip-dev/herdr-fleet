@@ -221,6 +221,30 @@ to journal fails closed — the mutation does not start.
 
 ## Successor additions (issue #76)
 
+## Replacement profile plans (issue #77)
+
+- **The bound plan**: `lane_replacement_profiles` (m0008/schema v8, `PRIMARY
+  KEY (replacement_id)`) stores one canonical `hf-profile-binding/v1`
+  document plus its 64-hex configuration revision, written in the SAME
+  transaction as the replacement record — a replacement is either bound
+  from birth or unbound, and an unbound record has no row at all (never a
+  placeholder plan). The stored document is re-validated on read and its
+  revision re-derived.
+- **The start fence**: `begin_lane_successor` compares the presented
+  `profile` against the stored plan BEFORE any effect — a changed revision
+  refuses `refusal.profile.revision` (the relevant configuration or a
+  declared credential moved after the preview; a newly reviewed plan is
+  required) and a missing, unexpected, or materially different binding
+  refuses `refusal.profile.binding`. The daemon additionally refuses a
+  start that would run another profile than the plan names.
+- **Recorded binding evidence**: the successor verification and adoption
+  evidence carry `binding` = {status (`matched` | `fallback` | `unknown`),
+  revision, introspection, intended, actual, source, configured_limits} —
+  the ACTUAL pair comes from authoritative adapter evidence only and is
+  `null` when unproven (never a copy of the intended pair), the configured
+  limits are reported as configured limits (never provider proof), and an
+  unexpected pair is fenced before any verification commits.
+
 - **The successor boundary**: `begin_lane_successor` validates one start
   request (`replacement_id`, `binding` = {generation, checkpoint_digest,
   nonce}, `successor` = {session, kickoff_receipt}, `harness`, `admission`)

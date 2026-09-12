@@ -1072,6 +1072,10 @@ fn unknown_harness_kind_fails_typed_and_independent_probes_keep_working() {
         env_allow: vec!["PATH".to_string()],
         provider: None,
         model: None,
+        fallback: vec![],
+        secret_env: vec![],
+        limits: vec![],
+        binding_introspection: false,
     };
     let err = Profile::from_config(&unknown).expect_err("unknown kind refused");
     assert_eq!(err.code, CODE_UNKNOWN_HARNESS);
@@ -1086,6 +1090,10 @@ fn unknown_harness_kind_fails_typed_and_independent_probes_keep_working() {
         env_allow: vec!["PATH".to_string()],
         provider: None,
         model: None,
+        fallback: vec![],
+        secret_env: vec![],
+        limits: vec![],
+        binding_introspection: false,
     };
     let profile = Profile::from_config(&known).expect("known kind parses");
     let probe = probe_retry(&profile, &bins.env());

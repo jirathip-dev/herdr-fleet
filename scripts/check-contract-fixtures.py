@@ -272,7 +272,8 @@ def validate_config(obj: dict) -> tuple[str, str]:
         if not isinstance(obj["harness"], dict):
             return _ref(REFUSE_MALFORMED, "config.harness must be a table")
         for name, entry in obj["harness"].items():
-            shape = {"kind", "executable", "env_allow", "provider", "model"}
+            shape = {"kind", "executable", "env_allow", "provider", "model",
+                     "fallback", "secret_env", "limits", "binding_introspection"}
             required = {"kind", "executable", "env_allow"}
             if (
                 not isinstance(entry, dict)
@@ -289,6 +290,25 @@ def validate_config(obj: dict) -> tuple[str, str]:
                 if key in entry and not isinstance(entry[key], str):
                     return _ref(REFUSE_MALFORMED,
                                 "config.harness.{}.{} must be a string".format(name, key))
+            # Optional issue #77 profile-planning keys: shape only here
+            # (bare-token pairs, allowlisted credential names and bounded
+            # limits are the decoder's rules).
+            for key in ("fallback", "secret_env"):
+                if key in entry and (
+                    not isinstance(entry[key], list)
+                    or not all(isinstance(item, str) for item in entry[key])
+                ):
+                    return _ref(REFUSE_MALFORMED,
+                                "config.harness.{}.{} must be [string]".format(name, key))
+            if "limits" in entry and (
+                not isinstance(entry["limits"], dict)
+                or not all(isinstance(item, (str, int)) for item in entry["limits"].values())
+            ):
+                return _ref(REFUSE_MALFORMED,
+                            "config.harness.{}.limits must be scalar values".format(name))
+            if "binding_introspection" in entry and not isinstance(entry["binding_introspection"], bool):
+                return _ref(REFUSE_MALFORMED,
+                            "config.harness.{}.binding_introspection must be a boolean".format(name))
             env_allow = entry["env_allow"]
             if not isinstance(env_allow, list) or not all(
                 isinstance(item, str) for item in env_allow

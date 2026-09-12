@@ -1330,10 +1330,24 @@ fn execute_config(action: ConfigAction, invocation: &Invocation) -> CmdResult {
                     ])
                 })
                 .collect();
+            // Issue #77: the target-profile preview the human reviews before
+            // requesting a replacement — the intended provider/model, the
+            // authorized fallbacks, the configured limits (metadata
+            // overrides, never provider proof), the declared introspection
+            // support, the credential DIGESTS (never values) and the exact
+            // profile-configuration revision the daemon will fence on.
             let harnesses: Vec<Val> = config
                 .harnesses
                 .iter()
                 .map(|harness| {
+                    let credential_env = crate::config::credential_environment(harness);
+                    let binding = crate::config::ProfileBinding::from_config(
+                        &config,
+                        &harness.key,
+                        &credential_env,
+                    );
+                    let (present, missing) =
+                        crate::config::credential_presence(harness, &credential_env);
                     object(vec![
                         ("key", string(&harness.key)),
                         ("kind", string(&harness.kind)),
@@ -1357,6 +1371,36 @@ fn execute_config(action: ConfigAction, invocation: &Invocation) -> CmdResult {
                                 .as_ref()
                                 .map(|model| string(model))
                                 .unwrap_or_else(null),
+                        ),
+                        (
+                            "profile",
+                            binding
+                                .as_ref()
+                                .map(|binding| binding.to_doc())
+                                .unwrap_or_else(null),
+                        ),
+                        (
+                            "credentials",
+                            object(vec![
+                                (
+                                    "declared",
+                                    Val::Arr(
+                                        harness
+                                            .secret_env
+                                            .iter()
+                                            .map(|name| string(name))
+                                            .collect(),
+                                    ),
+                                ),
+                                (
+                                    "present",
+                                    Val::Arr(present.iter().map(|name| string(name)).collect()),
+                                ),
+                                (
+                                    "missing",
+                                    Val::Arr(missing.iter().map(|name| string(name)).collect()),
+                                ),
+                            ]),
                         ),
                     ])
                 })
@@ -1435,6 +1479,18 @@ fn execute_config(action: ConfigAction, invocation: &Invocation) -> CmdResult {
                     harness.executable,
                     harness.env_allow.join(", ")
                 ));
+                let credential_env = crate::config::credential_environment(harness);
+                if let Some(binding) = crate::config::ProfileBinding::from_config(
+                    &config,
+                    &harness.key,
+                    &credential_env,
+                ) {
+                    human.push_str(&format!(
+                        "    profile revision {} intended {}/{} (configured limits only; \
+                         credential values never leave the environment)\n",
+                        binding.revision, binding.provider, binding.model
+                    ));
+                }
             }
             for pin in &config.workflows {
                 human.push_str(&format!(

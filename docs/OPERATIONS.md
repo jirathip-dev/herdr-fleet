@@ -41,8 +41,8 @@ $ cargo build --release --locked
 $ ./target/release/canter --version        # exit 0
 canter 0.1.0
 ...
-state schema version: 7
-migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4, m0005_lane_replacements_v5, m0006_lane_checkpoints_v6, m0007_lane_successors_v7
+state schema version: 8
+migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4, m0005_lane_replacements_v5, m0006_lane_checkpoints_v6, m0007_lane_successors_v7, m0008_lane_replacement_profiles_v8
 document schema families: hf-config/v1, hf-policy/v1, hf-output/v1, hf-error/v1, ...
 ```
 
@@ -312,7 +312,7 @@ $ ./target/release/canter daemon status --json       # exit 0 (live)
 {"command":"daemon status","data":{"daemon":{"pid":<pid>,
  "started_at":"<ts>","version":"0.1.0"},
  "freshness":"fresh","state":{"active_grants":0,"epoch":1,"event_seq":0,
- "journal_seq":0,"pending_claims":0,"poisoned":false,"schema_version":7}},
+ "journal_seq":0,"pending_claims":0,"poisoned":false,"schema_version":8}},
  "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
 ```
 
