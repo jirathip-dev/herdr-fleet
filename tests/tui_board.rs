@@ -30,7 +30,7 @@ fn issue(repository: &str, number: u64) -> IssueKey {
     }
 }
 
-fn run(id: &str, attempt: u32) -> RunKey {
+fn run(id: &str, attempt: Option<u32>) -> RunKey {
     RunKey {
         run: id.to_string(),
         attempt,
@@ -61,7 +61,7 @@ fn row(
 ) -> WorkRow {
     WorkRow {
         issue: issue(repository, number),
-        run: attempt.map(|attempt| run("run-fixture", attempt)),
+        run: attempt.map(|attempt| run("run-fixture", Some(attempt))),
         title: title.map(str::to_string),
         stage,
         owner: owner.map(str::to_string),
@@ -258,8 +258,8 @@ fn view_with(rows: Vec<WorkRow>, state: BoardState) -> BoardView {
         rows,
         page: Page {
             current: 1,
-            count: 1,
-            total_rows,
+            count: Some(1),
+            total_rows: Some(total_rows),
         },
         freshness: fresh(12),
     }
@@ -273,7 +273,7 @@ fn state_selected_on(repository: &str, number: u64, attempt: Option<u32>) -> UiS
     UiState {
         selected: Some(canter::tui::Selection {
             issue: issue(repository, number),
-            run: attempt.map(|attempt| run("run-fixture", attempt)),
+            run: attempt.map(|attempt| run("run-fixture", Some(attempt))),
         }),
         focus: Focus::Rows,
     }
