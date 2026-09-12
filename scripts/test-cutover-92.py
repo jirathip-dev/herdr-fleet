@@ -68,6 +68,27 @@ def sha256_file(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def fixture_root_pids(root: pathlib.Path) -> list[int]:
+    """Pids whose command line names this fixture root (self/ancestors excepted)."""
+    prefix = str(root).rstrip("/") + "/"
+    excluded = {os.getpid(), os.getppid()}
+    pids: list[int] = []
+    for line in ps_lines():
+        pid, _sep, command = line.strip().partition(" ")
+        if not pid.isdigit() or int(pid) in excluded:
+            continue
+        if prefix in command:
+            pids.append(int(pid))
+    return pids
+
+
+def leftover_processes() -> list[str]:
+    """Any process naming a rehearsal sandbox, a self-test fixture or the
+    fixture program: all three are this suite's own, so any hit is a leak."""
+    markers = ("cutover-92-rehearsal", "cutover-92-selftest", "fixture-supervisor --serve")
+    return [line for line in ps_lines() if any(marker in line for marker in markers)]
+
+
 def ps_lines() -> list[str]:
     out = subprocess.run(
         ["ps", "-Aww", "-o", "pid=,command="], capture_output=True, text=True, check=False
@@ -105,6 +126,7 @@ class Fixture:
         self.pidfile = self.run / "supervisor.pid"
         self.process: subprocess.Popen | None = None
         self.unit_sha = ""
+        self.stop_verified = True
 
     # -- construction ------------------------------------------------------
 
@@ -116,8 +138,19 @@ class Fixture:
         self.unit_sha = sha256_file(self.unit)
         self.program.write_text(
             "#!/usr/bin/env bash\n"
+            "# Same parent watchdog as the rehearsal fixture (#92-R1): if the\n"
+            "# self-test dies, the fixture removes its root and exits.\n"
             "echo \"$$\" >\"$CUTOVER92_FIXTURE_PIDFILE\"\n"
-            "while :; do sleep 1; done\n",
+            "while :; do\n"
+            "    parent=\"$(ps -ww -p \"${CUTOVER92_FIXTURE_PARENT_PID:-0}\" -o command= 2>/dev/null || true)\"\n"
+            "    case \"$parent\" in\n"
+            "        *\"${CUTOVER92_FIXTURE_PARENT_MATCH:-test-cutover-92}\"*) ;;\n"
+            "        *)\n"
+            "            exit 0\n"
+            "            ;;\n"
+            "    esac\n"
+            "    sleep 1\n"
+            "done\n",
             encoding="utf-8",
         )
         self.program.chmod(0o755)
@@ -153,7 +186,12 @@ class Fixture:
     # -- process -----------------------------------------------------------
 
     def start(self) -> None:
-        env = {**os.environ, "CUTOVER92_FIXTURE_PIDFILE": str(self.pidfile)}
+        env = {
+            **os.environ,
+            "CUTOVER92_FIXTURE_PIDFILE": str(self.pidfile),
+            "CUTOVER92_FIXTURE_PARENT_PID": str(os.getpid()),
+            "CUTOVER92_FIXTURE_PARENT_MATCH": "test-cutover-92",
+        }
         log = open(self.host / "fixture-supervisor.log", "wb")
         self.process = subprocess.Popen(
             [str(self.program), "--serve"],
@@ -174,6 +212,8 @@ class Fixture:
         env = {
             **os.environ,
             "CUTOVER92_FIXTURE_PIDFILE": str(self.host / "cases" / "second.pid"),
+            "CUTOVER92_FIXTURE_PARENT_PID": str(os.getpid()),
+            "CUTOVER92_FIXTURE_PARENT_MATCH": "test-cutover-92",
         }
         log = open(self.host / "cases" / "second.log", "wb")
         extra = subprocess.Popen(
@@ -204,6 +244,8 @@ class Fixture:
                 process.wait(timeout=10)
 
     def stop(self) -> None:
+        """Stop every process naming the fixture root: TERM, wait, KILL, wait,
+        then verify by re-scanning (never assume the kill worked)."""
         if self.process is not None and self.process.poll() is None:
             try:
                 os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
@@ -214,6 +256,18 @@ class Fixture:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=10)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            pids = fixture_root_pids(self.root)
+            if not pids:
+                return
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            time.sleep(0.1)
+        self.stop_verified = not fixture_root_pids(self.root)
 
     def write_identity(self, argv_sha: str) -> None:
         self.identity.write_text(
@@ -418,7 +472,13 @@ def static_guards() -> None:
 # Rehearsal runs
 # --------------------------------------------------------------------------
 
+def rehearsal_sandbox_dirs() -> set[str]:
+    base = pathlib.Path(tempfile.gettempdir())
+    return {str(path) for path in base.glob("cutover-92-rehearsal.*")}
+
+
 def rehearsal_guards(tmp: pathlib.Path) -> None:
+    sandboxes_before = rehearsal_sandbox_dirs()
     outside = tmp / "not-a-rehearsal" / "cutover-92-rehearsal.probe"
     proc = subprocess.run(
         ["bash", str(REHEARSAL)],
@@ -435,8 +495,10 @@ def rehearsal_guards(tmp: pathlib.Path) -> None:
     )
 
     if shutil.which("launchctl") is None:
-        skip("rehearsal green run", "launchctl absent (non-macOS host class)")
+        for name in ("rehearsal green run", "rehearsal --dry-run-only", "rehearsal killed mid-run"):
+            skip(name, "launchctl absent (non-macOS host class)")
         return
+
     proc = subprocess.run(
         ["bash", str(REHEARSAL)],
         capture_output=True,
@@ -451,24 +513,73 @@ def rehearsal_guards(tmp: pathlib.Path) -> None:
     for needle in (
         "REHEARSAL result=ok",
         "live_paths_touched=0",
+        "fixtures_left=0",
+        "sandbox_removed=yes",
         "SIMULATED (owner-executed on host, NOT run here)",
         "dry-run fails while the supervisor is down",
+        "no fixture process references the sandbox and the sandbox is removed",
     ):
         if needle not in out:
             problems.append(f"missing {needle!r}")
     record("rehearsal green run (disposable fixture)", not problems, "; ".join(problems) or "exit=0")
 
-    stale = [
-        line
-        for line in subprocess.run(
-            ["ps", "-Aww", "-o", "pid=,command="], capture_output=True, text=True, check=False
-        ).stdout.splitlines()
-        if "cutover-92-rehearsal" in line
-    ]
+    proc = subprocess.run(
+        ["bash", str(REHEARSAL), "--dry-run-only"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=600,
+    )
+    out = proc.stdout
+    problems = []
+    if proc.returncode != 0:
+        problems.append(f"exit {proc.returncode} (stderr: {proc.stderr.strip()[:200]})")
+    for needle in (
+        "RUN: python3",
+        "dry-run raw exit: 0",
+        "mode=dry-run-only",
+        "fixtures_left=0",
+        "sandbox_removed=yes",
+    ):
+        if needle not in out:
+            problems.append(f"missing {needle!r}")
+    record(
+        "rehearsal --dry-run-only runs the documented fixture invocation and cleans up",
+        not problems,
+        "; ".join(problems) or "exit=0",
+    )
+
+    killed = subprocess.Popen(
+        ["bash", str(REHEARSAL)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(1.2)
+    killed.send_signal(signal.SIGKILL)
+    killed.wait(timeout=60)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if not leftover_processes() and not (rehearsal_sandbox_dirs() - sandboxes_before):
+            break
+        time.sleep(0.25)
+    new_dirs = rehearsal_sandbox_dirs() - sandboxes_before
+    stale = leftover_processes()
+    record(
+        "rehearsal killed mid-run (SIGKILL, no trap can run) leaves no process and no sandbox",
+        not stale and not new_dirs,
+        f"processes={len(stale)} new sandbox dirs={len(new_dirs)}"
+        + (f": {stale[0].strip()[:100]}" if stale else ""),
+    )
+
+    deadline = time.monotonic() + 12
+    stale = leftover_processes()
+    while stale and time.monotonic() < deadline:
+        time.sleep(0.25)
+        stale = leftover_processes()
     record(
         "rehearsal leaves no fixture process behind",
         not stale,
-        f"{len(stale)} straggler(s)",
+        f"{len(stale)} straggler(s)" if not stale else f"{len(stale)} straggler(s): {stale[0].strip()[:120]}",
     )
 
 
@@ -505,6 +616,13 @@ def main() -> int:
 
         base = fixture.variant("green", lambda doc: None)
         dryrun_case("dry-run GREEN against the intact fixture", base, 0)
+
+        rc, out, _err = run_dryrun(base)
+        print("    documented standalone invocation:")
+        print(f"      python3 scripts/cutover-92-dryrun.py --target {base}")
+        print(f"    raw exit: {rc}")
+        for line in out.strip().splitlines():
+            print(f"      {line}")
 
         rc, out, _err = run_dryrun(base, "--json")
         doc = json.loads(out) if out.strip() else {}

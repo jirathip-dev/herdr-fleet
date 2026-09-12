@@ -22,16 +22,35 @@
 #   * executed command text is path-guarded: every absolute path inside a
 #     command it runs must be inside the sandbox.
 #
+# ZERO FIXTURE PROCESSES ON EVERY EXIT PATH (issue #92-R1). Teardown is
+# verified, not assumed:
+#   * the fixture process is started with a parent watchdog: as soon as the
+#     rehearsal process is gone — including SIGKILL, which no trap can catch —
+#     the fixture removes its sandbox and exits on its own (bounded by its
+#     1 s poll), so it can never outlive the rehearsal;
+#   * teardown kills by *path*, not by remembered pid: every process whose
+#     command line names this run's sandbox root is ours (a fresh mktemp
+#     directory), and they are all stopped with TERM, then KILL after a
+#     bounded wait, then the process table is re-scanned and must be empty;
+#   * INT/TERM/HUP are trapped and re-raised through the EXIT trap, so the
+#     cleanup runs on refusal, error, interrupt and normal exit alike;
+#   * the final `REHEARSAL result=...` line reports `fixtures_left=` and the
+#     exit status is non-zero if anything survived or the sandbox survived
+#     its removal. There is no mode that leaves a fixture process running.
+#
 # Host class: the macOS/launchd queue host (the fixture mirrors a launchd
 # user agent). Requires python3 (stdlib only) and shasum.
 #
 # Usage:
 #   bash scripts/cutover-92-rehearsal.sh
+#   bash scripts/cutover-92-rehearsal.sh --dry-run-only     # plant fixture + run the dry-run,
+#                                                          # then tear everything down and exit
+#                                                          # with the dry-run's raw exit code
 #   CUTOVER92_REHEARSAL_ROOT=<temp-dir path> bash scripts/cutover-92-rehearsal.sh
 #
 # Output: one PASS/FAIL line per verification, the per-step evidence, and a
 # final `REHEARSAL result=... steps=... verifications=... failures=...
-# sandbox=... live_paths_touched=0` line.
+# sandbox=... live_paths_touched=0 fixtures_left=...` line.
 # Exit codes: 0 all verifications passed · 1 a verification failed ·
 # 2 usage error or containment refusal.
 
@@ -47,6 +66,23 @@ FIXTURE_PID=""
 STEPS=0
 VERIFICATIONS=0
 FAILURES=0
+TEARDOWN_DONE=0
+TEARDOWN_FAILED=0
+DRY_RUN_ONLY=""
+DRY_RUN_EXIT=""
+
+usage() {
+    echo "usage: cutover-92-rehearsal.sh [--dry-run-only]" >&2
+    exit 2
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dry-run-only) DRY_RUN_ONLY="yes" ;;
+        *) usage ;;
+    esac
+    shift
+done
 
 refuse() {
     echo "REFUSED: $*" >&2
@@ -99,34 +135,153 @@ fixture_pid_is_ours() {
     esac
 }
 
-stop_fixture() {
-    if fixture_pid_is_ours; then
-        kill "$FIXTURE_PID" 2>/dev/null || true
-        wait "$FIXTURE_PID" 2>/dev/null || true
-        tries=0
-        while [ "$tries" -lt 50 ]; do
-            fixture_pid_is_ours || return 0
-            sleep 0.1
-            tries=$((tries + 1))
-        done
+# Every process whose command line names THIS run's sandbox root. The root is
+# a fresh mktemp directory, so anything naming it was started by this
+# rehearsal; the scan excludes itself and its parent so the checker never
+# matches the process reading the table.
+fixture_pids_now() {
+    [ -n "${SANDBOX:-}" ] || return 0
+    python3 - "$SANDBOX" <<'PY'
+import os
+import subprocess
+import sys
+
+root = sys.argv[1].rstrip("/") + "/"
+excluded = {os.getpid(), os.getppid()}
+out = subprocess.run(["ps", "-Aww", "-o", "pid=,command="],
+                     capture_output=True, text=True).stdout
+for line in out.splitlines():
+    pid, _sep, command = line.strip().partition(" ")
+    if not pid.isdigit() or int(pid) in excluded:
+        continue
+    if root in command:
+        print(pid)
+PY
+}
+
+# Every sandbox-named pid except the reaper (mode keep-reaper) or all of them.
+sandbox_pids() {
+    for pid in $(fixture_pids_now); do
+        if [ "${1:-all}" = "keep-reaper" ] && [ -n "${REAPER_PID:-}" ] && [ "$pid" = "$REAPER_PID" ]; then
+            continue
+        fi
+        printf '%s\n' "$pid"
+    done
+}
+
+# Stop sandbox processes: TERM, bounded wait, KILL, bounded wait, verify.
+# `keep-reaper` spares the reaper (used mid-run, where the reaper must survive
+# so an untrappable death later still leaves nothing behind).
+stop_sandbox_processes() {
+    mode="${1:-all}"
+    pids="$(sandbox_pids "$mode")"
+    for pid in $pids; do
+        kill "$pid" 2>/dev/null || true
+    done
+    tries=0
+    while [ "$tries" -lt 100 ]; do
+        pids="$(sandbox_pids "$mode")"
+        [ -z "$pids" ] && return 0
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+    for pid in $pids; do
+        kill -9 "$pid" 2>/dev/null || true
+    done
+    tries=0
+    while [ "$tries" -lt 100 ]; do
+        pids="$(sandbox_pids "$mode")"
+        [ -z "$pids" ] && return 0
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+# The reaper exits by itself once the sandbox it watches is gone; wait for it
+# (bounded) and force it down only if it does not.
+wait_for_reaper() {
+    [ -n "${REAPER_PID:-}" ] || return 0
+    tries=0
+    while [ "$tries" -lt 30 ]; do
+        kill -0 "$REAPER_PID" 2>/dev/null || return 0
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+    kill "$REAPER_PID" 2>/dev/null || true
+    sleep 0.3
+    kill -9 "$REAPER_PID" 2>/dev/null || true
+    tries=0
+    while [ "$tries" -lt 30 ]; do
+        kill -0 "$REAPER_PID" 2>/dev/null || return 1
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+# Idempotent, verified teardown: no fixture process may reference the sandbox
+# when this returns, and (unless the sandbox is explicitly kept for
+# inspection) the sandbox directory must be gone.
+teardown() {
+    if [ "$TEARDOWN_DONE" -eq 1 ]; then
+        return "$TEARDOWN_FAILED"
+    fi
+    TEARDOWN_DONE=1
+    if [ -z "${SANDBOX:-}" ]; then
+        return 0
+    fi
+    if [ -n "${CUTOVER92_REHEARSAL_KEEP:-}" ]; then
+        if ! stop_sandbox_processes all; then
+            echo "FAIL: fixture process(es) survived teardown: $(fixture_pids_now | tr '\n' ' ')" >&2
+            TEARDOWN_FAILED=1
+            return 1
+        fi
+        echo "NOTE: CUTOVER92_REHEARSAL_KEEP is set — sandbox kept at $SANDBOX (no fixture or reaper process is left running)"
+        return 0
+    fi
+    # 1) stop the fixtures but keep the reaper watching
+    if ! stop_sandbox_processes keep-reaper; then
+        echo "FAIL: fixture process(es) survived teardown: $(fixture_pids_now | tr '\n' ' ')" >&2
+        TEARDOWN_FAILED=1
+        return 1
+    fi
+    # 2) remove the sandbox (retried: a concurrent remover must never leave a
+    #    partially-emptied tree behind); the reaper notices and exits on its own
+    tries=0
+    while [ "$tries" -lt 5 ]; do
+        [ -e "$SANDBOX" ] || break
+        rm -rf "$SANDBOX" 2>/dev/null || true
+        [ -e "$SANDBOX" ] || break
+        sleep 0.2
+        tries=$((tries + 1))
+    done
+    # 3) the reaper must be gone before the rehearsal exits (verified)
+    if ! wait_for_reaper; then
+        echo "FAIL: the sandbox reaper did not exit after the sandbox was removed" >&2
+        TEARDOWN_FAILED=1
+        return 1
+    fi
+    if [ -e "$SANDBOX" ]; then
+        echo "FAIL: sandbox directory survived removal: $SANDBOX" >&2
+        TEARDOWN_FAILED=1
+        return 1
+    fi
+    if [ -n "$(fixture_pids_now)" ]; then
+        echo "FAIL: process(es) still name the sandbox after teardown: $(fixture_pids_now | tr '\n' ' ')" >&2
+        TEARDOWN_FAILED=1
         return 1
     fi
     return 0
 }
 
 cleanup() {
-    if [ -n "${SANDBOX:-}" ] && [ -d "$SANDBOX" ]; then
-        if [ -n "${CUTOVER92_REHEARSAL_KEEP:-}" ]; then
-            echo "NOTE: CUTOVER92_REHEARSAL_KEEP is set — sandbox kept at $SANDBOX"
-            echo "      fixture supervisor left running (pid ${FIXTURE_PID:-none}); to remove:"
-            echo "      kill ${FIXTURE_PID:-<pid>} 2>/dev/null; rm -rf $SANDBOX"
-        else
-            stop_fixture 2>/dev/null || true
-            rm -rf "$SANDBOX"
-        fi
-    fi
+    teardown 2>/dev/null || TEARDOWN_FAILED=1
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # --------------------------------------------------------------------------
 # Sandbox root: only a fresh mktemp -d path (or an explicitly named one that
@@ -156,6 +311,86 @@ fi
 if [ ! -f "$DRY_RUN" ]; then
     refuse "dry-run script not found at $DRY_RUN"
 fi
+
+# --------------------------------------------------------------------------
+# Sandbox reaper (#92-R1). Started as soon as the sandbox root exists, before
+# any fixture: if the rehearsal disappears for a reason no trap can catch
+# (SIGKILL, host kill), the reaper stops every process still naming the
+# sandbox and removes the sandbox root — so the rehearsal can never leave a
+# fixture *or* a sandbox behind, on any path.
+# --------------------------------------------------------------------------
+REAPER="$SANDBOX/reaper.sh"
+cat >"$REAPER" <<'EOF'
+#!/usr/bin/env bash
+# Sandbox reaper: independent of the fixture; exits only after it has stopped
+# every process naming the sandbox and removed the sandbox root.
+sandbox="${CUTOVER92_REAPER_SANDBOX:-}"
+tmp_base="${CUTOVER92_REAPER_TMP_BASE:-/nonexistent}"
+while :; do
+    parent="$(ps -ww -p "${CUTOVER92_REAPER_PARENT_PID:-0}" -o command= 2>/dev/null || true)"
+    case "$parent" in
+        *"${CUTOVER92_REAPER_PARENT_MATCH:-cutover-92-rehearsal}"*)
+            # the rehearsal is alive: keep watching, unless it already removed
+            # the sandbox itself (a normal, verified teardown) — then there is
+            # nothing left to reap and this process may exit.
+            [ -d "$sandbox" ] || exit 0
+            sleep 0.3
+            continue
+            ;;
+    esac
+    break
+done
+tries=0
+while [ "$tries" -lt 20 ]; do
+    pids="$(python3 - "$sandbox" "$$" <<'PY'
+import os
+import subprocess
+import sys
+
+root = sys.argv[1].rstrip("/") + "/"
+# never match this reaper itself (its own command line names the sandbox),
+# the subshell running this scan, or the scan process
+excluded = {os.getpid(), os.getppid(), int(sys.argv[2])}
+out = subprocess.run(["ps", "-Aww", "-o", "pid=,command="],
+                     capture_output=True, text=True).stdout
+for line in out.splitlines():
+    pid, _sep, command = line.strip().partition(" ")
+    if pid.isdigit() and int(pid) not in excluded and root in command:
+        print(pid)
+PY
+)"
+    [ -z "$pids" ] && break
+    for pid in $pids; do
+        if [ "$tries" -ge 10 ]; then
+            kill -9 "$pid" 2>/dev/null || true
+        else
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+    sleep 0.3
+    tries=$((tries + 1))
+done
+case "$sandbox" in
+    "$tmp_base"/cutover-92-*)
+        tries=0
+        while [ "$tries" -lt 10 ]; do
+            [ -e "$sandbox" ] || break
+            rm -rf "$sandbox" 2>/dev/null || true
+            [ -e "$sandbox" ] || break
+            sleep 0.3
+            tries=$((tries + 1))
+        done
+        ;;
+esac
+exit 0
+EOF
+chmod +x "$REAPER"
+export CUTOVER92_REAPER_PARENT_PID="$$"
+export CUTOVER92_REAPER_PARENT_MATCH="cutover-92-rehearsal"
+export CUTOVER92_REAPER_SANDBOX="$SANDBOX"
+export CUTOVER92_REAPER_TMP_BASE="$TMP_BASE"
+"$REAPER" >"$SANDBOX/reaper.log" 2>&1 &
+REAPER_PID=$!
 
 ROOT="$SANDBOX/host"
 LABEL="com.example.fixture-supervisor"
@@ -190,9 +425,24 @@ printf '%s\n' \
 
 cat >"$PROGRAM" <<'EOF'
 #!/usr/bin/env bash
-# Fixture supervisor: keeps its own argv (no exec) and records its pid.
+# Fixture supervisor: keeps its own argv (no exec), records its pid, and
+# exits as soon as the rehearsal that started it is gone — a fixture must
+# never be able to outlive the rehearsal, not even when the rehearsal is
+# SIGKILLed (#92-R1). The parent is identified by its command line (not only
+# by pid) so pid reuse cannot keep it alive. The sandbox tree itself is
+# removed by exactly one owner at a time: the rehearsal's verified teardown,
+# or the separate sandbox reaper on an untrappable death — never both at once.
 echo "$$" >"$CUTOVER92_FIXTURE_PIDFILE"
-while :; do sleep 1; done
+while :; do
+    parent="$(ps -ww -p "${CUTOVER92_FIXTURE_PARENT_PID:-0}" -o command= 2>/dev/null || true)"
+    case "$parent" in
+        *"${CUTOVER92_FIXTURE_PARENT_MATCH:-cutover-92-rehearsal}"*) ;;
+        *)
+            exit 0
+            ;;
+    esac
+    sleep 1
+done
 EOF
 chmod +x "$PROGRAM"
 
@@ -217,14 +467,23 @@ chmod +x "$CANTER_BIN"
 printf '%s\n' '[daemon]' 'enabled = false' >"$CONFIG"
 
 export CUTOVER92_FIXTURE_PIDFILE="$ROOT/run/supervisor.pid"
-"$PROGRAM" --serve >"$ROOT/log/fixture-supervisor.log" 2>&1 &
-tries=0
-while [ ! -s "$ROOT/run/supervisor.pid" ] && [ "$tries" -lt 100 ]; do
-    sleep 0.1
-    tries=$((tries + 1))
-done
-FIXTURE_PID="$(cat "$ROOT/run/supervisor.pid" 2>/dev/null || true)"
-contain "$ROOT/run/supervisor.pid"
+export CUTOVER92_FIXTURE_PARENT_PID="$$"
+export CUTOVER92_FIXTURE_PARENT_MATCH="cutover-92-rehearsal"
+
+start_fixture() {
+    contain "$ROOT/run/supervisor.pid"
+    rm -f "$ROOT/run/supervisor.pid"
+    "$PROGRAM" --serve >>"$ROOT/log/fixture-supervisor.log" 2>&1 &
+    tries=0
+    while [ ! -s "$ROOT/run/supervisor.pid" ] && [ "$tries" -lt 100 ]; do
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+    sleep 0.3
+    FIXTURE_PID="$(cat "$ROOT/run/supervisor.pid" 2>/dev/null || true)"
+}
+
+start_fixture
 if ! fixture_pid_is_ours; then
     refuse "fixture supervisor did not start (pid: ${FIXTURE_PID:-none})"
 fi
@@ -320,7 +579,18 @@ contain "$TARGET"
 step "dry-run against the fixture host (preconditions must hold)"
 python3 "$DRY_RUN" --target "$TARGET" >"$ROOT/log/dryrun-before.log" 2>&1
 BEFORE_RC=$?
-tail -n 4 "$ROOT/log/dryrun-before.log" | sed 's/^/    /'
+DRY_RUN_EXIT="$BEFORE_RC"
+if [ -n "$DRY_RUN_ONLY" ]; then
+    sed 's/^/    /' "$ROOT/log/dryrun-before.log"
+else
+    tail -n 4 "$ROOT/log/dryrun-before.log" | sed 's/^/    /'
+fi
+echo "    RUN: python3 $DRY_RUN --target $TARGET"
+echo "    dry-run raw exit: $BEFORE_RC"
+if [ -n "$DRY_RUN_ONLY" ]; then
+    echo "    (--dry-run-only: the dry-run invocation above is the documented fixture invocation;"
+    echo "     the simulated cutover, rollback and post-rollback steps are skipped)"
+fi
 if [ "$BEFORE_RC" -ne 0 ]; then
     fail "dry-run failed against the intact fixture (exit $BEFORE_RC)"
 else
@@ -332,6 +602,10 @@ if grep -q '^SUMMARY result=ok ' "$ROOT/log/dryrun-before.log" && \
 else
     fail "dry-run summary missing or not ok"
 fi
+
+if [ -n "$DRY_RUN_ONLY" ]; then
+    echo "    mode dry-run-only: simulated cutover, rollback and post-rollback steps skipped"
+else
 
 step "record the baseline (unit bytes + running identity)"
 BASE_UNIT_SHA="$(shasum -a 256 "$UNIT" | awk '{print $1}')"
@@ -365,7 +639,7 @@ printf '%s\n' \
     '  </array>' \
     '</dict>' \
     '</plist>' >"$UNIT"
-if ! stop_fixture; then
+if ! stop_sandbox_processes keep-reaper; then
     fail "could not stop the fixture supervisor"
 fi
 python3 "$DRY_RUN" --target "$TARGET" >"$ROOT/log/dryrun-during-cutover.log" 2>&1
@@ -424,16 +698,10 @@ if [ "$RESTORED_SHA" = "$BASE_UNIT_SHA" ]; then
 else
     fail "restored unit differs: $RESTORED_SHA vs $BASE_UNIT_SHA"
 fi
-contain "$ROOT/run/supervisor.pid"
-rm -f "$ROOT/run/supervisor.pid"
-"$PROGRAM" --serve >>"$ROOT/log/fixture-supervisor.log" 2>&1 &
-tries=0
-while [ ! -s "$ROOT/run/supervisor.pid" ] && [ "$tries" -lt 100 ]; do
-    sleep 0.1
-    tries=$((tries + 1))
-done
-sleep 0.5
-FIXTURE_PID="$(cat "$ROOT/run/supervisor.pid" 2>/dev/null || true)"
+start_fixture
+if ! fixture_pid_is_ours; then
+    fail "restarted fixture supervisor did not start (pid: ${FIXTURE_PID:-none})"
+fi
 RESTORED_IDENTITY_SHA="$(CUTOVER92_PATTERN="$PATTERN" python3 -c '
 import hashlib, os, subprocess
 pattern = os.environ["CUTOVER92_PATTERN"]
@@ -457,9 +725,49 @@ else
     fail "dry-run failed after the rollback (exit $AFTER_RC)"
 fi
 
-echo
-if [ "$FAILURES" -ne 0 ]; then
-    echo "REHEARSAL result=failed steps=$STEPS verifications=$VERIFICATIONS failures=$FAILURES sandbox=$SANDBOX live_paths_touched=0 sandbox_kept=${CUTOVER92_REHEARSAL_KEEP:+yes}"
-    exit 1
 fi
-echo "REHEARSAL result=ok steps=$STEPS verifications=$VERIFICATIONS failures=0 sandbox=$SANDBOX live_paths_touched=0 sandbox_kept=${CUTOVER92_REHEARSAL_KEEP:+yes}"
+
+# --------------------------------------------------------------------------
+# Teardown: explicit, verified, and the last thing the summary reports.
+# --------------------------------------------------------------------------
+step "teardown: stop every fixture process and verify the sandbox is gone"
+if teardown; then
+    ok "no fixture process references the sandbox and the sandbox is removed"
+else
+    fail "teardown left fixture process(es) or the sandbox behind"
+fi
+LEFT_PIDS="$(fixture_pids_now)"
+if [ -z "$LEFT_PIDS" ]; then
+    FIXTURES_LEFT=0
+else
+    FIXTURES_LEFT="$(printf '%s\n' "$LEFT_PIDS" | wc -l | tr -d ' ')"
+fi
+if [ -e "$SANDBOX" ]; then
+    SANDBOX_REMOVED="no"
+else
+    SANDBOX_REMOVED="yes"
+fi
+if [ -n "$DRY_RUN_ONLY" ]; then
+    DRY_RUN_MODE="dry-run-only"
+    if [ "${DRY_RUN_EXIT:-1}" -ne 0 ]; then
+        fail "dry-run exited ${DRY_RUN_EXIT} (mode dry-run-only)"
+    fi
+else
+    DRY_RUN_MODE="full"
+fi
+
+FAILED=0
+[ "$FAILURES" -eq 0 ] || FAILED=1
+[ "$TEARDOWN_FAILED" -eq 0 ] || FAILED=1
+[ "$FIXTURES_LEFT" -eq 0 ] || FAILED=1
+RESULT="ok"
+if [ "$FAILED" -eq 1 ]; then
+    RESULT="failed"
+fi
+
+echo
+echo "REHEARSAL result=$RESULT steps=$STEPS verifications=$VERIFICATIONS failures=$FAILURES sandbox=$SANDBOX live_paths_touched=0 fixtures_left=$FIXTURES_LEFT sandbox_removed=$SANDBOX_REMOVED mode=$DRY_RUN_MODE dry_run_exit=${DRY_RUN_EXIT:-none}"
+if [ "$FAILED" -eq 0 ]; then
+    exit 0
+fi
+exit 1

@@ -282,7 +282,8 @@ $ bash scripts/cutover-92-rehearsal.sh                                   # dispo
 $ python3 scripts/test-cutover-92.py                                     # mutation probes
 ```
 
-- **Dry-run** (`--target` required): proves (a) the unit/artifacts exist as
+- **Dry-run** (`--target` is required — a missing `--target` is a usage
+  error, exit 2): proves (a) the unit/artifacts exist as
   this plan describes (unit parses, program matches, canter binary
   executable), (b) exactly one supervisor process is running and its argv
   hash matches both the descriptor and `{identity_record}`, (c) every
@@ -306,10 +307,28 @@ $ python3 scripts/test-cutover-92.py                                     # mutat
   process, a non-temp root is refused, and an existing root is never reused.
   It never references the live label, the live unit or the service manager.
   `CUTOVER92_REHEARSAL_ROOT=<temp path>` picks the root;
-  `CUTOVER92_REHEARSAL_KEEP=1` keeps the sandbox and the fixture running so
-  the dry-run can be run by hand against it (the script prints the removal
-  commands). The final stdout line is
-  `REHEARSAL result=… steps=… verifications=… sandbox=… live_paths_touched=0`.
+  `CUTOVER92_REHEARSAL_KEEP=1` keeps the sandbox directory for inspection
+  but still stops every fixture process, so no mode leaves a process behind.
+
+  **Zero fixture processes on every exit path (issue #92-R1):** teardown is
+  verified, not assumed — every process naming this run's sandbox root is
+  stopped (TERM, bounded wait, KILL, bounded wait, re-scan), a sandbox
+  *reaper* started before any fixture survives the rehearsal's own kills and
+  finishes the job even when the rehearsal is killed with SIGKILL (where no
+  trap can run), and the fixture itself self-destructs as soon as the
+  rehearsal is gone. INT/TERM/HUP are trapped and re-raised through the exit
+  trap. The final stdout line reports it:
+  `REHEARSAL result=… steps=… verifications=… failures=… sandbox=…
+  live_paths_touched=0 fixtures_left=0 sandbox_removed=yes mode=full
+  dry_run_exit=…`; a non-zero exit means a verification failed or something
+  survived teardown.
+
+  `bash scripts/cutover-92-rehearsal.sh --dry-run-only` is the documented way
+  to run the plan's dry-run invocation against a fixture descriptor: it
+  plants the fixture, prints the exact command it runs
+  (`python3 scripts/cutover-92-dryrun.py --target <sandbox>/host/target.json`),
+  prints the dry-run's raw exit, tears everything down, and exits with the
+  dry-run's code.
 - **Self-test** (`python3 scripts/test-cutover-92.py`): mutation probes that
   prove each dry-run check fails closed (missing unit, hash mismatch,
   unresolved binary, syntax error, unknown placeholder, missing/extra
