@@ -2,7 +2,7 @@
 //! (AC1 single writer/containment, AC4 crash boundaries + restart
 //! reconcile, AC5 fail closed, AC6 spent claims, AC7 events).
 //!
-//! Every test spawns `herdr-fleet daemon run` as a child process with
+//! Every test spawns `canter daemon run` as a child process with
 //! isolated XDG state and an explicit socket under a per-test temp dir;
 //! nothing here touches the real host state or the service manager.
 
@@ -12,12 +12,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use herdr_fleet::client::{Connection, RpcError};
-use herdr_fleet::dirs::DaemonPaths;
-use herdr_fleet::value::{Val, integer, object, string};
+use canter::client::{Connection, RpcError};
+use canter::dirs::DaemonPaths;
+use canter::value::{Val, integer, object, string};
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_herdr-fleet")
+    env!("CARGO_BIN_EXE_canter")
 }
 
 struct Fixture {
@@ -40,9 +40,9 @@ impl Fixture {
 
     fn paths(&self) -> DaemonPaths {
         // The daemon child runs with XDG_STATE_HOME=fixture.state_dir, so the
-        // daemon state root is state_dir/herdr-fleet (do not derive from the
+        // daemon state root is state_dir/canter (do not derive from the
         // test process environment).
-        let state_dir = self.state_dir.join("herdr-fleet");
+        let state_dir = self.state_dir.join("canter");
         DaemonPaths {
             state_dir: state_dir.clone(),
             runtime_dir: self.dir.clone(),
@@ -81,7 +81,7 @@ impl Fixture {
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file));
         if let Some(point) = crash_point {
-            command.env("HERDR_FLEET_CRASH_POINT", point);
+            command.env("CANTER_CRASH_POINT", point);
         }
         command.spawn().expect("spawn daemon")
     }
@@ -91,9 +91,7 @@ impl Fixture {
 fn wait_ready(fixture: &Fixture) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        if herdr_fleet::lock::socket_presence(&fixture.socket)
-            == herdr_fleet::lock::SocketPresence::Active
-        {
+        if canter::lock::socket_presence(&fixture.socket) == canter::lock::SocketPresence::Active {
             let ok = Connection::open(&fixture.socket)
                 .and_then(|mut connection| {
                     connection.send_request("aaaaaaaaaaaaaaaa", "status", None)?;
@@ -125,7 +123,7 @@ fn rpc(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
     let response = connection.read_response().expect("read response");
     if response.ok {
         object(vec![
-            ("ok", herdr_fleet::value::bool_(true)),
+            ("ok", canter::value::bool_(true)),
             ("result", response.result),
         ])
     } else {
@@ -134,7 +132,7 @@ fn rpc(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
             message: "no error doc".to_string(),
         });
         object(vec![
-            ("ok", herdr_fleet::value::bool_(false)),
+            ("ok", canter::value::bool_(false)),
             (
                 "error",
                 object(vec![
@@ -152,7 +150,7 @@ fn rpc_ok(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
         doc.get("ok").and_then(Val::as_bool),
         Some(true),
         "expected ok response for {method}: {}",
-        herdr_fleet::canonical::canonical_text(&doc)
+        canter::canonical::canonical_text(&doc)
     );
     doc.get("result").expect("result").clone()
 }
@@ -399,7 +397,7 @@ fn restore_racing_acknowledged_mutations_never_loses_acked_intents() {
             ack_doc.get("ok").and_then(Val::as_bool),
             Some(true),
             "racing mutation must be acknowledged, got: {}",
-            herdr_fleet::canonical::canonical_text(&ack_doc)
+            canter::canonical::canonical_text(&ack_doc)
         );
         // A mutation acknowledged while the restore is in flight must not be
         // lost by THIS restore: it either journaled before the rename (and
@@ -463,7 +461,7 @@ fn restore_racing_acknowledged_mutations_never_loses_acked_intents() {
             ("limit", integer(5000)),
         ])),
     );
-    let serialized = herdr_fleet::canonical::canonical_text(&tail);
+    let serialized = canter::canonical::canonical_text(&tail);
     for key in &surviving_keys {
         assert!(
             serialized.contains(key),
@@ -500,7 +498,7 @@ fn restore_racing_acknowledged_mutations_never_loses_acked_intents() {
             ("limit", integer(5000)),
         ])),
     );
-    let serialized_after_restart = herdr_fleet::canonical::canonical_text(&tail_after_restart);
+    let serialized_after_restart = canter::canonical::canonical_text(&tail_after_restart);
     for key in &surviving_keys {
         assert!(
             serialized_after_restart.contains(key),
@@ -968,7 +966,7 @@ fn subscribe_resnapshots_future_cursors_and_replays_contiguously() {
 
     // Fresh subscribe (no cursor): ok response, then a snapshot line.
     let mut subscription =
-        herdr_fleet::client::EventSubscription::open(&fixture.socket, None).expect("subscribe");
+        canter::client::EventSubscription::open(&fixture.socket, None).expect("subscribe");
     let snapshot_line = subscription
         .next_line()
         .expect("snapshot")
@@ -982,7 +980,7 @@ fn subscribe_resnapshots_future_cursors_and_replays_contiguously() {
     drop(subscription);
 
     // A future cursor is answered with a fresh snapshot (gap detection).
-    let mut future = herdr_fleet::client::EventSubscription::open(&fixture.socket, Some(1 << 30))
+    let mut future = canter::client::EventSubscription::open(&fixture.socket, Some(1 << 30))
         .expect("subscribe future");
     let future_line = future.next_line().expect("line").expect("closed");
     let future_doc = Val::parse_json(&future_line).expect("parse");
@@ -994,8 +992,8 @@ fn subscribe_resnapshots_future_cursors_and_replays_contiguously() {
     drop(future);
 
     // Live events stream in strictly increasing seq order while subscribed.
-    let mut live = herdr_fleet::client::EventSubscription::open(&fixture.socket, None)
-        .expect("subscribe live");
+    let mut live =
+        canter::client::EventSubscription::open(&fixture.socket, None).expect("subscribe live");
     let _snapshot = live.next_line().expect("snapshot").expect("closed");
     let mut last_seq = 0i64;
     for index in 3..6 {
@@ -1020,7 +1018,7 @@ fn subscribe_resnapshots_future_cursors_and_replays_contiguously() {
     }
 
     // A contiguous replay resumes from a real cursor without a snapshot.
-    let mut replay = herdr_fleet::client::EventSubscription::open(&fixture.socket, Some(last_seq))
+    let mut replay = canter::client::EventSubscription::open(&fixture.socket, Some(last_seq))
         .expect("subscribe replay");
     let replay_line = replay
         .next_line()
@@ -1052,11 +1050,11 @@ fn non_draining_subscriber_is_disconnected_under_backpressure() {
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
     let request = format!(
         "{}\n",
-        herdr_fleet::canonical::canonical_text(&object(vec![
+        canter::canonical::canonical_text(&object(vec![
             ("schema", string("hf-rpc-request/v1")),
             ("id", string(&fresh_id(60))),
             ("method", string("events.subscribe")),
-            ("params", herdr_fleet::value::null()),
+            ("params", canter::value::null()),
         ]))
     );
     stream
@@ -1066,7 +1064,7 @@ fn non_draining_subscriber_is_disconnected_under_backpressure() {
     reader.read_line(&mut response).expect("subscribe response");
     assert!(response.contains("event_stream"), "{response}");
 
-    let cap = herdr_fleet::daemon::SUBSCRIBER_QUEUE_CAP;
+    let cap = canter::daemon::SUBSCRIBER_QUEUE_CAP;
     let storm_requests = cap + 64;
     for index in 0..storm_requests {
         let key = format!("ik_ac7-bp-{index:08}");

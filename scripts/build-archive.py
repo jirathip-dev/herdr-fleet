@@ -41,11 +41,11 @@ import tempfile
 # The four release-blocking platforms (docs/RELEASING.md).
 PLATFORMS = ("linux-x86_64", "linux-aarch64", "darwin-x86_64", "darwin-aarch64")
 
-_ARCHIVE_RE = re.compile(r"^herdr-fleet-(?P<version>[0-9]+[0-9a-zA-Z.\-]*)"
+_ARCHIVE_RE = re.compile(r"^canter-(?P<version>[0-9]+[0-9a-zA-Z.\-]*)"
                          r"-(?P<platform>" + "|".join(PLATFORMS) + r")\.tar\.gz$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
-_VERSION_LINE_RE = re.compile(r"^herdr-fleet (?P<version>[0-9][0-9a-zA-Z.\-]*)",
+_VERSION_LINE_RE = re.compile(r"^canter (?P<version>[0-9][0-9a-zA-Z.\-]*)",
                               re.MULTILINE)
 _SCHEMA_LINE_RE = re.compile(r"^state schema version: (?P<version>[0-9]+)$",
                              re.MULTILINE)
@@ -54,8 +54,13 @@ _MIGRATION_LINE_RE = re.compile(r"^migration chain: (?P<chain>.*)$",
 _FAMILIES_LINE_RE = re.compile(r"^document schema families: (?P<families>.*)$",
                                re.MULTILINE)
 
+# The pre-rename product-name alias (docs/contracts/compatibility.md,
+# "Product rename (issue #106)"): every archive ships it next to `canter`.
+LEGACY_ALIAS = "herdr-fleet"
+
 ARCHIVE_MEMBERS = (
-    "herdr-fleet",
+    "canter",
+    LEGACY_ALIAS,
     "LICENSE-APACHE",
     "LICENSE-MIT",
     "SBOM.spdx.json",
@@ -120,19 +125,19 @@ def parse_lockfile_packages(lock_text: str) -> list[dict[str, str]]:
 def make_sbom(packages: list[dict[str, str]], version: str, source_ref: str,
               created: str) -> dict:
     """SPDX 2.3 JSON SBOM derived from Cargo.lock package entries."""
-    root_name = "herdr-fleet"
+    root_name = "canter"
     doc = {
         "spdxVersion": "SPDX-2.3",
         "dataLicense": "CC0-1.0",
         "SPDXID": "SPDXRef-DOCUMENT",
-        "name": f"herdr-fleet-{version}-sbom",
+        "name": f"canter-{version}-sbom",
         "documentNamespace": (
-            "https://spdx.org/spdxdocs/herdr-fleet/"
+            "https://spdx.org/spdxdocs/canter/"
             f"{version}/{source_ref}"
         ),
         "creationInfo": {
             "created": created,
-            "creators": ["Tool: scripts/build-archive.py (herdr-fleet)"],
+            "creators": ["Tool: scripts/build-archive.py (canter)"],
         },
         "packages": [],
         "relationships": [],
@@ -141,7 +146,7 @@ def make_sbom(packages: list[dict[str, str]], version: str, source_ref: str,
     # The root package is the release itself (not on crates.io; publish=false).
     doc["packages"].append({
         "name": root_name,
-        "SPDXID": "SPDXRef-Package-herdr-fleet",
+        "SPDXID": "SPDXRef-Package-canter",
         "versionInfo": version,
         "downloadLocation": "NOASSERTION",
         "filesAnalyzed": False,
@@ -154,7 +159,7 @@ def make_sbom(packages: list[dict[str, str]], version: str, source_ref: str,
             "referenceLocator": f"pkg:cargo/{root_name}@{version}",
         }],
     })
-    pkg_ids[root_name] = "SPDXRef-Package-herdr-fleet"
+    pkg_ids[root_name] = "SPDXRef-Package-canter"
     for package in packages:
         name = package.get("name", "")
         version_info = package.get("version", "")
@@ -263,7 +268,7 @@ def write_canonical_json(path: str, value: dict) -> None:
 def cmd_build(args: argparse.Namespace) -> int:
     repo = os.path.abspath(args.repo)
     if not os.path.isfile(os.path.join(repo, "Cargo.lock")):
-        sys.stderr.write(f"error: {repo} does not look like the herdr-fleet repo "
+        sys.stderr.write(f"error: {repo} does not look like the canter repo "
                          "(no Cargo.lock)\n")
         return 1
     if not _COMMIT_RE.match(args.source_ref):
@@ -291,6 +296,16 @@ def cmd_build(args: argparse.Namespace) -> int:
         sys.stderr.write(f"error: --binary {binary} is not an executable file "
                          "(run `cargo build --release --locked` first)\n")
         return 1
+    # The pre-rename alias must sit next to the canonical binary: it is a
+    # shipped member of every archive (docs/contracts/compatibility.md).
+    alias = os.path.join(os.path.dirname(binary), LEGACY_ALIAS)
+    if not os.path.isfile(alias) or not os.access(alias, os.X_OK):
+        sys.stderr.write(
+            f"error: the pre-rename alias {alias} is not an executable file; "
+            "`cargo build --release --locked` must produce it next to "
+            "--binary and every archive must ship it "
+            "(docs/contracts/compatibility.md)\n")
+        return 1
     if args.platform not in PLATFORMS:
         sys.stderr.write("error: --platform must be one of: "
                          + ", ".join(PLATFORMS) + "\n")
@@ -315,8 +330,8 @@ def cmd_build(args: argparse.Namespace) -> int:
         packages = parse_lockfile_packages(handle.read())
     sbom = make_sbom(packages, args.version, args.source_ref, committed_at)
 
-    stem = f"herdr-fleet-{args.version}-{args.platform}"
-    inner = f"herdr-fleet-{args.version}"
+    stem = f"canter-{args.version}-{args.platform}"
+    inner = f"canter-{args.version}"
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -324,8 +339,9 @@ def cmd_build(args: argparse.Namespace) -> int:
     try:
         inner_dir = os.path.join(staging, inner)
         os.makedirs(inner_dir, mode=0o755, exist_ok=True)
-        shutil.copy2(binary, os.path.join(inner_dir, "herdr-fleet"))
-        os.chmod(os.path.join(inner_dir, "herdr-fleet"), 0o755)
+        for name, source in (("canter", binary), (LEGACY_ALIAS, alias)):
+            shutil.copy2(source, os.path.join(inner_dir, name))
+            os.chmod(os.path.join(inner_dir, name), 0o755)
         for license_name in ("LICENSE-APACHE", "LICENSE-MIT"):
             shutil.copy2(os.path.join(repo, license_name),
                          os.path.join(inner_dir, license_name))
@@ -335,8 +351,8 @@ def cmd_build(args: argparse.Namespace) -> int:
 
         # Per-file checksums (deterministic content manifest).
         manifest: dict[str, str] = {}
-        for member in ("herdr-fleet", "LICENSE-APACHE", "LICENSE-MIT",
-                       "SBOM.spdx.json"):
+        for member in ("canter", LEGACY_ALIAS, "LICENSE-APACHE",
+                       "LICENSE-MIT", "SBOM.spdx.json"):
             manifest[member] = sha256_file(
                 os.path.join(inner_dir, member))
         sha_lines = "".join(
@@ -350,7 +366,7 @@ def cmd_build(args: argparse.Namespace) -> int:
 
         provenance = {
             "record": "release-provenance/v1",
-            "product": "herdr-fleet",
+            "product": "canter",
             "version": args.version,
             "platform": args.platform,
             "source": {"ref": args.source_ref, "committed_at": committed_at},
@@ -383,7 +399,8 @@ def cmd_build(args: argparse.Namespace) -> int:
                         info = tarfile.TarInfo(os.path.join(inner, name))
                         info.size = os.path.getsize(member_path)
                         info.mtime = commit_ts
-                        info.mode = 0o755 if name == "herdr-fleet" else 0o644
+                        info.mode = (0o755 if name in ("canter", LEGACY_ALIAS)
+                                     else 0o644)
                         info.uid = 0
                         info.gid = 0
                         info.uname = ""
@@ -418,7 +435,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     if not match:
         sys.stderr.write(
             f"error: {os.path.basename(archive_path)} does not match "
-            "herdr-fleet-<version>-<platform>.tar.gz\n")
+            "canter-<version>-<platform>.tar.gz\n")
         return 2
     stem = match.group(0)[:-len(".tar.gz")]
 
@@ -527,7 +544,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
         ok("SBOM parses as SPDX 2.3 with a non-empty package list")
 
         # Binary self-reported facts must match the provenance record.
-        binary_path = os.path.join(inner_root, "herdr-fleet")
+        binary_path = os.path.join(inner_root, "canter")
         proc = subprocess.run(
             [binary_path, "--version"], stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, check=False)
@@ -591,7 +608,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     verify = sub.add_parser("verify", help="verify an archive against its "
                                            "provenance record")
     verify.add_argument("--archive", required=True,
-                        help="path to herdr-fleet-<version>-<platform>.tar.gz")
+                        help="path to canter-<version>-<platform>.tar.gz")
 
     return parser.parse_args(argv)
 

@@ -21,7 +21,8 @@
 //! - Logs are JSONL with only allowlisted fields and redacted bounded
 //!   summaries (AC8); there is no network listener, usage reporting,
 //!   auto-update path, or notification integration anywhere (AC10).
-//! - `HERDR_FLEET_CRASH_POINT` aborts the process at a named journal
+//! - `CANTER_CRASH_POINT` (pre-rename alias: `HERDR_FLEET_CRASH_POINT`;
+//!   docs/contracts/compatibility.md) aborts the process at a named journal
 //!   boundary in **debug builds only**; release binaries ignore it, so it
 //!   cannot be weaponized against a production daemon.
 
@@ -6081,14 +6082,29 @@ fn reconcile_lane_successor(
 // ---------------------------------------------------------------------------
 // Crash-point injection (debug builds only; release ignores the env var)
 // ---------------------------------------------------------------------------
+/// Canonical crash-point env var and its pre-rename alias (product rename,
+/// issue #106): both names are honored so pre-rename test tooling keeps
+/// working (docs/contracts/compatibility.md, "Product rename (issue #106)").
+const CRASH_POINT_ENV: &str = "CANTER_CRASH_POINT";
+const LEGACY_CRASH_POINT_ENV: &str = "HERDR_FLEET_CRASH_POINT";
+
+/// Pick the requested crash point: the canonical env var wins, the
+/// pre-rename name is honored as a fallback. Pure so the alias rule is
+/// unit-testable without touching this process's environment.
+fn crash_point_requested(canonical: Option<&str>, legacy: Option<&str>) -> Option<String> {
+    canonical.or(legacy).map(str::to_string)
+}
+
 /// Abort the daemon at a named journal boundary. Honored only when
 /// `cfg!(debug_assertions)` — release binaries never crash from this hook.
 fn crash_point(point: &str) {
     if !cfg!(debug_assertions) {
         return;
     }
-    if std::env::var("HERDR_FLEET_CRASH_POINT").as_deref() == Ok(point) {
-        eprintln!("herdr-fleet: crash point {point:?} reached (debug-only test hook)");
+    let canonical = std::env::var(CRASH_POINT_ENV).ok();
+    let legacy = std::env::var(LEGACY_CRASH_POINT_ENV).ok();
+    if crash_point_requested(canonical.as_deref(), legacy.as_deref()).as_deref() == Some(point) {
+        eprintln!("canter: crash point {point:?} reached (debug-only test hook)");
         std::process::abort();
     }
 }
@@ -6096,6 +6112,27 @@ fn crash_point(point: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crash_point_env_alias_prefers_canonical_and_honors_legacy() {
+        // Issue #106: the pre-rename crash-point env var keeps working.
+        assert_eq!(crash_point_requested(Some("a"), None).as_deref(), Some("a"));
+        assert_eq!(crash_point_requested(None, Some("b")).as_deref(), Some("b"));
+        assert_eq!(
+            crash_point_requested(Some("a"), Some("b")).as_deref(),
+            Some("a"),
+            "the canonical name wins when both are set"
+        );
+        assert_eq!(crash_point_requested(None, None), None);
+        assert_eq!(
+            CRASH_POINT_ENV, "CANTER_CRASH_POINT",
+            "canonical env var name"
+        );
+        assert_eq!(
+            LEGACY_CRASH_POINT_ENV, "HERDR_FLEET_CRASH_POINT",
+            "pre-rename env var name"
+        );
+    }
 
     #[test]
     fn bounded_summary_truncates_at_char_boundary() {

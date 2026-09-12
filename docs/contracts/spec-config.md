@@ -10,9 +10,10 @@ stack").
 ## Config: `hf-config/v1` (TOML)
 
 - Location: explicit `--config` path wins; otherwise XDG default
-  (`$XDG_CONFIG_HOME/herdr-fleet/config.toml`, falling back to the
-  platform XDG equivalent). Values below are portable; no machine-specific
-  default is compiled in.
+  (`$XDG_CONFIG_HOME/canter/config.toml`; a pre-rename
+  `herdr-fleet/config.toml` is still discovered when the new path holds
+  none — see [compatibility.md](compatibility.md#product-rename-issue-106)).
+  Values below are portable; no machine-specific default is compiled in.
 - The config is **one canonical file**. There is no implicit merge stack of
   profiles/repositories/hosts. Additional input arrives only through the
   single explicit overlay (below).

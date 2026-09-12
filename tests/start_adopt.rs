@@ -10,7 +10,7 @@
 //! PAUSED fence between transitions, and the restart reconciliation that
 //! re-derives the startup nonce and the process evidence before any retry.
 //!
-//! Every test spawns `herdr-fleet daemon run` as a child process with
+//! Every test spawns `canter daemon run` as a child process with
 //! isolated XDG state and an explicit socket under a per-test temp dir. The
 //! workspace executable the start/adopt paths drive is a fake `herdr`
 //! recorded in a per-fixture invocation log, on a PATH that contains
@@ -22,11 +22,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use herdr_fleet::client::{Connection, RpcError};
-use herdr_fleet::value::{Val, bool_, integer, null, object, string};
+use canter::client::{Connection, RpcError};
+use canter::value::{Val, bool_, integer, null, object, string};
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_herdr-fleet")
+    env!("CARGO_BIN_EXE_canter")
 }
 
 /// Default per-test daemon readiness deadline.
@@ -103,7 +103,7 @@ impl Fixture {
     }
 
     fn daemon_log(&self) -> PathBuf {
-        self.state_dir.join("herdr-fleet").join("daemon.log")
+        self.state_dir.join("canter").join("daemon.log")
     }
 
     fn bin_dir(&self) -> PathBuf {
@@ -164,7 +164,7 @@ impl Fixture {
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file));
         if let Some(point) = crash_point {
-            command.env("HERDR_FLEET_CRASH_POINT", point);
+            command.env("CANTER_CRASH_POINT", point);
         }
         command.spawn().expect("spawn daemon")
     }
@@ -173,9 +173,7 @@ impl Fixture {
 fn wait_ready(fixture: &Fixture) {
     let deadline = Instant::now() + READY_TIMEOUT;
     while Instant::now() < deadline {
-        if herdr_fleet::lock::socket_presence(&fixture.socket)
-            == herdr_fleet::lock::SocketPresence::Active
-        {
+        if canter::lock::socket_presence(&fixture.socket) == canter::lock::SocketPresence::Active {
             let ok = Connection::open(&fixture.socket)
                 .and_then(|mut connection| {
                     connection.send_request("aaaaaaaaaaaaaaaa", "status", None)?;
@@ -246,7 +244,7 @@ fn rpc_ok(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
         doc.get("ok").and_then(Val::as_bool),
         Some(true),
         "expected ok response for {method}: {}",
-        herdr_fleet::canonical::canonical_text(&doc)
+        canter::canonical::canonical_text(&doc)
     );
     doc.get("result").expect("result").clone()
 }
@@ -257,7 +255,7 @@ fn rpc_err(socket: &Path, id: &str, method: &str, params: Option<Val>) -> (Strin
         doc.get("ok").and_then(Val::as_bool),
         Some(false),
         "expected refused response for {method}: {}",
-        herdr_fleet::canonical::canonical_text(&doc)
+        canter::canonical::canonical_text(&doc)
     );
     let error = doc.get("error").expect("error doc");
     (
@@ -670,7 +668,7 @@ fn retired_record(
 
 fn admission(caps: (i64, i64, i64), measured_at: &str) -> Val {
     object(vec![
-        ("repository", string("example-org/herdr-fleet")),
+        ("repository", string("example-org/canter")),
         (
             "caps",
             object(vec![
@@ -688,7 +686,7 @@ fn admission(caps: (i64, i64, i64), measured_at: &str) -> Val {
 }
 
 fn live_admission() -> Val {
-    admission((8, 4, 4), &herdr_fleet::time::rfc3339_now())
+    admission((8, 4, 4), &canter::time::rfc3339_now())
 }
 
 fn start_params(
@@ -1155,7 +1153,7 @@ fn capacity_refusal_is_a_held_typed_refusal_with_a_bounded_retry() {
     assert_eq!(code, "refusal.admission.proof_missing", "{message}");
 
     // Stale host-resource proof: unknown/stale measurements refuse.
-    let stale_at = herdr_fleet::time::rfc3339_from_unix(herdr_fleet::time::unix_now() - 3600);
+    let stale_at = canter::time::rfc3339_from_unix(canter::time::unix_now() - 3600);
     let id = fresh_id(221);
     let (code, message) = rpc_err(
         &fixture.socket,
@@ -1184,7 +1182,7 @@ fn capacity_refusal_is_a_held_typed_refusal_with_a_bounded_retry() {
             &digest,
             "nonce-0001",
             SUCCESSOR_SESSION,
-            admission((0, 4, 4), &herdr_fleet::time::rfc3339_now()),
+            admission((0, 4, 4), &canter::time::rfc3339_now()),
         )),
     );
     assert_eq!(code, "refusal.admission.cap_global", "{message}");

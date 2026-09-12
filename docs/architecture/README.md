@@ -1,6 +1,12 @@
 # Architecture artifacts
 
-This directory commits two architecture artifact sets for herdr-fleet:
+This directory commits two architecture artifact sets for canter. Both sets
+are **frozen, SHA-256-pinned records**: their filenames (`herdr-fleet.*`) and
+their rendered titles retain the product name as it was when they were
+produced (v0.1.0 / locked target, before the issue #106 rename) — they are
+dated evidence, not live product surfaces. The rename compatibility rule for
+these files is in
+[../contracts/compatibility.md](../contracts/compatibility.md#product-rename-issue-106).
 
 - **As-shipped (v0.1.0)** — what the current release ships today (first
   section below; the picture embedded at the top of the repository README).
@@ -39,7 +45,7 @@ optional read-only Corral edge, no workspace/pane edges into Herdr.
   (generator `archify 2.17.0-dev.1`) — with the diagram body (SVG) authored in
   the export's own markup conventions from the committed JSON. The shell's
   rendered chrome was **re-authored to the as-shipped identity as well**: the
-  page `<h1>` reads "herdr-fleet — As-Shipped Architecture (v0.1.0)" and the
+  page `<h1>` reads "canter — As-Shipped Architecture (v0.1.0)" and the
   footer info card ("Shipped v0.1.0") carries as-shipped prose and the
   as-shipped arrow legend — no locked-target title, "Target contract" card, or
   locked-target arrow legend remains anywhere in the file. The
@@ -86,7 +92,7 @@ file's default theme is dark.)
 
 ## Locked target architecture (v5)
 
-The approved **locked target architecture** for herdr-fleet (issue #1's final
+The approved **locked target architecture** for canter (issue #1's final
 architecture and delivery graph, Amendment 3 of issue #2). It is the *target*
 model — **not** the current implementation; the current v0.1.0 shipped surface
 has its own committed artifact set (above) and is described in the repository

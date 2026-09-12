@@ -272,7 +272,7 @@ class Probe:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="clean-host-probe.py")
     parser.add_argument("--bin", required=True,
-                        help="path to the release herdr-fleet binary")
+                        help="path to the release canter binary")
     parser.add_argument("--schedule-doc", required=True,
                         help="path to the synthetic hf-schedule/v1 fixture "
                              "(schemas/fixtures/schedule/schedule.valid.json)")

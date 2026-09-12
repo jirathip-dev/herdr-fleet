@@ -3,7 +3,7 @@
 //! identity bindings, CAS transitions, held/ambiguous outcomes, restart
 //! durability of the record + history + next allowed transition).
 //!
-//! Every test spawns `herdr-fleet daemon run` as a child process with
+//! Every test spawns `canter daemon run` as a child process with
 //! isolated XDG state and an explicit socket under a per-test temp dir;
 //! nothing here touches the real host state, the service manager, or the
 //! network. All identities are synthetic.
@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use herdr_fleet::client::{Connection, RpcError};
-use herdr_fleet::value::{Val, bool_, integer, null, object, string};
+use canter::client::{Connection, RpcError};
+use canter::value::{Val, bool_, integer, null, object, string};
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_herdr-fleet")
+    env!("CARGO_BIN_EXE_canter")
 }
 
 struct Fixture {
@@ -61,7 +61,7 @@ impl Fixture {
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file));
         if let Some(point) = crash_point {
-            command.env("HERDR_FLEET_CRASH_POINT", point);
+            command.env("CANTER_CRASH_POINT", point);
         }
         if let PathMode::WithoutTools = path_mode {
             let empty = self.dir.join("empty-bin");
@@ -75,9 +75,7 @@ impl Fixture {
 fn wait_ready(fixture: &Fixture) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        if herdr_fleet::lock::socket_presence(&fixture.socket)
-            == herdr_fleet::lock::SocketPresence::Active
-        {
+        if canter::lock::socket_presence(&fixture.socket) == canter::lock::SocketPresence::Active {
             let ok = Connection::open(&fixture.socket)
                 .and_then(|mut connection| {
                     connection.send_request("aaaaaaaaaaaaaaaa", "status", None)?;
@@ -132,7 +130,7 @@ fn rpc_ok(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
         doc.get("ok").and_then(Val::as_bool),
         Some(true),
         "expected ok response for {method}: {}",
-        herdr_fleet::canonical::canonical_text(&doc)
+        canter::canonical::canonical_text(&doc)
     );
     doc.get("result").expect("result").clone()
 }
@@ -143,7 +141,7 @@ fn rpc_err(socket: &Path, id: &str, method: &str, params: Option<Val>) -> (Strin
         doc.get("ok").and_then(Val::as_bool),
         Some(false),
         "expected refused response for {method}: {}",
-        herdr_fleet::canonical::canonical_text(&doc)
+        canter::canonical::canonical_text(&doc)
     );
     let error = doc.get("error").expect("error doc");
     (
@@ -301,7 +299,7 @@ fn request_is_idempotent_and_concurrent_requests_yield_one_owner() {
     let replacement_id = field_str(&first, "replacement_id").to_string();
     assert_eq!(
         replacement_id,
-        herdr_fleet::state::replacement_id_for("lane-7", 1),
+        canter::state::replacement_id_for("lane-7", 1),
         "the record identity is deterministic per lane generation"
     );
     assert_eq!(field_str(&first, "phase"), "requested");
@@ -544,7 +542,7 @@ fn missing_or_invalid_identities_refuse_without_creating_records() {
 
     // No record was created — status of the would-be deterministic id is a
     // typed not-found, and the journal holds no request intent.
-    let would_be = herdr_fleet::state::replacement_id_for("lane-7", 1);
+    let would_be = canter::state::replacement_id_for("lane-7", 1);
     let (code, message) = rpc_err(
         &fixture.socket,
         &fresh_id(90),

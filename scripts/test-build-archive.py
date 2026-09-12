@@ -5,19 +5,23 @@ Proves the issue #10 release-archive chain end-to-end on the current host:
 builder failure modes BITE (wrong source ref, dirty tree, version mismatch,
 unknown platform) and a real archive maps back to source + binary-reported
 schema facts + checksums + SBOM digest, deterministically (two builds with
-the same inputs produce byte-identical metadata and archive).
+the same inputs produce byte-identical metadata and archive). Issue #106
+review-fix round: the archive must also ship the pre-rename alias member
+with its own executable framing, SHA256SUMS entry and provenance record
+(docs/contracts/compatibility.md).
 
 Stdlib only. Run from the repository root:
     python3 scripts/test-build-archive.py
-Requirements: git, a release binary (builds one with
-`cargo build --release --locked` if absent), and a clean tracked worktree at
-a fixed HEAD. Never touches the network.
+Requirements: git, the release binaries (canter plus the pre-rename alias,
+built with `cargo build --release --locked` when absent), and a clean
+tracked worktree at a fixed HEAD. Never touches the network.
 """
 
 from __future__ import annotations
 
 import gzip
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -28,6 +32,23 @@ import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = os.path.join(REPO, "scripts", "build-archive.py")
+
+# The pre-rename alias binary member every release archive must ship next to
+# `canter` (docs/contracts/compatibility.md, "Product rename (issue #106)").
+# This single occurrence is a deliberate legacy mention pinned by
+# tests/rename_sweep.rs.
+LEGACY_ALIAS = "herdr-fleet"
+
+
+def _load_builder():
+    """Import the builder under test — single source for its member list."""
+    spec = importlib.util.spec_from_file_location("hf_build_archive", BUILDER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+builder = _load_builder()
 
 
 def run(argv, cwd=None, check=True):
@@ -42,11 +63,12 @@ def run(argv, cwd=None, check=True):
 
 
 def ensure_release_binary():
-    binary = os.path.join(REPO, "target", "release", "herdr-fleet")
-    if not os.path.isfile(binary):
+    binary = os.path.join(REPO, "target", "release", "canter")
+    alias = os.path.join(REPO, "target", "release", LEGACY_ALIAS)
+    if not os.path.isfile(binary) or not os.path.isfile(alias):
         proc = run(["cargo", "build", "--release", "--locked"], cwd=REPO)
         if proc.returncode != 0:
-            raise AssertionError("could not build the release binary")
+            raise AssertionError("could not build the release binaries")
     return binary
 
 
@@ -101,16 +123,20 @@ def checks():
         # A malicious archive whose member basenames match the documented
         # layout but whose paths escape the extraction directory must be
         # refused by verify (tarfile extractall runs with filter='data').
-        malicious = os.path.join(tmp, "herdr-fleet-0.1.0-linux-x86_64.tar.gz")
-        benign_names = ("LICENSE-APACHE", "LICENSE-MIT", "SBOM.spdx.json",
-                        "SHA256SUMS", "provenance.json")
+        malicious = os.path.join(tmp, "canter-0.1.0-linux-x86_64.tar.gz")
+        # The fixture must pass the layout check so the refusal provably comes
+        # from the traversal path, not from a missing member: take every
+        # documented member except `canter` (which the traversal member
+        # reports as its basename) off the builder's own member list.
+        benign_names = [name for name in builder.ARCHIVE_MEMBERS
+                        if name != "canter"]
         with open(malicious, "wb") as raw:
             with gzip.GzipFile(filename="", mode="wb", fileobj=raw,
                                mtime=0) as gz:
                 with tarfile.open(fileobj=gz, mode="w",
                                   format=tarfile.GNU_FORMAT) as tar:
                     for name in benign_names:
-                        info = tarfile.TarInfo("herdr-fleet-0.1.0/" + name)
+                        info = tarfile.TarInfo("canter-0.1.0/" + name)
                         info.size = 0
                         info.mtime = 0
                         info.uid = 0
@@ -119,7 +145,7 @@ def checks():
                     # Traversal member: same basename as the documented
                     # executable, path escapes the extraction directory.
                     evil = tarfile.TarInfo(
-                        "herdr-fleet-0.1.0/../../../herdr-fleet")
+                        "canter-0.1.0/../../../canter")
                     evil.size = 0
                     evil.mtime = 0
                     evil.uid = 0
@@ -140,7 +166,7 @@ def checks():
                       "--out-dir", out_dir]
         first = run(build_args)
         assert first.returncode == 0, first.stderr.decode()
-        archive = os.path.join(out_dir, "herdr-fleet-0.1.0-linux-x86_64.tar.gz")
+        archive = os.path.join(out_dir, "canter-0.1.0-linux-x86_64.tar.gz")
         assert os.path.isfile(archive)
         assert os.path.isfile(archive + ".sha256")
 
@@ -151,6 +177,34 @@ def checks():
         assert "6 checks passed" in out_text, out_text
         print("PASS: archive verifies against its provenance record "
               "(6 checks)")
+
+        # --- the pre-rename alias ships as a wired, executable member ----------
+        # The compatibility contract promises the alias binary is shipped next
+        # to `canter`; these witnesses fail if the member is missing, loses
+        # its executable framing, or drops out of SHA256SUMS/provenance.files.
+        with tarfile.open(archive, "r:gz") as tar:
+            members = {os.path.basename(member.name): member
+                       for member in tar.getmembers() if member.isfile()}
+            expected = sorted(builder.ARCHIVE_MEMBERS)
+            assert sorted(members) == expected, sorted(members)
+            assert LEGACY_ALIAS in members, sorted(members)
+            alias_member = members[LEGACY_ALIAS]
+            assert alias_member.mode == 0o755, oct(alias_member.mode)
+            alias_digest = hashlib.sha256(
+                tar.extractfile(alias_member).read()).hexdigest()
+            sums_text = tar.extractfile(members["SHA256SUMS"]).read().decode()
+            provenance_text = tar.extractfile(
+                members["provenance.json"]).read().decode()
+        sums = {}
+        for line in sums_text.splitlines():
+            digest, _, name = line.partition("  ")
+            sums[name] = digest
+        provenance_files = json.loads(provenance_text)["files"]
+        assert sums.get(LEGACY_ALIAS) == alias_digest, sums
+        assert provenance_files.get(LEGACY_ALIAS) == alias_digest, (
+            provenance_files)
+        print(f"PASS: archive ships the {LEGACY_ALIAS} alias member (755) "
+              "wired into SHA256SUMS and provenance.files")
 
         # --- provenance maps to source + schema facts ---------------------------
         with tarfile.open(archive, "r:gz") as tar:
@@ -182,27 +236,22 @@ def checks():
         assert sbom_data is not None, "SBOM missing"
         assert sbom_data["spdxVersion"] == "SPDX-2.3"
         # Reuse the builder's own Cargo.lock parser (single source of truth).
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "hf_build_archive", BUILDER)
-        builder = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(builder)
         lock_text = open(os.path.join(REPO, "Cargo.lock"),
                          encoding="utf-8").read()
         packages = {p["name"]: p.get("version", "")
                     for p in builder.parse_lockfile_packages(lock_text)}
         sbom_names = {p["name"]: p.get("versionInfo")
                       for p in sbom_data["packages"]}
-        assert "herdr-fleet" in sbom_names and sbom_names["herdr-fleet"] == "0.1.0"
+        assert "canter" in sbom_names and sbom_names["canter"] == "0.1.0"
         # Every dependency in Cargo.lock appears once with its version; the
         # SBOM's root package entry corresponds to Cargo.lock's own
-        # herdr-fleet entry (same name/version), so counts are equal.
+        # canter entry (same name/version), so counts are equal.
         for name, version in packages.items():
             assert sbom_names.get(name) == version, (
                 f"SBOM must mirror Cargo.lock for {name}@{version}")
         assert len(sbom_names) == len(packages), (
             "SBOM package count must equal Cargo.lock packages "
-            "(root entry covers Cargo.lock's own herdr-fleet row)")
+            "(root entry covers Cargo.lock's own canter row)")
         print(f"PASS: SBOM mirrors Cargo.lock offline ({len(packages)} "
               "packages incl. root)")
 
@@ -211,7 +260,7 @@ def checks():
         os.makedirs(second_out)
         second = run(build_args + ["--out-dir", second_out])
         assert second.returncode == 0, second.stderr.decode()
-        archive2 = os.path.join(second_out, "herdr-fleet-0.1.0-linux-x86_64.tar.gz")
+        archive2 = os.path.join(second_out, "canter-0.1.0-linux-x86_64.tar.gz")
 
         def file_sha(path):
             digest = hashlib.sha256()

@@ -1425,6 +1425,9 @@ fn effect_prompt(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(profile) => profile,
         Err(outcome) => return outcome,
     };
+    // Default session names keep the pre-rename identifier: a live Herdr
+    // lane/terminal session name is external identity and is not renamed
+    // (docs/contracts/compatibility.md, "Product rename (issue #106)").
     let identity = match crate::adapters::bind_identity(
         param_str_opt(Some(params), "herdr_session").unwrap_or("herdr-fleet-lane"),
         param_str_opt(Some(params), "terminal_session").unwrap_or("herdr-fleet-lane"),

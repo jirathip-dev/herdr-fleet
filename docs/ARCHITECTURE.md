@@ -9,7 +9,7 @@ The locked target is documented in the committed architecture artifacts in
 
 ## Current scaffold (as shipped)
 
-One Cargo package (library + `herdr-fleet` binary). The read-only CLI core
+One Cargo package (library + `canter` binary). The read-only CLI core
 keeps a deliberately small dependency set (serde/toml/sha2); the daemon adds
 bundled SQLite + flock (rusqlite/fs2/libc) for its single-writer state
 store:
@@ -82,7 +82,7 @@ authority) -> typed workflow + plan engine -> typed effects + adapters
 
 ## Scheduler-cutover truth
 
-herdr-fleet does **not** replace Hermes Agent, the Hermes scheduler as a
+canter does **not** replace Hermes Agent, the Hermes scheduler as a
 platform, Corral's daemon, Herdr's server, or unrelated research/office/host-
 maintenance automation. Its planned scope is **portable fleet scheduling**
 (pause/resume/rearm/supervision/recovery/cleanup for software-repository
@@ -92,7 +92,7 @@ concerns tracked elsewhere. **Issue #2 changes no live state**: no cron,
 launchd, service, caller, daemon, live config, or runtime state is touched by
 this repository's content.
 
-## Layer responsibilities (Herdr hosts / herdr-fleet tracks / Corral displays)
+## Layer responsibilities (Herdr hosts / canter tracks / Corral displays)
 
 Each product owns one layer of a fleet lane's life:
 
@@ -101,10 +101,10 @@ Each product owns one layer of a fleet lane's life:
   It detects its recognized agent kinds in panes, rolls their states up
   into the sidebar (`working`, `blocked`, `done`, `idle`, `unknown`), and
   exposes the `herdr agent` / `herdr pane` CLI and socket API.
-- **herdr-fleet tracks.** herdr-fleet owns fleet state and discipline:
+- **canter tracks.** canter owns fleet state and discipline:
   plans, route grants, lanes/instances, review evidence, journals, epochs,
   and schedules live in its own single-writer daemon state store — never in
-  Herdr, which herdr-fleet observes but never controls (the
+  Herdr, which canter observes but never controls (the
   [README](../README.md) as-shipped diagram; [OPERATIONS.md](OPERATIONS.md)).
   Where Herdr supports a custom reporting source, the shipped `pi`
   (issue #33) and `jcode` (issue #37) adapter profiles also report a lane
@@ -114,25 +114,25 @@ Each product owns one layer of a fleet lane's life:
   [spec-capabilities.md](contracts/spec-capabilities.md).
 - **Corral displays.** Corral is the optional, independent **read-only**
   display layer: `corrald` consumes Herdr's per-user socket and renders
-  read-model boards. Corral has no runtime dependency on herdr-fleet and
-  herdr-fleet none on Corral; an optional future Corral adapter that reads
-  herdr-fleet status for lanes Herdr cannot classify is an open idea —
+  read-model boards. Corral has no runtime dependency on canter and
+  canter none on Corral; an optional future Corral adapter that reads
+  canter status for lanes Herdr cannot classify is an open idea —
   [Corral#443](https://github.com/jirathip-dev/corral/issues/443).
 
 **Recognized vs unrecognized harnesses.** Herdr 0.9.0 spawns from a closed
 list of recognized agent kinds — 23 kinds in the 0.9.0 measured for this
 revision (`herdr agent start --help`, 2026-09-09; the list grows as Herdr
-adds agents). jcode is a first-class herdr-fleet adapter (issue #37) but
+adds agents). jcode is a first-class canter adapter (issue #37) but
 **not** a Herdr agent kind — by design, Herdr's owner declined an upstream
 feature request. An unrecognized harness runs fine in a pane (it is an
 ordinary terminal process) but gets no Herdr agent-kind lifecycle tracking,
-so the agents-sidebar gap for such lanes is **not a defect**. herdr-fleet's
+so the agents-sidebar gap for such lanes is **not a defect**. canter's
 daemon state above, plus the custom `pane report-agent` rows, are the
 intended tracker: `pi` is also a recognized Herdr kind (`herdr agent start
 --kind pi` starts interactive Pi panes), while headless adapter lanes report
 through the custom rows; jcode registers through the custom rows only.
 OPERATIONS.md section 3.1 describes monitoring an unrecognized-harness lane
-from herdr-fleet state instead of `herdr agent list`.
+from canter state instead of `herdr agent list`.
 
 ## Corral's actual current path (separate product)
 
@@ -141,11 +141,11 @@ Herdr per-user Unix socket -> corrald -> FleetNotifier (iOS)
 ```
 
 Corral is an independent, optional, **read-only** observability product. It
-has no runtime dependency on herdr-fleet, and herdr-fleet has none on Corral.
+has no runtime dependency on canter, and canter has none on Corral.
 If a concrete need ever justifies it, a future Corral adapter may consume the
-versioned herdr-fleet local read/event contract — shown **dashed** and
+versioned canter local read/event contract — shown **dashed** and
 labeled **optional future adapter** in the committed diagram. Nothing in this
-repository implies a required herdr-fleet → Corral edge.
+repository implies a required canter → Corral edge.
 
 ## YAGNI rule
 

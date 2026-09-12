@@ -9,15 +9,15 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use herdr_fleet::canonical::canonical_bytes;
-use herdr_fleet::formats::{is_hex40, is_hex64};
-use herdr_fleet::redact::redact;
-use herdr_fleet::schema::{Family, validate_doc};
-use herdr_fleet::value::{Val, object, string};
+use canter::canonical::canonical_bytes;
+use canter::formats::{is_hex40, is_hex64};
+use canter::redact::redact;
+use canter::schema::{Family, validate_doc};
+use canter::value::{Val, object, string};
 use sha2::{Digest, Sha256};
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_herdr-fleet")
+    env!("CARGO_BIN_EXE_canter")
 }
 
 /// A private scratch area for one test (unique per test name + process).
@@ -128,7 +128,7 @@ fn run_cli(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    command.output().expect("spawn herdr-fleet")
+    command.output().expect("spawn canter")
 }
 
 fn stdout(out: &Output) -> String {
@@ -174,7 +174,7 @@ branch = "staging"
 "#;
 
 fn write_valid_config(sandbox: &Sandbox) -> PathBuf {
-    sandbox.write("home/.config/herdr-fleet/config.toml", VALID_CONFIG)
+    sandbox.write("home/.config/canter/config.toml", VALID_CONFIG)
 }
 
 fn home_dir(sandbox: &Sandbox) -> PathBuf {
@@ -407,7 +407,7 @@ fn doctor_refuses_an_invalid_config_with_exit_5() {
     let home = home_dir(&sandbox);
     let path = fakebin(&sandbox);
     let config = sandbox.write(
-        "home/.config/herdr-fleet/config.toml",
+        "home/.config/canter/config.toml",
         "schema = \"hf-config/v2\"\n",
     );
     let out = run_cli(&sandbox, &["doctor", "--json"], &path, Some(&home), None);
@@ -871,7 +871,7 @@ fn config_validate_refuses_malformed_and_unknown_versions() {
     let home = home_dir(&sandbox);
     let path = fakebin(&sandbox);
     let bad = sandbox.write(
-        "home/.config/herdr-fleet/config.toml",
+        "home/.config/canter/config.toml",
         "schema = \"hf-config/v1\"\n[schedules]\ndaily = \"09:00\"\n",
     );
     let out = run_cli(
@@ -899,7 +899,7 @@ fn config_validate_refuses_malformed_and_unknown_versions() {
     let _ = bad;
 
     let unknown = sandbox.write(
-        "home/.config/herdr-fleet/config.toml",
+        "home/.config/canter/config.toml",
         "schema = \"hf-config/v2\"\n",
     );
     let out = run_cli(
@@ -934,7 +934,7 @@ fn output_framing_survives_hostile_config_paths_and_issue_text() {
     let path = fakebin(&sandbox);
     // Hostile names must never break argv handling or JSON framing.
     let hostile = "weird;name 'quote\"back\\slash $(touch /tmp/pwned)";
-    let config = sandbox.write(&format!("home/.config/herdr-fleet/{hostile}"), VALID_CONFIG);
+    let config = sandbox.write(&format!("home/.config/canter/{hostile}"), VALID_CONFIG);
 
     let out = run_cli(
         &sandbox,
@@ -1011,6 +1011,6 @@ fn capabilities_declare_the_read_only_forge_set() {
     assert_eq!(capability.get("axis").and_then(Val::as_str), Some("forge"));
     assert_eq!(
         capability.get("actor").and_then(Val::as_str),
-        Some("herdr-fleet")
+        Some("canter")
     );
 }

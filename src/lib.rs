@@ -1,4 +1,4 @@
-//! herdr-fleet library surface.
+//! canter library surface.
 //!
 //! Read-only core (issue #4): configuration, doctor, read-only status/plan
 //! rendering, and stable versioned JSON. No daemon, workflow execution,
@@ -42,7 +42,7 @@ pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Truthful for the read-only core: this is a read-only companion CLI; no
 /// daemon or live fleet mutation is implemented.
 pub fn about() -> &'static str {
-    "herdr-fleet: typed, plan-first companion CLI for operating Herdr coding-agent fleets (read-only core; no daemon, no live fleet mutations)"
+    "canter: typed, plan-first companion CLI for operating Herdr coding-agent fleets (read-only core; no daemon, no live fleet mutations)"
 }
 
 /// Release-facing version facts, printed by `--version` after the package
@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     fn package_identity_matches_cargo_metadata() {
-        assert_eq!(PACKAGE_NAME, "herdr-fleet");
+        assert_eq!(PACKAGE_NAME, "canter");
         assert_eq!(PACKAGE_VERSION, env!("CARGO_PKG_VERSION"));
         assert!(!about().is_empty());
     }

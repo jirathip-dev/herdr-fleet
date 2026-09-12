@@ -1,4 +1,4 @@
-# herdr-fleet — canonical developer entry point.
+# canter — canonical developer entry point.
 # Canonical documentation: docs/DEVELOPMENT.md (single authoritative home).
 # Recipes preserve raw failures and raw exit statuses; never pipe a gate
 # through grep as a PASS/FAIL test.

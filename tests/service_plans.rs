@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_herdr-fleet")
+    env!("CARGO_BIN_EXE_canter")
 }
 
 /// A fixture home/config layout: nothing outside this dir is read or
@@ -37,7 +37,7 @@ impl ServiceFixture {
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env("XDG_STATE_HOME", self.dir.join("state"))
             .env("XDG_RUNTIME_DIR", self.dir.join("runtime"))
-            .env_remove("HERDR_FLEET_CRASH_POINT");
+            .env_remove("CANTER_CRASH_POINT");
         command
     }
 
@@ -49,7 +49,7 @@ impl ServiceFixture {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn herdr-fleet");
+            .expect("spawn canter");
         let mut stdout = String::new();
         let mut stderr = String::new();
         use std::io::Read;
@@ -78,7 +78,7 @@ impl Drop for ServiceFixture {
 
 /// Write a minimal config under the fixture XDG dirs.
 fn write_config(fixture: &ServiceFixture, socket: &Path) {
-    let config_dir = fixture.dir.join("config").join("herdr-fleet");
+    let config_dir = fixture.dir.join("config").join("canter");
     std::fs::create_dir_all(&config_dir).expect("config dir");
     let mut file = std::fs::File::create(config_dir.join("config.toml")).expect("config file");
     write!(
@@ -141,7 +141,7 @@ fn service_install_plan_renders_a_fixture_unit_with_steps() {
     if cfg!(target_os = "macos") {
         assert!(stdout.contains("<key>ProgramArguments</key>"), "{stdout}");
     } else {
-        assert!(stdout.contains("herdr-fleet daemon run"), "{stdout}");
+        assert!(stdout.contains("canter daemon run"), "{stdout}");
     }
     // The plan *documents* the fixture-host activation command (install
     // plans are executed on clean supported hosts, never on this one); the

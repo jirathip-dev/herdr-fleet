@@ -1,4 +1,4 @@
-# cargo-deny configuration for herdr-fleet (strict; public repository).
+# cargo-deny configuration for canter (strict; public repository).
 # Consumed by: `just security`, CI supply-chain job (cargo-deny 0.20.2).
 # There are zero external dependencies in this bootstrap; this file is the
 # strict policy that any future dependency must satisfy.

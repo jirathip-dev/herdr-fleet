@@ -1,13 +1,13 @@
 # Workflow
 
-Contributor and maintainer workflow for herdr-fleet. This is the process
+Contributor and maintainer workflow for canter. This is the process
 contract; mechanical enforcement lives in CI (`policy` job) and in
 repository rulesets applied by maintainers.
 
 ## Issue-first
 
 Durable work starts from an issue. The umbrella
-[#1](https://github.com/jirathip-dev/herdr-fleet/issues/1) tracks the
+[#1](https://github.com/jirathip-dev/canter/issues/1) tracks the
 approved architecture and delivery graph; its children are routed one slice
 at a time. In this bootstrap, `ready-to-work` is **bootstrap-process state**
 recording that an issue is authorized and queued under today's external
@@ -60,7 +60,7 @@ integration branch.
 > head-branch deletion on merge (`delete_branch_on_merge`, "automatically
 > delete head branches") therefore deletes the integration branch when the
 > promotion PR merges. This happened after promotion PR
-> [#28](https://github.com/jirathip-dev/herdr-fleet/pull/28): `staging` was
+> [#28](https://github.com/jirathip-dev/canter/pull/28): `staging` was
 > silently deleted, later landing was blocked until a maintainer recreated
 > it by hand, and the repository setting is now off. The setting must stay
 > **off** while promotion PRs exist.

@@ -23,7 +23,7 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROBE = os.path.join(REPO, "scripts", "clean-host-probe.py")
 VERIFIER = os.path.join(REPO, "scripts", "clean-host-verify.sh")
-BINARY = os.path.join(REPO, "target", "release", "herdr-fleet")
+BINARY = os.path.join(REPO, "target", "release", "canter")
 SCHEDULE_DOC = os.path.join(REPO, "schemas", "fixtures", "schedule",
                             "schedule.valid.json")
 

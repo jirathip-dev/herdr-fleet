@@ -13,14 +13,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use herdr_fleet::canonical::{canonical_bytes, sha256_hex};
-use herdr_fleet::client::{Connection, RpcError};
-use herdr_fleet::dirs::DaemonPaths;
-use herdr_fleet::state::{Retention, State};
-use herdr_fleet::value::{Val, integer, null, object, string};
+use canter::canonical::{canonical_bytes, sha256_hex};
+use canter::client::{Connection, RpcError};
+use canter::dirs::DaemonPaths;
+use canter::state::{Retention, State};
+use canter::value::{Val, integer, null, object, string};
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_herdr-fleet")
+    env!("CARGO_BIN_EXE_canter")
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +139,7 @@ fn make_repos(sandbox: &Sandbox) -> Repos {
     ]);
     let ck = Git::new(&checkout);
     ck.run(&["checkout", "-q", "staging"]);
-    ck.run(&["config", "user.name", "herdr-fleet test"]);
+    ck.run(&["config", "user.name", "canter test"]);
     ck.run(&["config", "user.email", "test@example.invalid"]);
     Repos {
         checkout,
@@ -175,7 +175,7 @@ exit 1
 const FAKE_LANE: &str = r#"#!/bin/sh
 echo 'lane change' >> lane.txt
 git add -A
-git -c user.name='herdr-fleet lane' -c user.email='lane@example.invalid' commit -q -m 'lane work (synthetic)'
+git -c user.name='canter lane' -c user.email='lane@example.invalid' commit -q -m 'lane work (synthetic)'
 printf '%s' 'lane transcript ok'
 exit 0
 "#;
@@ -213,7 +213,7 @@ impl Fixture {
     }
 
     fn paths(&self) -> DaemonPaths {
-        let state_dir = self.state_dir.join("herdr-fleet");
+        let state_dir = self.state_dir.join("canter");
         DaemonPaths {
             state_dir: state_dir.clone(),
             runtime_dir: self.dir.clone(),
@@ -246,9 +246,7 @@ impl Fixture {
 fn wait_ready(fixture: &Fixture) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        if herdr_fleet::lock::socket_presence(&fixture.socket)
-            == herdr_fleet::lock::SocketPresence::Active
-        {
+        if canter::lock::socket_presence(&fixture.socket) == canter::lock::SocketPresence::Active {
             let ok = Connection::open(&fixture.socket)
                 .and_then(|mut connection| {
                     connection.send_request("aaaaaaaaaaaaaaaa", "status", None)?;
@@ -266,7 +264,7 @@ fn wait_ready(fixture: &Fixture) {
     // socket path > sockaddr_un limit) or any other startup error is
     // self-explanatory in CI instead of an opaque timeout.
     let stderr_text = std::fs::read_to_string(&fixture.stderr_log).unwrap_or_default();
-    let daemon_log = fixture.state_dir.join("herdr-fleet").join("daemon.log");
+    let daemon_log = fixture.state_dir.join("canter").join("daemon.log");
     let log_text = std::fs::read_to_string(&daemon_log).unwrap_or_default();
     panic!(
         "daemon did not become ready on {} ({} bytes; macOS sockaddr_un ~104-byte limit); stderr:\n{}\ndaemon.log:\n{}",
@@ -285,7 +283,7 @@ fn rpc(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
     let response = connection.read_response().expect("read response");
     if response.ok {
         object(vec![
-            ("ok", herdr_fleet::value::bool_(true)),
+            ("ok", canter::value::bool_(true)),
             ("result", response.result),
         ])
     } else {
@@ -294,7 +292,7 @@ fn rpc(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
             message: "no error doc".to_string(),
         });
         object(vec![
-            ("ok", herdr_fleet::value::bool_(false)),
+            ("ok", canter::value::bool_(false)),
             (
                 "error",
                 object(vec![
@@ -312,7 +310,7 @@ fn rpc_ok(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
         doc.get("ok").and_then(Val::as_bool),
         Some(true),
         "expected ok response: {}",
-        herdr_fleet::canonical::canonical_text(&doc)
+        canter::canonical::canonical_text(&doc)
     );
     doc.get("result").expect("result").clone()
 }
@@ -323,7 +321,7 @@ fn rpc_err(socket: &Path, id: &str, method: &str, params: Option<Val>) -> (Strin
         doc.get("ok").and_then(Val::as_bool),
         Some(false),
         "expected refused response: {}",
-        herdr_fleet::canonical::canonical_text(&doc)
+        canter::canonical::canonical_text(&doc)
     );
     let error = doc.get("error").expect("error doc");
     (
@@ -594,7 +592,7 @@ fn policy_steps() -> Vec<Val> {
             "approve",
             Some(object(vec![
                 ("digest", string(&"1".repeat(64))),
-                ("interactive", herdr_fleet::value::bool_(true)),
+                ("interactive", canter::value::bool_(true)),
             ])),
         ),
     ]
@@ -669,7 +667,7 @@ impl Scenario {
             doc.get("ok").and_then(Val::as_bool),
             Some(true),
             "apply {step_id} (seed {seed}) failed: {}",
-            herdr_fleet::canonical::canonical_text(&doc)
+            canter::canonical::canonical_text(&doc)
         );
         doc.get("result").expect("result").clone()
     }
@@ -700,9 +698,9 @@ impl Scenario {
         scheduled: bool,
     ) -> Val {
         let mut flags = vec![
-            ("interactive", herdr_fleet::value::bool_(true)),
-            ("digest_confirmed", herdr_fleet::value::bool_(true)),
-            ("scheduled", herdr_fleet::value::bool_(scheduled)),
+            ("interactive", canter::value::bool_(true)),
+            ("digest_confirmed", canter::value::bool_(true)),
+            ("scheduled", canter::value::bool_(scheduled)),
             ("production_confirmation", string("tty")),
             // Issue #9 AC1: fan-out steps (harness_start/prompt) require a
             // fresh host-resource proof + declared concurrency caps. These
@@ -715,18 +713,15 @@ impl Scenario {
                     (
                         "caps",
                         object(vec![
-                            ("global", herdr_fleet::value::integer(16)),
-                            ("repository", herdr_fleet::value::integer(8)),
-                            ("harness", herdr_fleet::value::integer(8)),
+                            ("global", canter::value::integer(16)),
+                            ("repository", canter::value::integer(8)),
+                            ("harness", canter::value::integer(8)),
                         ]),
                     ),
-                    ("harness_lanes", herdr_fleet::value::integer(0)),
+                    ("harness_lanes", canter::value::integer(0)),
                     (
                         "host_proof",
-                        object(vec![(
-                            "measured_at",
-                            string(&herdr_fleet::time::rfc3339_now()),
-                        )]),
+                        object(vec![("measured_at", string(&canter::time::rfc3339_now()))]),
                     ),
                 ]),
             ),
@@ -1059,9 +1054,9 @@ fn production_pr_schedule_and_first_write_gates_bite_over_the_wire() {
             (
                 "flags",
                 object(vec![
-                    ("interactive", herdr_fleet::value::bool_(false)),
-                    ("digest_confirmed", herdr_fleet::value::bool_(false)),
-                    ("scheduled", herdr_fleet::value::bool_(false)),
+                    ("interactive", canter::value::bool_(false)),
+                    ("digest_confirmed", canter::value::bool_(false)),
+                    ("scheduled", canter::value::bool_(false)),
                 ]),
             ),
         ])),
@@ -1105,9 +1100,9 @@ fn production_pr_schedule_and_first_write_gates_bite_over_the_wire() {
             (
                 "flags",
                 object(vec![
-                    ("interactive", herdr_fleet::value::bool_(true)),
-                    ("digest_confirmed", herdr_fleet::value::bool_(true)),
-                    ("scheduled", herdr_fleet::value::bool_(true)),
+                    ("interactive", canter::value::bool_(true)),
+                    ("digest_confirmed", canter::value::bool_(true)),
+                    ("scheduled", canter::value::bool_(true)),
                 ]),
             ),
         ])),
@@ -1318,7 +1313,7 @@ fn archive_x1_step() -> Val {
         Some(object(vec![
             ("worktree", string("issues-123")),
             ("branch", string("issue-123")),
-            ("archive", herdr_fleet::value::bool_(true)),
+            ("archive", canter::value::bool_(true)),
         ])),
     )
 }
@@ -1396,7 +1391,7 @@ fn dirty_cleanup_archive_preserves_exact_bytes_and_manifest_and_never_deletes() 
         payload.as_bytes(),
         "archived bytes must equal the original"
     );
-    let expected_sha = herdr_fleet::canonical::sha256_hex(payload.as_bytes());
+    let expected_sha = canter::canonical::sha256_hex(payload.as_bytes());
     assert_eq!(
         entry_sha, expected_sha,
         "manifest sha256 must match the bytes"
@@ -1405,7 +1400,7 @@ fn dirty_cleanup_archive_preserves_exact_bytes_and_manifest_and_never_deletes() 
     let manifest_text =
         std::fs::read_to_string(archive_dir.join("manifest.json")).expect("manifest");
     assert_eq!(
-        herdr_fleet::canonical::sha256_hex(manifest_text.as_bytes()),
+        canter::canonical::sha256_hex(manifest_text.as_bytes()),
         manifest_sha,
         "manifest file digest must equal the reported manifest_sha256"
     );
@@ -1457,7 +1452,7 @@ fn dirty_cleanup_archive_preserves_exact_bytes_and_manifest_and_never_deletes() 
         let second_manifest_text =
             std::fs::read_to_string(second_dir.join("manifest.json")).expect("second manifest");
         assert_eq!(
-            herdr_fleet::canonical::sha256_hex(second_manifest_text.as_bytes()),
+            canter::canonical::sha256_hex(second_manifest_text.as_bytes()),
             second_manifest_sha,
             "the second manifest digest must pin its own bytes"
         );
@@ -1465,7 +1460,7 @@ fn dirty_cleanup_archive_preserves_exact_bytes_and_manifest_and_never_deletes() 
             let rel = file.get("path").and_then(Val::as_str).expect("path");
             let bytes = std::fs::read(second_dir.join(rel)).expect("second archive bytes");
             assert_eq!(
-                herdr_fleet::canonical::sha256_hex(&bytes),
+                canter::canonical::sha256_hex(&bytes),
                 file.get("sha256").and_then(Val::as_str).expect("sha"),
                 "second archive {rel} digest"
             );
@@ -1482,7 +1477,7 @@ fn dirty_cleanup_archive_preserves_exact_bytes_and_manifest_and_never_deletes() 
             error.get("code").and_then(Val::as_str),
             Some("effect.archive.failed"),
             "an existing archive dir is never overwritten: {}",
-            herdr_fleet::canonical::canonical_text(&repeat)
+            canter::canonical::canonical_text(&repeat)
         );
     }
     // The invariant, independent of which branch ran: the FIRST archive
@@ -1491,7 +1486,7 @@ fn dirty_cleanup_archive_preserves_exact_bytes_and_manifest_and_never_deletes() 
     let first_manifest_text =
         std::fs::read_to_string(archive_dir.join("manifest.json")).expect("first manifest");
     assert_eq!(
-        herdr_fleet::canonical::sha256_hex(first_manifest_text.as_bytes()),
+        canter::canonical::sha256_hex(first_manifest_text.as_bytes()),
         manifest_sha,
         "the first archive manifest must be byte-unchanged"
     );
@@ -1499,7 +1494,7 @@ fn dirty_cleanup_archive_preserves_exact_bytes_and_manifest_and_never_deletes() 
         let rel = file.get("path").and_then(Val::as_str).expect("path");
         let bytes = std::fs::read(archive_dir.join(rel)).expect("first archive bytes");
         assert_eq!(
-            herdr_fleet::canonical::sha256_hex(&bytes),
+            canter::canonical::sha256_hex(&bytes),
             file.get("sha256").and_then(Val::as_str).expect("sha"),
             "first archive {rel} digest must be unchanged"
         );

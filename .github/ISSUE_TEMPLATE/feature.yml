@@ -1,5 +1,5 @@
 name: Feature request
-description: Propose a feature for herdr-fleet. Public repository — never include credentials, tokens, host paths, or private configuration.
+description: Propose a feature for canter. Public repository — never include credentials, tokens, host paths, or private configuration.
 labels: [enhancement]
 body:
   - type: markdown
@@ -20,7 +20,7 @@ body:
     id: proposal
     attributes:
       label: Proposed behavior
-      description: What should herdr-fleet do differently?
+      description: What should canter do differently?
     validations:
       required: true
   - type: textarea

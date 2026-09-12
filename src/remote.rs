@@ -536,7 +536,7 @@ mod tests {
             &invocation(
                 &target,
                 &known_hosts,
-                "herdr-fleet",
+                "canter",
                 &args,
                 Some(7),
                 Some(id.clone()),
@@ -561,7 +561,7 @@ mod tests {
             argv.contains("build-host-1"),
             "argv must carry the host: {argv}"
         );
-        assert!(argv.contains("herdr-fleet"), "argv: {argv}");
+        assert!(argv.contains("canter"), "argv: {argv}");
         assert!(argv.contains("status --json"), "argv: {argv}");
         assert!(
             argv.contains("--"),
@@ -589,7 +589,7 @@ mod tests {
             &invocation(
                 &target,
                 &known_hosts,
-                "herdr-fleet",
+                "canter",
                 &args,
                 Some(9),
                 Some(id.clone()),
@@ -606,14 +606,7 @@ mod tests {
         // The plan bound a different identity -> refusal.
         let other = "f".repeat(64);
         let mismatch = invoke_remote(
-            &invocation(
-                &target,
-                &known_hosts,
-                "herdr-fleet",
-                &args,
-                Some(7),
-                Some(other),
-            ),
+            &invocation(&target, &known_hosts, "canter", &args, Some(7), Some(other)),
             &host_env(&dir.join("bin")),
         );
         assert_eq!(
@@ -640,7 +633,7 @@ mod tests {
         };
         let args: Vec<String> = vec![];
         let failed = invoke_remote(
-            &invocation(&target, &known_hosts, "herdr-fleet", &args, None, None),
+            &invocation(&target, &known_hosts, "canter", &args, None, None),
             &host_env(&dir.join("bin")),
         );
         assert!(matches!(
@@ -662,7 +655,7 @@ mod tests {
             std::env::temp_dir().display().to_string(),
         );
         let ambiguous = invoke_remote(
-            &invocation(&target, &known_hosts, "herdr-fleet", &args, None, None),
+            &invocation(&target, &known_hosts, "canter", &args, None, None),
             &bare_env,
         );
         assert!(

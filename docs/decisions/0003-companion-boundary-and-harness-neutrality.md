@@ -7,10 +7,10 @@
 
 ## Context
 
-herdr-fleet sits in an ecosystem of overlapping tools (Herdr, Corral, agent
+canter sits in an ecosystem of overlapping tools (Herdr, Corral, agent
 harnesses, scheduling platforms). Earlier wordings blurred boundaries:
 daemon-authority overlaps, review-loop confusion, live-cutover wording, and
-"herdr-fleet replaces X" claims. This ADR records the locked boundary so
+"canter replaces X" claims. This ADR records the locked boundary so
 bootstrap documentation and future slices cannot drift into coupling.
 
 ## Decision
@@ -19,15 +19,15 @@ bootstrap documentation and future slices cannot drift into coupling.
 
 - **Herdr** is the execution/workspace substrate: it owns workspaces, panes,
   terminals, and agent-process hosting.
-- **herdr-fleet** is a standalone, headless orchestration/control CLI (and,
+- **canter** is a standalone, headless orchestration/control CLI (and,
   in the approved target, a local daemon) for software-repository fleets. It
   owns typed plans, workflow state, mediated effects, verification,
   recovery, and machine-readable outcomes.
 - **Corral** is an optional, **read-only** human observability client. There
   is **no runtime dependency in either direction** between Corral and
-  herdr-fleet: no Corral library, daemon, HTTP route, process,
+  canter: no Corral library, daemon, HTTP route, process,
   configuration, or availability may be required by the CLI.
-- herdr-fleet does not replace Hermes Agent, the Hermes scheduler as a
+- canter does not replace Hermes Agent, the Hermes scheduler as a
   platform, Corral's daemon, Herdr's server, or unrelated research/office/
   host-maintenance automation. Portable fleet scheduling is distinct from a
   private cron census; the exact private census/disposition is a private
@@ -69,7 +69,7 @@ bootstrap documentation and future slices cannot drift into coupling.
 ## Consequences
 
 - Diagrams must show Corral's actual current path separately (Herdr per-user
-  Unix socket → corrald → iOS client) and any future herdr-fleet read
+  Unix socket → corrald → iOS client) and any future canter read
   contract edge as dashed + labeled "optional future adapter".
 - Bootstrap ships no adapter/plugin hierarchy, no harness implementation,
   and no empty speculative directories.

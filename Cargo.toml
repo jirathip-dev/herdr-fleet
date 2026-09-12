@@ -1,13 +1,21 @@
 [package]
-name = "herdr-fleet"
+name = "canter"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
 publish = false
 description = "Typed, plan-first CLI companion for operating Herdr coding-agent fleets (pre-alpha scaffold)."
-repository = "https://github.com/jirathip-dev/herdr-fleet"
+repository = "https://github.com/jirathip-dev/canter"
 readme = "README.md"
 license = "Apache-2.0 OR MIT"
+
+# The canonical binary is `canter`, built from `src/main.rs`. `herdr-fleet`
+# is the pre-rename product name: it stays available as a compatibility
+# alias that runs the same CLI (docs/contracts/compatibility.md, "Product
+# rename (issue #106)").
+[[bin]]
+name = "herdr-fleet"
+path = "src/bin/herdr-fleet.rs"
 
 [dependencies]
 # Read-only core (issue #4): TOML parsing for hf-config/hf-policy documents,

@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn spawn_failure_is_reported_without_panic() {
         let out = run(ProcSpec {
-            program: "herdr-fleet-no-such-tool-xyz",
+            program: "canter-no-such-tool-xyz",
             args: &[],
             env: &env(),
             cwd: None,

@@ -17,16 +17,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use herdr_fleet::adapters::{
+use canter::adapters::{
     ADAPTER_TIMEOUT, AgentIdentity, CODE_BINDING, CODE_CREDENTIALS, CODE_EXIT, CODE_MALFORMED,
     CODE_PROCESS_DEATH, CODE_STALE_IDENTITY, CODE_TIMEOUT, CODE_UNAVAILABLE,
     CODE_UNKNOWN_CAPABILITY, CODE_UNKNOWN_HARNESS, HarnessKind, Op, OpRequest, Profile,
     bind_identity, execute_named, execute_op, new_session, probe_profile,
 };
-use herdr_fleet::canonical::canonical_bytes;
-use herdr_fleet::config::Harness as ConfigHarness;
-use herdr_fleet::schema::{Family, validate_bytes};
-use herdr_fleet::value::Val;
+use canter::canonical::canonical_bytes;
+use canter::config::Harness as ConfigHarness;
+use canter::schema::{Family, validate_bytes};
+use canter::value::Val;
 
 static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -107,7 +107,7 @@ fn set_executable(path: &std::path::Path) {
 /// adapter classification is correct either way (`refusal.unavailable`); the
 /// tests assert the *classification*, so they retry transient spawn errors
 /// a bounded number of times instead of flaking on the environment.
-fn is_transient_spawn_failure(result: &herdr_fleet::adapters::OpResult) -> bool {
+fn is_transient_spawn_failure(result: &canter::adapters::OpResult) -> bool {
     if result.code != Some(CODE_UNAVAILABLE) {
         return false;
     }
@@ -124,7 +124,7 @@ fn run_op_retry(
     profile: &Profile,
     request: &OpRequest<'_>,
     env: &BTreeMap<String, String>,
-) -> herdr_fleet::adapters::OpResult {
+) -> canter::adapters::OpResult {
     let mut result = execute_op(profile, request, env);
     let mut attempts = 0;
     while is_transient_spawn_failure(&result) && attempts < 4 {
@@ -139,11 +139,11 @@ fn run_op_retry(
 fn run_named_retry(
     profile: &Profile,
     op_name: &str,
-    session: &herdr_fleet::adapters::SessionHandle,
+    session: &canter::adapters::SessionHandle,
     payload: Option<&str>,
     timeout: Duration,
     env: &BTreeMap<String, String>,
-) -> herdr_fleet::adapters::OpResult {
+) -> canter::adapters::OpResult {
     let mut result = execute_named(profile, op_name, session, payload, timeout, env);
     let mut attempts = 0;
     while is_transient_spawn_failure(&result) && attempts < 4 {
@@ -155,10 +155,7 @@ fn run_named_retry(
 }
 
 /// `probe_profile` with a bounded retry on transient spawn failures.
-fn probe_retry(
-    profile: &Profile,
-    env: &BTreeMap<String, String>,
-) -> herdr_fleet::adapters::ProbeResult {
+fn probe_retry(profile: &Profile, env: &BTreeMap<String, String>) -> canter::adapters::ProbeResult {
     let mut probe = probe_profile(profile, env);
     let mut attempts = 0;
     while probe.code == Some(CODE_UNAVAILABLE)
@@ -306,7 +303,7 @@ fn sample_identity() -> AgentIdentity {
 /// A leaked static session handle for request helpers. Test helpers only:
 /// the handle is intentionally immutable and the leak is negligible for the
 /// lifetime of one test binary.
-fn session_ref() -> &'static herdr_fleet::adapters::SessionHandle {
+fn session_ref() -> &'static canter::adapters::SessionHandle {
     Box::leak(Box::new(
         new_session("sess-20260906-0001", sample_identity()).expect("session handle"),
     ))
@@ -768,7 +765,7 @@ fn pi_prompt_runs_confined_to_the_assigned_worktree() {
     // temp-dir symlink spelling; see the argv witness test).
     let expected_cwd = fs::canonicalize(&worktree).unwrap_or_else(|_| worktree.clone());
 
-    let result = herdr_fleet::adapters::execute_op_in_worktree(
+    let result = canter::adapters::execute_op_in_worktree(
         &profile,
         &OpRequest {
             op: Op::Prompt,
@@ -1201,7 +1198,7 @@ fn harness_prompt_runs_confined_to_the_assigned_worktree() {
     // byte-compare two different spellings of the same directory.
     let expected_cwd = fs::canonicalize(&worktree).unwrap_or_else(|_| worktree.clone());
 
-    let result = herdr_fleet::adapters::execute_op_in_worktree(
+    let result = canter::adapters::execute_op_in_worktree(
         &profile,
         &OpRequest {
             op: Op::Prompt,
@@ -1722,7 +1719,7 @@ fn jcode_prompt_runs_confined_to_the_assigned_worktree() {
     fs::create_dir_all(&worktree).expect("worktree dir");
     let expected_cwd = fs::canonicalize(&worktree).unwrap_or_else(|_| worktree.clone());
 
-    let result = herdr_fleet::adapters::execute_op_in_worktree(
+    let result = canter::adapters::execute_op_in_worktree(
         &profile,
         &OpRequest {
             op: Op::Prompt,

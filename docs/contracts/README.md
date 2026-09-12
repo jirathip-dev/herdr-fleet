@@ -1,10 +1,10 @@
-# herdr-fleet 1.0 contract artifacts
+# canter 1.0 contract artifacts
 
 Refs #3 (Contracts), umbrella #1 (locked spec). This directory turns the
 locked 1.0 product decisions into public, reviewable, machine-checked
 contract artifacts. It authorizes **no implementation**: commands, the
 daemon, adapters, workflows, and migrations are non-goals of #3
-([issue body](https://github.com/jirathip-dev/herdr-fleet/issues/3)).
+([issue body](https://github.com/jirathip-dev/canter/issues/3)).
 
 ## Evidence legend
 

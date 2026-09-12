@@ -1,4 +1,4 @@
-# Dependabot for herdr-fleet.
+# Dependabot for canter.
 # Grouped weekly updates; all PRs target `staging` (never `main`).
 
 version: 2

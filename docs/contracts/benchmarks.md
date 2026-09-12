@@ -13,9 +13,9 @@ actually records with its evidence trail.
 
 ## Why no universal network-latency promises
 
-herdr-fleet commands spend most of their time in external tools: Git,
+canter commands spend most of their time in external tools: Git,
 GitHub, Herdr, harness executables, filesystems. None of that latency is
-owned or controllable by herdr-fleet, so a wall-clock budget stated in
+owned or controllable by canter, so a wall-clock budget stated in
 milliseconds would be a promise about other people's networks. Budgets are
 therefore:
 

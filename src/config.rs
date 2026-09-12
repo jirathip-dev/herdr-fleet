@@ -2,8 +2,8 @@
 //!
 //! Discovery contract (docs/contracts/spec-config.md): an explicit `--config`
 //! path wins; otherwise the XDG default
-//! (`$XDG_CONFIG_HOME/herdr-fleet/config.toml`, falling back to
-//! `$HOME/.config/herdr-fleet/config.toml`) is used when present. There is
+//! (`$XDG_CONFIG_HOME/canter/config.toml`, falling back to
+//! `$HOME/.config/canter/config.toml`) is used when present. There is
 //! exactly one canonical config file and at most one explicit policy overlay
 //! named by `config.policy.overlay` — no implicit profile/repository merge
 //! stack exists. Overlay paths are resolved relative to the config file's
@@ -157,7 +157,8 @@ impl Config {
 }
 
 /// Locate the config file: explicit path wins; otherwise the XDG default
-/// when present. Returns `Ok(None)` when no default config exists.
+/// when present, then the pre-rename default (see [`legacy_config_path`]).
+/// Returns `Ok(None)` when no default config exists.
 pub fn discover_config(explicit: Option<&Path>) -> Result<Option<PathBuf>, LoadError> {
     if let Some(path) = explicit {
         if path.is_file() {
@@ -170,23 +171,46 @@ pub fn discover_config(explicit: Option<&Path>) -> Result<Option<PathBuf>, LoadE
             path: path.display().to_string(),
         });
     }
-    Ok(default_config_path().filter(|path| path.is_file()))
+    Ok(default_config_path()
+        .filter(|path| path.is_file())
+        .or_else(|| legacy_config_path().filter(|path| path.is_file())))
 }
 
+/// The config directory name under the XDG config home (product rename,
+/// issue #106).
+pub const CONFIG_DIR_NAME: &str = "canter";
+
+/// Pre-rename config directory name. A config at the pre-rename path is
+/// still discovered when no new-path config exists; it is read in place
+/// (never copied, moved, or rewritten). Normative rule:
+/// docs/contracts/compatibility.md, "Product rename (issue #106)".
+pub const LEGACY_CONFIG_DIR_NAME: &str = "herdr-fleet";
+
 /// The XDG default config path (`$XDG_CONFIG_HOME` or `$HOME/.config`,
-/// then `herdr-fleet/config.toml`) regardless of whether it exists.
+/// then `canter/config.toml`) regardless of whether it exists.
 pub fn default_config_path() -> Option<PathBuf> {
+    config_path_in(CONFIG_DIR_NAME)
+}
+
+/// The pre-rename XDG config path (`.../herdr-fleet/config.toml`),
+/// regardless of whether it exists. Only used as a fallback when the
+/// new path holds no config.
+pub fn legacy_config_path() -> Option<PathBuf> {
+    config_path_in(LEGACY_CONFIG_DIR_NAME)
+}
+
+fn config_path_in(dir_name: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let base = xdg.or_else(|| home.map(|home| home.join(".config")));
-    base.map(|base| base.join("herdr-fleet").join("config.toml"))
+    base.map(|base| base.join(dir_name).join("config.toml"))
 }
 
 /// A human hint naming where the default config would live.
 pub fn default_config_hint() -> String {
     default_config_path()
         .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "<XDG config home>/herdr-fleet/config.toml".to_string())
+        .unwrap_or_else(|| format!("<XDG config home>/{CONFIG_DIR_NAME}/config.toml"))
 }
 
 /// Load, validate, and type a config document from a path.
@@ -456,10 +480,12 @@ fn identity_from_origin(origin: &str) -> Option<(&str, &str)> {
 /// An annotated synthetic `hf-config/v1` template for `config init` (stdout
 /// guidance; the CLI never writes files itself).
 pub fn init_template() -> String {
-    r#"# herdr-fleet canonical configuration (hf-config/v1).
+    r#"# canter canonical configuration (hf-config/v1).
 # One canonical XDG file, no implicit profile/repository merge stack.
-# Save this as $XDG_CONFIG_HOME/herdr-fleet/config.toml (or
-# ~/.config/herdr-fleet/config.toml) and edit the synthetic values below.
+# Save this as $XDG_CONFIG_HOME/canter/config.toml (or
+# ~/.config/canter/config.toml) and edit the synthetic values below.
+# A pre-rename config at $XDG_CONFIG_HOME/herdr-fleet/config.toml is still
+# read when no new-path config exists (docs/contracts/compatibility.md).
 
 schema = "hf-config/v1"
 
@@ -515,7 +541,7 @@ pub fn resolve_repository<'a>(
         .find(|r| r.identity() == argument)
         .ok_or_else(|| {
             format!(
-                "no configured repository matches {argument:?}; configure it first (see `herdr-fleet config init`)"
+                "no configured repository matches {argument:?}; configure it first (see `canter config init`)"
             )
         })
 }

@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn actor_and_error_code_rules() {
-        assert!(is_actor("herdr-fleet"));
+        assert!(is_actor("canter"));
         assert!(is_actor("gh"));
         assert!(!is_actor(""));
         assert!(is_error_code("config.invalid"));

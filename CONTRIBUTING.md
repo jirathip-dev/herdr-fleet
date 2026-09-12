@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for considering a contribution to herdr-fleet. This is a public
+Thanks for considering a contribution to canter. This is a public
 repository with a strict public-data rule; please read this page and
 [docs/WORKFLOW.md](docs/WORKFLOW.md) before opening anything.
 

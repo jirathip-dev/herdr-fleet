@@ -71,10 +71,13 @@ fail with rustup/cargo's own actionable errors.
   deterministic plan rendering (`plan.rs`), and command parsing/envelope
   emission (`commands.rs`).
 - `tests/cli_smoke.rs` — integration tests against the **real compiled
-  binary** (`CARGO_BIN_EXE_herdr-fleet`): help exits 0 and prints usage,
+  binary** (`CARGO_BIN_EXE_canter`): help exits 0 and prints usage,
   version exits 0 and prints name + version, unknown flag and no-args exit
   non-zero (2) with usage on stderr, usage lists only implemented commands,
   and `--json` mode writes exactly one envelope to stdout without prompting.
+  The pre-rename `herdr-fleet` alias binary is built from
+  `src/bin/herdr-fleet.rs` (it calls the same `commands::cli_main`) and is
+  covered by `tests/rename_compat.rs`; both binaries ship from this package.
 - `tests/cli_readonly.rs` — behavior tests against the real binary with
   **fake `herdr`/`gh` executables on a controlled PATH and synthetic local
   git repositories**: doctor rows (ok / missing / invalid config exit 5),

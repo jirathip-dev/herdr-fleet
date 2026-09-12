@@ -91,7 +91,7 @@ can run with **no harness credentials** (AC7).
   (kind outside the closed set), `unknown.capability` (capability/operation
   not in the closed harness set or not declared), `refusal.unavailable.harness`
   (executable missing/unspawnable), `refusal.credentials` (auth failure —
-  credentials stay in the harness, never in herdr-fleet, AC8),
+  credentials stay in the harness, never in canter, AC8),
   `refusal.binding.missing` (the harness profile declares no explicit
   provider/model binding; the terminal prompt refuses — no default is
   inferred and no fallback model is substituted, issue #80),
