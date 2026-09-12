@@ -262,6 +262,23 @@ pub struct EvidenceRow {
     pub created_at: String,
 }
 
+/// A bounded, deterministic board-read row (issue #83): one daemon-owned
+/// run joined with a bounded slice of its durable review evidence. This is
+/// a read projection over recorded facts only — the run identity is the
+/// durable instance row and evidence is never inferred from activity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoardRunRow {
+    /// The durable workflow-instance row (run identity and state).
+    pub run: InstanceRow,
+    /// Most recent evidence row for the run (merge-gate ordering), if any.
+    pub evidence_newest: Option<EvidenceRow>,
+    /// Bounded list of evidence ids, newest first (at most the requested
+    /// per-row cap; [`BoardRunRow::evidence_total`] makes overflow explicit).
+    pub evidence_ids: Vec<String>,
+    /// Total recorded evidence rows for the run.
+    pub evidence_total: i64,
+}
+
 /// A recorded first-real-write approval (issue #8 AC10 plumbing). The
 /// approval is recorded by a human-gated flow BEFORE any real external
 /// write canary; this slice only proves the gate with fakes and never runs
@@ -1683,6 +1700,115 @@ impl State {
             );
         }
         Ok(out)
+    }
+
+    /// Bounded, deterministic board read (issue #83): run rows in
+    /// `(repository, issue_number, instance_id)` order strictly after the
+    /// exclusive `after` bound (`None` reads from the start), at most
+    /// `limit` rows, each joined with its most recent evidence record and
+    /// at most `per_row_cap` newest evidence ids.
+    ///
+    /// The read is a pure projection over recorded rows: it never writes,
+    /// never scans an unbounded table, and the ordering key makes pages
+    /// stable across restarts, inserts, and out-of-order attempts. The
+    /// cursor is an ordering key, not a pointer: rows deleted between pages
+    /// simply leave no gap. Legacy rows that predate the m0002 bindings are
+    /// read with empty/null fields coalesced so a missing source is reported
+    /// rather than failing the read.
+    pub fn board_page_rows(
+        &self,
+        after: Option<(&str, i64, &str)>,
+        limit: usize,
+        per_row_cap: usize,
+    ) -> Result<Vec<BoardRunRow>, StateError> {
+        let conn = self.lock("board_page_rows")?;
+        // The sentinel bound `("", -1, "")` is strictly below every real
+        // row: repository is never negative-ordered below "" and any issue
+        // number is >= 0 > -1 (one statement serves both the first page and
+        // every cursor page).
+        let (after_repository, after_issue, after_instance) = after.unwrap_or(("", -1, ""));
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = conn
+            .prepare(
+                "SELECT instance_id, COALESCE(repository, ''), workflow_id, workflow_hash,
+                        policy_hash, grant_id, issue_number, issue_revision, phase, scope,
+                        caps, current_node, normal_rounds, recovery_rounds, human_queue,
+                        terminal_blockers, paused, resume_digest, state_epoch, status,
+                        created_at, COALESCE(updated_at, '')
+                   FROM instances
+                  WHERE (COALESCE(repository, ''), issue_number, instance_id) > (?1, ?2, ?3)
+                  ORDER BY COALESCE(repository, ''), issue_number, instance_id
+                  LIMIT ?4",
+            )
+            .map_err(|err| StateError::from_sqlite("board_page_rows: prepare", err))?;
+        let rows = statement
+            .query_map(
+                params![after_repository, after_issue, after_instance, limit],
+                instance_row_from,
+            )
+            .map_err(|err| StateError::from_sqlite("board_page_rows: query", err))?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row.map_err(|err| StateError::from_sqlite("board_page_rows: row", err))?);
+        }
+        if runs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // One bounded evidence batch for the whole page (never one query per
+        // row): newest-first row numbers plus a per-instance total, capped
+        // per row.
+        let placeholders = std::iter::repeat_n("?", runs.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let batch_sql = format!(
+            "SELECT evidence_id, instance_id, repository, feature_head, integration_base,
+                    workflow_hash, policy_hash, verdict, reviewer, checks, created_at,
+                    ROW_NUMBER() OVER (PARTITION BY instance_id
+                                       ORDER BY created_at DESC, evidence_id DESC) AS rn,
+                    COUNT(*) OVER (PARTITION BY instance_id) AS total
+               FROM evidence WHERE instance_id IN ({placeholders})"
+        );
+        let mut statement = conn
+            .prepare(&batch_sql)
+            .map_err(|err| StateError::from_sqlite("board_page_rows: evidence prepare", err))?;
+        let ids: Vec<&str> = runs.iter().map(|run| run.instance_id.as_str()).collect();
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(ids), |row| {
+                let evidence = evidence_row_from(row)?;
+                Ok((evidence, row.get::<_, i64>(11)?, row.get::<_, i64>(12)?))
+            })
+            .map_err(|err| StateError::from_sqlite("board_page_rows: evidence query", err))?;
+        let mut newest: std::collections::BTreeMap<String, EvidenceRow> =
+            std::collections::BTreeMap::new();
+        let mut ids_by_run: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut totals: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+        for row in rows {
+            let (evidence, rank, total) =
+                row.map_err(|err| StateError::from_sqlite("board_page_rows: evidence row", err))?;
+            let instance_id = evidence.instance_id.clone();
+            totals.insert(instance_id.clone(), total);
+            if rank == 1 {
+                newest.insert(instance_id.clone(), evidence.clone());
+            }
+            if rank <= i64::try_from(per_row_cap).unwrap_or(i64::MAX) {
+                ids_by_run
+                    .entry(instance_id)
+                    .or_default()
+                    .push(evidence.evidence_id);
+            }
+        }
+
+        Ok(runs
+            .into_iter()
+            .map(|run| BoardRunRow {
+                evidence_newest: newest.remove(&run.instance_id),
+                evidence_ids: ids_by_run.remove(&run.instance_id).unwrap_or_default(),
+                evidence_total: totals.remove(&run.instance_id).unwrap_or(0),
+                run,
+            })
+            .collect())
     }
 
     /// Record the separate explicit human approval required before the

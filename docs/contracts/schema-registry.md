@@ -55,6 +55,7 @@ same families — the three cannot drift apart.
 | `hf-migration/v1` | SQLite migration manifest | [spec-state.md](spec-state.md) | No canonical-bytes rule (migration checksum covers the migration artifact) | `migration/migration.valid.json`, `migration/migration.malformed.json`, `migration/migration.unknown-version.json` |
 | `hf-capability/v1` | Harness/forge capability negotiation envelope | [spec-capabilities.md](spec-capabilities.md) | No canonical-bytes rule | `capability/capability.harness.valid.json`, `capability/capability.forge.valid.json`, `capability/capability.malformed.json`, `capability/capability.unknown-version.json` |
 | `hf-evidence/v1` | Review evidence record (AC4 bindings) | [spec-review-evidence.md](spec-review-evidence.md) | No canonical-bytes rule | `evidence/evidence.valid.json`, `evidence/evidence.malformed.json`, `evidence/evidence.unknown-version.json` |
+| `hf-board/v1` | Bounded paginated board read page (issue #83 read model) | [spec-board.md](spec-board.md) | No canonical-bytes rule | `board/board.valid.json`, `board/board.page.valid.json`, `board/board.malformed.json`, `board/board.unknown-version.json` |
 
 ## Embedded scalar formats (no standalone document)
 

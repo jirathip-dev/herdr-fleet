@@ -64,6 +64,7 @@ RX_PLAN_ID = re.compile(r"^hf_plan_[0-9a-f]{16}$")
 RX_GRANT_ID = re.compile(r"^gr_[0-9a-f]{16}$")
 RX_SCHEDULE_ID = re.compile(r"^sd_[0-9a-f]{16}$")
 RX_EVIDENCE_ID = re.compile(r"^ev_[0-9a-f]{16}$")
+RX_WORK_ITEM_ID = re.compile(r"^wi_[0-9a-f]{16}$")
 RX_IDEMPOTENCY_KEY = re.compile(r"^ik_[a-z0-9-]{8,64}$")
 RX_SLUG_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 RX_ACTION = re.compile(r"^[a-z][a-z0-9_.-]*$")
@@ -108,6 +109,14 @@ HARNESS_CAPS = frozenset({"discover", "start", "prompt", "observe",
                           "interrupt", "outcome", "identity"})
 FORGE_CAPS = frozenset({"read_refs", "read_issues", "read_checks",
                         "create_pr", "comment"})
+# hf-board/v1 (issue #83 read model): closed sets mirrored in src/schema.rs.
+BOARD_STAGES = frozenset({"planned", "in_progress", "needs_attention", "verified"})
+BOARD_VERIFICATIONS = frozenset({"none", "failed", "passed"})
+BOARD_RUN_STATES = frozenset({"new", "running", "paused", "human_queue",
+                              "blocked", "done", "invalidated"})
+BOARD_NEXT_ACTIONS = frozenset({"resume", "human_decision"})
+BOARD_SOURCE_KINDS = frozenset({"github"})
+BOARD_EVIDENCE_REF_MAX = 4
 
 
 def canon_json_bytes(obj) -> bytes:
@@ -855,6 +864,285 @@ def _validate_toml_doc(raw: bytes, family: str) -> tuple[str, str]:
     return VALIDATORS[family](obj)
 
 
+# ---------------------------------------------------------------------------
+# hf-board/v1 (issue #83 read model): bounded page of run rows
+# ---------------------------------------------------------------------------
+
+# Token shapes mirrored conservatively from src/redact.rs (prefix, minimum
+# token-run length after the prefix). A recorded-text field must be
+# redaction-stable: the conservative pass would not change it.
+_SECRET_TOKEN_PREFIXES = (
+    ("github_pat_", 20), ("ghp_", 8), ("gho_", 8), ("ghu_", 8), ("ghs_", 8),
+    ("ghr_", 8), ("glpat-", 8), ("xoxb-", 8), ("xoxp-", 8), ("sk-", 20),
+    ("xoxa-", 8), ("xoxr-", 8), ("AKIA", 16),
+)
+
+
+def _token_char(ch: str) -> bool:
+    return ch.isascii() and (ch.isalnum() or ch in "_-./=+$")
+
+
+def _token_run_len(text: str) -> int:
+    run = 0
+    for ch in text:
+        if not _token_char(ch):
+            break
+        run += 1
+    return run
+
+
+def _secret_shaped(text: str) -> bool:
+    """True when the conservative redaction pass (src/redact.rs) would
+    change this text: a token-prefixed secret at a boundary, a PEM block
+    begin marker, or a URL userinfo segment."""
+    for start, ch in enumerate(text):
+        boundary = start == 0 or not _token_char(text[start - 1])
+        rest = text[start:]
+        if boundary:
+            for prefix, floor in _SECRET_TOKEN_PREFIXES:
+                if rest.startswith(prefix) and _token_run_len(rest[len(prefix):]) >= floor:
+                    return True
+            if rest.startswith("-----BEGIN"):
+                return True
+        if rest.startswith("://"):
+            after = rest[3:]
+            at = after.find("@")
+            if at >= 0:
+                before_at = after[:at]
+                if "/" not in before_at and len(before_at) >= 3:
+                    return True
+    return False
+
+
+def _board_recorded_text(obj: dict, key: str, where: str) -> tuple[str, str] | None:
+    if key not in obj:
+        return _ref(REFUSE_MALFORMED, "{}: missing required key {!r}".format(where, key))
+    value = obj[key]
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return _ref(REFUSE_MALFORMED,
+                    "{}: {!r} must be null or a string".format(where, key))
+    if len(value) > 128 or any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        return _ref(REFUSE_MALFORMED,
+                    "{}: {!r} must be <= 128 characters without controls".format(where, key))
+    if _secret_shaped(value):
+        return _ref(REFUSE_MALFORMED,
+                    "{}: {!r} carries an unredacted secret-shaped run".format(where, key))
+    return None
+
+
+def _board_optional_timestamp(obj: dict, key: str, where: str) -> tuple[str, str] | None:
+    if key not in obj:
+        return _ref(REFUSE_MALFORMED, "{}: missing required key {!r}".format(where, key))
+    value = obj[key]
+    if value is None:
+        return None
+    if not isinstance(value, str) or not RX_RFC3339_Z.match(value):
+        return _ref(REFUSE_MALFORMED,
+                    "{}: {!r} must be null or RFC3339 UTC (seconds, Z)".format(where, key))
+    return None
+
+
+def _board_cursor_shaped(text: str) -> bool:
+    parts = text.split("|")
+    if len(parts) != 3:
+        return False
+    repository, issue, run = parts
+    if repository and not RX_REPOSITORY.match(repository):
+        return False
+    if not issue or not issue.isascii() or not issue.isdigit():
+        return False
+    return bool(run) and len(run) <= 64 and all(
+        c.isascii() and (c.isalnum() or c in "._-") for c in run)
+
+
+def validate_board(obj: dict) -> tuple[str, str]:
+    """hf-board/v1 (issue #83 read model): one bounded page of run rows.
+    The closed consistency rules are the machine-checked half of the
+    coverage contract: a page never presents an idle/working run as
+    verified without current recorded review evidence, never joins two
+    runs of one work item into a row, never reorders a page, never
+    fabricates evidence, and never carries secret-shaped recorded text."""
+    keys = {"schema", "observed_at", "state", "rows", "next_cursor", "truncated"}
+    err = _json_obj(obj, "hf-board", keys, keys)
+    if err:
+        return err
+    err = _expect_timestamp(obj, "observed_at", "board")
+    if err:
+        return err
+    err = _expect_object(obj, "state", "board")
+    if err:
+        return err
+    state_keys = {"epoch", "journal_seq"}
+    err = _require_keys(obj["state"], state_keys, state_keys, "board.state")
+    if err:
+        return err
+    for key in ("epoch", "journal_seq"):
+        err = _expect_int(obj["state"], key, "board.state")
+        if err:
+            return err
+    truncated = obj["truncated"]
+    if not isinstance(truncated, bool):
+        return _ref(REFUSE_MALFORMED, "board.truncated must be a boolean")
+    cursor = obj["next_cursor"]
+    has_cursor = cursor is not None
+    if has_cursor and (not isinstance(cursor, str) or not _board_cursor_shaped(cursor)):
+        return _ref(REFUSE_MALFORMED,
+                    "board.next_cursor must be a repository|issue|run ordering key")
+    if has_cursor != truncated:
+        return _ref(REFUSE_MALFORMED,
+                    "board.next_cursor and board.truncated must agree (cursor iff more rows)")
+    rows = obj["rows"]
+    if not isinstance(rows, list):
+        return _ref(REFUSE_MALFORMED, "board.rows must be a list")
+    if not rows and truncated:
+        return _ref(REFUSE_MALFORMED, "board.truncated cannot be true for an empty page")
+    previous = None
+    for row in rows:
+        code, msg, key = _validate_board_row(row, previous)
+        if code != ACCEPT:
+            return _ref(code, msg)
+        previous = key
+    return _ref(ACCEPT, "board ok")
+
+
+def _validate_board_row(row, previous):
+    """Validate one board row; returns (code, message, ordering key)."""
+    where = "board row"
+    if not isinstance(row, dict):
+        return (REFUSE_MALFORMED, "{} must be an object".format(where), None)
+    keys = {"work_item", "source", "run", "run_state", "stage", "verification",
+            "owner", "reason", "next_action", "human_gate", "milestone",
+            "evidence", "evidence_total", "evidence_at", "reviewer",
+            "progress_at", "observed_at"}
+    err = _require_keys(row, keys, keys, where)
+    if err:
+        return (err[0], err[1], None)
+    source = row["source"]
+    if not isinstance(source, dict):
+        return (REFUSE_MALFORMED, "{} source must be an object".format(where), None)
+    source_keys = {"kind", "repository", "issue", "revision", "freshness",
+                   "completeness", "observed_at"}
+    err = _require_keys(source, source_keys, source_keys, "{} source".format(where))
+    if err:
+        return (err[0], err[1], None)
+    err = _expect_in(source, "kind", "{} source".format(where), BOARD_SOURCE_KINDS)
+    if err:
+        return (err[0], err[1], None)
+    repository = source["repository"]
+    if not isinstance(repository, str):
+        return (REFUSE_MALFORMED, "{} source.repository must be a string".format(where), None)
+    issue = source["issue"]
+    if isinstance(issue, bool) or not isinstance(issue, int) or issue < 0:
+        return (REFUSE_MALFORMED, "{} source.issue must be a non-negative integer".format(where), None)
+    revision = source["revision"]
+    if not isinstance(revision, str):
+        return (REFUSE_MALFORMED, "{} source.revision must be a string".format(where), None)
+    err = _expect_in(source, "freshness", "{} source".format(where), {"fresh", "stale"})
+    if err:
+        return (err[0], err[1], None)
+    completeness = source["completeness"]
+    if completeness not in ("complete", "partial"):
+        return (REFUSE_MALFORMED, "{} source.completeness must be complete|partial".format(where), None)
+    err = _board_optional_timestamp(source, "observed_at", "{} source".format(where))
+    if err:
+        return (err[0], err[1], None)
+    work_item = row["work_item"]
+    if completeness == "partial":
+        if work_item is not None:
+            return (REFUSE_MALFORMED,
+                    "{} work_item must be null for a partial source".format(where), None)
+    elif not isinstance(work_item, str) or not RX_WORK_ITEM_ID.match(work_item):
+        return (REFUSE_MALFORMED,
+                "{} work_item must be a wi_ id for a complete source".format(where), None)
+    if completeness == "complete" and (
+            not RX_REPOSITORY.match(repository) or issue < 1 or not RX_HEX40.match(revision)):
+        return (REFUSE_MALFORMED,
+                "{} source: a complete row requires owner/name, a positive issue, "
+                "and a 40-hex revision".format(where), None)
+    run = row["run"]
+    if not isinstance(run, str) or not run or len(run) > 64 or not all(
+            c.isascii() and (c.isalnum() or c in "._-") for c in run):
+        return (REFUSE_MALFORMED, "{} run must be a 1..=64 character identifier".format(where), None)
+    run_state = row["run_state"]
+    if run_state not in BOARD_RUN_STATES:
+        return (REFUSE_MALFORMED, "{} run_state outside the closed set".format(where), None)
+    stage = row["stage"]
+    if stage not in BOARD_STAGES:
+        return (REFUSE_MALFORMED, "{} stage outside the closed set".format(where), None)
+    freshness = source["freshness"]
+    verification = row["verification"]
+    if verification not in BOARD_VERIFICATIONS:
+        return (REFUSE_MALFORMED, "{} verification outside the closed set".format(where), None)
+    verified = verification == "passed" and freshness == "fresh" and run_state != "invalidated"
+    if (stage == "verified") != verified:
+        return (REFUSE_MALFORMED,
+                "{} stage must be verified iff verification is passed, fresh, "
+                "and not invalidated".format(where), None)
+    for key in ("owner", "reason", "reviewer"):
+        err = _board_recorded_text(row, key, where)
+        if err:
+            return (err[0], err[1], None)
+    next_action = row["next_action"]
+    if next_action is not None and next_action not in BOARD_NEXT_ACTIONS:
+        return (REFUSE_MALFORMED, "{} next_action outside the closed set".format(where), None)
+    if next_action == "resume" and run_state != "paused":
+        return (REFUSE_MALFORMED, "{} next_action resume requires a paused run".format(where), None)
+    if next_action == "human_decision" and run_state != "human_queue":
+        return (REFUSE_MALFORMED, "{} next_action human_decision requires a human_queue run".format(where), None)
+    human_gate = row["human_gate"]
+    if not isinstance(human_gate, bool) or human_gate != (run_state in ("paused", "human_queue")):
+        return (REFUSE_MALFORMED,
+                "{} human_gate must be a boolean equal to (run_state is paused "
+                "or human_queue)".format(where), None)
+    milestone = row["milestone"]
+    if milestone is not None and (not isinstance(milestone, str) or not RX_SLUG_ID.match(milestone)):
+        return (REFUSE_MALFORMED, "{} milestone must be null or a node slug".format(where), None)
+    evidence = row["evidence"]
+    if not isinstance(evidence, list):
+        return (REFUSE_MALFORMED, "{} evidence must be a list".format(where), None)
+    if len(evidence) > BOARD_EVIDENCE_REF_MAX:
+        return (REFUSE_MALFORMED, "{} evidence exceeds the bounded cap".format(where), None)
+    seen = set()
+    for item in evidence:
+        if not isinstance(item, str) or not RX_EVIDENCE_ID.match(item):
+            return (REFUSE_MALFORMED, "{} evidence entries must be ev_ ids".format(where), None)
+        if item in seen:
+            return (REFUSE_MALFORMED, "{} evidence repeats a reference".format(where), None)
+        seen.add(item)
+    evidence_total = row["evidence_total"]
+    if isinstance(evidence_total, bool) or not isinstance(evidence_total, int) \
+            or evidence_total < len(evidence):
+        return (REFUSE_MALFORMED,
+                "{} evidence_total must be an integer >= the exposed count".format(where), None)
+    err = _board_optional_timestamp(row, "evidence_at", where)
+    if err:
+        return (err[0], err[1], None)
+    err = _board_optional_timestamp(row, "progress_at", where)
+    if err:
+        return (err[0], err[1], None)
+    err = _expect_timestamp(row, "observed_at", where)
+    if err:
+        return (err[0], err[1], None)
+    has_evidence_at = isinstance(row["evidence_at"], str)
+    if verification == "none":
+        if evidence or evidence_total != 0 or has_evidence_at:
+            return (REFUSE_MALFORMED,
+                    "{} verification none requires no evidence references and "
+                    "no evidence_at".format(where), None)
+    elif not evidence or evidence_total < 1 or not has_evidence_at:
+        return (REFUSE_MALFORMED,
+                "{} verification failed|passed requires recorded evidence and "
+                "its timestamp".format(where), None)
+    key = (repository, issue, run)
+    if previous is not None and key <= previous:
+        return (REFUSE_MALFORMED,
+                "{} rows must be in strictly increasing (repository, issue, run) "
+                "order".format(where), None)
+    return (ACCEPT, "board row ok", key)
+
+
 VALIDATORS = {
     "hf-config": validate_config,
     "hf-policy": validate_policy,
@@ -867,6 +1155,7 @@ VALIDATORS = {
     "hf-outcome": validate_outcome,
     "hf-workflow": validate_workflow,
     "hf-schedule": validate_schedule,
+    "hf-board": validate_board,
     "hf-rpc-request": validate_rpc_request,
     "hf-rpc-response": validate_rpc_response,
     "hf-event": validate_event,
