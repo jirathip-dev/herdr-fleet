@@ -320,6 +320,58 @@ release process activates (docs/RELEASING.md), then semver applies.
   until normal quiescence/retirement; no new store, scheduler or automatic
   rotation trigger exists.
 
+### Added (issue #78 — CLI preview / request / inspect for one explicit lane handoff)
+
+- The thin CLI lane surface over the completed daemon handoff path
+  (#73–#77): `canter lane preview`, `canter lane request` and
+  `canter lane status` for ONE exact lane. Preview and status are
+  read-only — they may issue only `lane.replacement.status` /
+  `lane.checkpoint.status` (a closed allowlist guard refuses anything
+  else before a socket is opened), dispatch no mutation, and never
+  advance a record.
+- `lane preview` renders the reviewable `hf-lane-handoff/v1` plan: the
+  source identity (session/process/role/generation), the target profile
+  plan (`--profile KEY` derives the same reviewed
+  `hf-profile-binding/v1` document `config show` previews), the
+  repository-relative worktree, the closed effect-boundary chain of the
+  phase surface, the retained workers/reviewers/pending gates (captured
+  at the `checkpointed` boundary; read from the committed checkpoint when
+  one exists) and the plan digest.
+- `lane request` records ONE durable replacement request through the
+  existing `lane.replacement.request` endpoint (no spawn, kill, Git or
+  grant effect). The authorization binds the exact plan digest:
+  `--confirm-digest HEX64` (noninteractive explicit) and `--confirm`
+  (the human types the digest; the prompt goes to stderr) check the SAME
+  digest, and a digest that no longer matches the current plan refuses
+  as a stale plan (`refusal.plan.stale`) before any daemon call. A
+  blanket `--yes` is refused whenever the policy overlay declares
+  `production_confirmation` (`refusal.confirmation.policy`) and `deny`
+  refuses every mode (`refusal.policy.production`) — the flag can never
+  bypass the policy.
+- `lane status` reads one record read-only: phase, outcome, blocker,
+  intended (bound profile revision + provider/model) vs actual
+  (successor verification evidence — `unknown` is never copied from the
+  intended pair), the last verified transition, the next supported
+  action and actionable guidance for an ambiguous retirement, a capacity
+  hold, a failed adoption and an unknown model binding, naming only
+  existing commands.
+- JSON mode is pure: exactly one `hf-output/v1` document on stdout,
+  never a prompt (a missing authorization is a typed usage refusal, not
+  a read from stdin), and the human rendering carries the same plan
+  digest, phase, bindings, transition, next action and stable error
+  codes (the human diagnostic carries the code too).
+- `tests/lane_cli.rs` proves the surface over the real binary and
+  socket: read-only preview/status on the wire (a recording fake daemon),
+  digest parity between the two authorization paths, policy refusal of
+  `--yes`, stale-plan rejection after a moved profile revision, JSON
+  purity, the paused-fleet boundary, the four guidance scenarios,
+  human/JSON success and refusal parity, and a bounded read against a
+  hung daemon.
+- Excluded, as the issue requires: no TUI, no context auto-trigger, no
+  whole-fleet recycle, no service activation, no new scheduler, no
+  authorization bypass and no hidden auto-resume (a paused fleet stays
+  paused through every CLI path).
+
 ### Changed (issue #106 — product rename `herdr-fleet` → `canter`)
 
 - The product is renamed: package + library crate `canter`, canonical binary

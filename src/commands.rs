@@ -55,6 +55,9 @@ USAGE:
     canter capabilities [--json]
     canter daemon run [--socket PATH] [--config PATH]
     canter daemon status [--config PATH] [--json]
+    canter lane preview --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY] [--socket PATH] [--config PATH] [--json]
+    canter lane request --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY] [--confirm-digest HEX64 | --confirm | --yes] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter lane status (--replacement RP_ID | --lane ID --generation N) [--socket PATH] [--config PATH] [--json]
     canter service doctor [--config PATH] [--json]
     canter service install-plan [--config PATH] [--json]
     canter service status-plan [--config PATH] [--json]
@@ -73,6 +76,8 @@ COMMANDS:
     plan             Render a deterministic read-only hf-plan/v1 plan.
     capabilities     Report the CLI's declared forge read capabilities.
     daemon           Run or probe the single-writer state daemon.
+    lane             Preview, request, or inspect ONE explicit lane handoff
+                     (preview/status are read-only; request records intent).
     service          Render per-user launchd/systemd plans; doctor checks.
 
 EXIT CODES (with or without --json):
@@ -99,6 +104,8 @@ pub struct Invocation {
     pub daemon_action: Option<DaemonAction>,
     /// Service subcommand (doctor/plan actions).
     pub service_action: Option<ServiceAction>,
+    /// Lane handoff subcommand (preview/request/status).
+    pub lane_action: Option<LaneAction>,
 }
 
 /// Daemon subcommands (issue #5).
@@ -140,6 +147,70 @@ pub enum ConfigAction {
     Validate,
     /// Show the effective config.
     Show,
+}
+
+/// Lane handoff subcommands (issue #78): preview, request, status for ONE
+/// explicit lane. Preview and status are read-only; request records durable
+/// intent only (no spawn, kill, or Git effect exists on this surface).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaneAction {
+    /// Render the reviewable `hf-lane-handoff/v1` plan (read-only).
+    Preview(LaneArgs),
+    /// Authorize and record ONE explicit replacement request.
+    Request(LaneRequestArgs),
+    /// Read one replacement record with its status and guidance (read-only).
+    Status(LaneStatusArgs),
+}
+
+/// The shared plan inputs of `lane preview` / `lane request`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneArgs {
+    /// Logical lane identity (slug).
+    pub lane_id: String,
+    /// Source lane generation being replaced (>= 1).
+    pub generation: i64,
+    /// Source session identity.
+    pub session: String,
+    /// Source process identity.
+    pub process: String,
+    /// Source role (doctrine role).
+    pub role: String,
+    /// Repository-relative worktree reference.
+    pub worktree: String,
+    /// Operator reason (1-300 printable characters).
+    pub reason: String,
+    /// Optional configured harness key whose reviewed profile plan binds.
+    pub profile: Option<String>,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
+}
+
+/// `lane request`: the plan inputs plus the explicit authorization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneRequestArgs {
+    /// The plan inputs.
+    pub plan: LaneArgs,
+    /// `--confirm-digest HEX64`: the noninteractive explicit authorization.
+    pub confirm_digest: Option<String>,
+    /// `--confirm`: read the plan digest from stdin (interactive).
+    pub confirm: bool,
+    /// `--yes`: blanket authorization (refused under a declared policy).
+    pub yes: bool,
+    /// `--idempotency-key`: replay-safe automation key.
+    pub idempotency_key: Option<String>,
+}
+
+/// `lane status`: one exact target (replacement id or lane + generation).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneStatusArgs {
+    /// Explicit replacement id (`rp_` + 16 hex).
+    pub replacement: Option<String>,
+    /// Lane id (with `--generation`).
+    pub lane_id: Option<String>,
+    /// Source lane generation (with `--lane`).
+    pub generation: Option<i64>,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
 }
 
 /// Plan command arguments (validated during parsing).
@@ -280,6 +351,7 @@ pub fn parse_invocation(args: &[String]) -> Result<Invocation, ParseError> {
         "plan" => parse_plan(&rest),
         "daemon" => parse_daemon(&rest),
         "service" => parse_service(&rest),
+        "lane" => parse_lane(&rest),
         other => Err(ParseError::Usage(format!("unknown command {other:?}"))),
     }
 }
@@ -317,6 +389,7 @@ fn parse_flag_command(name: &str, args: &[&String]) -> Result<Invocation, ParseE
         config_action: None,
         daemon_action: None,
         service_action: None,
+        lane_action: None,
     })
 }
 
@@ -329,6 +402,7 @@ fn help_request(name: &str) -> String {
         "plan" => PLAN_USAGE.trim_end().to_string(),
         "config" => CONFIG_USAGE.trim_end().to_string(),
         "daemon" => DAEMON_USAGE.trim_end().to_string(),
+        "lane" => LANE_USAGE.trim_end().to_string(),
         "service" => SERVICE_USAGE.trim_end().to_string(),
         _ => USAGE.to_string(),
     }
@@ -456,6 +530,7 @@ fn parse_config(args: &[&String]) -> Result<Invocation, ParseError> {
         config_action: Some(action),
         daemon_action: None,
         service_action: None,
+        lane_action: None,
     })
 }
 
@@ -546,6 +621,7 @@ fn parse_daemon(args: &[&String]) -> Result<Invocation, ParseError> {
         config_action: None,
         daemon_action: Some(action),
         service_action: None,
+        lane_action: None,
     })
 }
 
@@ -602,7 +678,283 @@ fn parse_service(args: &[&String]) -> Result<Invocation, ParseError> {
         config_action: None,
         daemon_action: None,
         service_action: Some(action),
+        lane_action: None,
     })
+}
+
+/// Parse `lane <preview|request|status>` (issue #78).
+fn parse_lane(args: &[&String]) -> Result<Invocation, ParseError> {
+    let action = args
+        .first()
+        .ok_or_else(|| ParseError::Help(help_request("lane")))?;
+    if action.as_str() == "-h" || action.as_str() == "--help" {
+        return Err(ParseError::Help(help_request("lane")));
+    }
+    let rest: Vec<&String> = args[1..].to_vec();
+
+    let mut json = false;
+    let mut config_path: Option<PathBuf> = None;
+    let mut socket: Option<String> = None;
+    let mut lane_id: Option<String> = None;
+    let mut generation: Option<i64> = None;
+    let mut session: Option<String> = None;
+    let mut process: Option<String> = None;
+    let mut role: Option<String> = None;
+    let mut worktree: Option<String> = None;
+    let mut reason: Option<String> = None;
+    let mut profile: Option<String> = None;
+    let mut confirm_digest: Option<String> = None;
+    let mut confirm = false;
+    let mut yes = false;
+    let mut idempotency_key: Option<String> = None;
+    let mut replacement: Option<String> = None;
+
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--json" => json = true,
+            "--config" => {
+                config_path = Some(PathBuf::from(flag_value(
+                    &rest, &mut index, "lane", "--config",
+                )?))
+            }
+            "--socket" => socket = Some(flag_value(&rest, &mut index, "lane", "--socket")?),
+            "--lane" => lane_id = Some(flag_value(&rest, &mut index, "lane", "--lane")?),
+            "--generation" => {
+                let raw = flag_value(&rest, &mut index, "lane", "--generation")?;
+                let parsed = raw.parse::<i64>().map_err(|_| {
+                    ParseError::Usage(format!(
+                        "lane: --generation must be a positive integer, got {raw:?}"
+                    ))
+                })?;
+                if parsed < 1 {
+                    return Err(ParseError::Usage(format!(
+                        "lane: --generation must be a positive integer, got {raw:?}"
+                    )));
+                }
+                generation = Some(parsed);
+            }
+            "--session" => session = Some(flag_value(&rest, &mut index, "lane", "--session")?),
+            "--process" => process = Some(flag_value(&rest, &mut index, "lane", "--process")?),
+            "--role" => role = Some(flag_value(&rest, &mut index, "lane", "--role")?),
+            "--worktree" => worktree = Some(flag_value(&rest, &mut index, "lane", "--worktree")?),
+            "--reason" => reason = Some(flag_value(&rest, &mut index, "lane", "--reason")?),
+            "--profile" => profile = Some(flag_value(&rest, &mut index, "lane", "--profile")?),
+            "--confirm-digest" => {
+                let raw = flag_value(&rest, &mut index, "lane", "--confirm-digest")?;
+                if !crate::formats::is_hex64(&raw) {
+                    return Err(ParseError::Usage(format!(
+                        "lane request: --confirm-digest must be 64 lowercase hex (the plan digest), \
+                         got {raw:?}"
+                    )));
+                }
+                confirm_digest = Some(raw);
+            }
+            "--confirm" => confirm = true,
+            "--yes" => yes = true,
+            "--idempotency-key" => {
+                let raw = flag_value(&rest, &mut index, "lane", "--idempotency-key")?;
+                if !crate::formats::is_idempotency_key(&raw) {
+                    return Err(ParseError::Usage(format!(
+                        "lane request: --idempotency-key must match `ik_` + 8-64 of [a-z0-9-], got \
+                         {raw:?}"
+                    )));
+                }
+                idempotency_key = Some(raw);
+            }
+            "--replacement" => {
+                let raw = flag_value(&rest, &mut index, "lane", "--replacement")?;
+                if !crate::formats::is_replacement_id(&raw) {
+                    return Err(ParseError::Usage(format!(
+                        "lane status: --replacement must be `rp_` + 16 lowercase hex, got {raw:?}"
+                    )));
+                }
+                replacement = Some(raw);
+            }
+            "-h" | "--help" => return Err(ParseError::Help(help_request("lane"))),
+            flag => {
+                return Err(ParseError::Usage(format!(
+                    "lane: unknown flag {flag:?}; run `canter lane --help`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    let command = match action.as_str() {
+        "preview" => "lane preview",
+        "request" => "lane request",
+        "status" => "lane status",
+        other => {
+            return Err(ParseError::Usage(format!(
+                "lane: unknown subcommand {other:?}; run `canter lane --help`"
+            )));
+        }
+    };
+
+    if command == "lane status" {
+        if session.is_some()
+            || process.is_some()
+            || role.is_some()
+            || worktree.is_some()
+            || reason.is_some()
+            || profile.is_some()
+            || confirm_digest.is_some()
+            || confirm
+            || yes
+        {
+            return Err(ParseError::Usage(
+                "lane status: plan inputs/authorization flags are not valid for a read-only \
+                 status read"
+                    .to_string(),
+            ));
+        }
+        if replacement.is_some() && lane_id.is_some() {
+            return Err(ParseError::Usage(
+                "lane status: pass either --replacement RP_ID or --lane ID --generation N, not both"
+                    .to_string(),
+            ));
+        }
+        let status = match (replacement, lane_id, generation) {
+            (Some(replacement), _, _) => LaneStatusArgs {
+                replacement: Some(replacement),
+                lane_id: None,
+                generation: None,
+                socket,
+            },
+            (None, Some(lane_id), Some(generation)) => {
+                if !crate::formats::is_slug(&lane_id) {
+                    return Err(ParseError::Usage(format!(
+                        "lane status: --lane must be a lowercase slug (a-z, 0-9, '-'), got \
+                         {lane_id:?}"
+                    )));
+                }
+                LaneStatusArgs {
+                    replacement: None,
+                    lane_id: Some(lane_id),
+                    generation: Some(generation),
+                    socket,
+                }
+            }
+            (None, Some(_), None) => {
+                return Err(ParseError::Usage(
+                    "lane status: --lane requires --generation".to_string(),
+                ));
+            }
+            (None, None, Some(_)) => {
+                return Err(ParseError::Usage(
+                    "lane status: --generation requires --lane".to_string(),
+                ));
+            }
+            (None, None, None) => {
+                return Err(ParseError::Usage(
+                    "lane status: pass --replacement RP_ID or --lane ID --generation N".to_string(),
+                ));
+            }
+        };
+        return Ok(Invocation {
+            command: command.to_string(),
+            json,
+            config_path,
+            plan: None,
+            config_action: None,
+            daemon_action: None,
+            service_action: None,
+            lane_action: Some(LaneAction::Status(status)),
+        });
+    }
+
+    if replacement.is_some() {
+        return Err(ParseError::Usage(format!(
+            "{command}: --replacement is only valid for `canter lane status`"
+        )));
+    }
+    let lane_id = required_flag(&lane_id, command, "--lane")?.to_string();
+    let generation = generation.ok_or_else(|| {
+        ParseError::Usage(format!(
+            "{command}: --generation is required (positive integer)"
+        ))
+    })?;
+    let session = required_flag(&session, command, "--session")?.to_string();
+    let process = required_flag(&process, command, "--process")?.to_string();
+    let role = required_flag(&role, command, "--role")?.to_string();
+    let worktree = required_flag(&worktree, command, "--worktree")?.to_string();
+    let reason = required_flag(&reason, command, "--reason")?.to_string();
+    crate::handoff::validate_plan_input(
+        &lane_id, generation, &session, &process, &role, &worktree, &reason,
+    )
+    .map_err(|err| ParseError::Usage(format!("{command}: {}", err.message)))?;
+    if let Some(key) = &profile
+        && !crate::formats::is_slug(key)
+    {
+        return Err(ParseError::Usage(format!(
+            "{command}: --profile must name a configured harness key (lowercase slug), got \
+             {key:?}"
+        )));
+    }
+    let plan = LaneArgs {
+        lane_id,
+        generation,
+        session,
+        process,
+        role,
+        worktree,
+        reason,
+        profile,
+        socket,
+    };
+    let lane_action = if command == "lane preview" {
+        if confirm_digest.is_some() || confirm || yes || idempotency_key.is_some() {
+            return Err(ParseError::Usage(
+                "lane preview: authorization flags (--confirm-digest/--confirm/--yes/\
+                 --idempotency-key) are request-only; preview is read-only"
+                    .to_string(),
+            ));
+        }
+        LaneAction::Preview(plan)
+    } else {
+        LaneAction::Request(LaneRequestArgs {
+            plan,
+            confirm_digest,
+            confirm,
+            yes,
+            idempotency_key,
+        })
+    };
+    Ok(Invocation {
+        command: command.to_string(),
+        json,
+        config_path,
+        plan: None,
+        config_action: None,
+        daemon_action: None,
+        service_action: None,
+        lane_action: Some(lane_action),
+    })
+}
+
+/// Read one `--flag value` pair out of an argv slice.
+fn flag_value(
+    args: &[&String],
+    index: &mut usize,
+    command: &str,
+    flag: &str,
+) -> Result<String, ParseError> {
+    *index += 1;
+    args.get(*index)
+        .map(|value| value.to_string())
+        .ok_or_else(|| ParseError::Usage(format!("{command}: {flag} requires a value")))
+}
+
+/// Require one already-parsed flag value.
+fn required_flag<'a>(
+    value: &'a Option<String>,
+    command: &str,
+    flag: &str,
+) -> Result<&'a str, ParseError> {
+    value
+        .as_deref()
+        .ok_or_else(|| ParseError::Usage(format!("{command}: {flag} is required")))
 }
 
 fn parse_plan(args: &[&String]) -> Result<Invocation, ParseError> {
@@ -670,6 +1022,7 @@ fn parse_plan(args: &[&String]) -> Result<Invocation, ParseError> {
             revision,
         }),
         config_action: None,
+        lane_action: None,
     })
 }
 
@@ -757,6 +1110,9 @@ pub fn render_envelope(command: &str, result: &CmdResult) -> String {
 
 /// Execute one parsed invocation.
 pub fn execute(invocation: &Invocation) -> CmdResult {
+    if let Some(action) = invocation.lane_action.clone() {
+        return execute_lane(action, invocation);
+    }
     if let Some(action) = invocation.daemon_action.clone() {
         return execute_daemon(action, invocation);
     }
@@ -1509,6 +1865,739 @@ fn execute_config(action: ConfigAction, invocation: &Invocation) -> CmdResult {
     }
 }
 
+/// Map one typed code onto its stable exit code for the lane surface:
+/// refusals 4, usage 2, config/policy 5, everything else (daemon/transport)
+/// 1. `command | grep` is never used to decide this; the code is typed.
+fn lane_exit_code(code: &str) -> u8 {
+    if code.starts_with("refusal.") || code == "state.not_found" {
+        4
+    } else if code.starts_with("usage.") {
+        2
+    } else if code.starts_with("config.") || code.starts_with("policy.") {
+        5
+    } else {
+        1
+    }
+}
+
+fn lane_error(code: &str, message: String, retryable: bool) -> CmdResult {
+    // Human mode carries the stable code in the diagnostic so the operator
+    // and the JSON envelope agree on the same typed refusal.
+    let mut result = error_result(lane_exit_code(code), code, message.clone(), retryable);
+    result.diagnostics = format!("{code}: {message}");
+    result
+}
+
+/// The closed read-only method allowlist of the lane surface: preview and
+/// status may issue ONLY these methods. Every read-only lane call goes
+/// through [`read_only_call`], which fails closed (typed) on anything else —
+/// the guard that keeps the read-only commands free of mutations even if a
+/// call site is ever edited.
+const READ_ONLY_METHODS: [&str; 2] = ["lane.replacement.status", "lane.checkpoint.status"];
+
+/// One read-only lane RPC: refuses any method outside the read-only
+/// allowlist BEFORE a socket is even opened.
+fn read_only_call(
+    socket_path: &std::path::Path,
+    method: &str,
+    params: Option<&Val>,
+) -> Result<Val, RpcError> {
+    if !READ_ONLY_METHODS.contains(&method) {
+        return Err(RpcError {
+            code: "client.read_only".to_string(),
+            message: format!(
+                "refusing {method:?} on the read-only lane surface (preview/status never mutate)"
+            ),
+        });
+    }
+    client::call(socket_path, method, params)
+}
+
+/// The read-only durable record read of one replacement (`None` when no
+/// record exists yet — a preview may target a not-yet-requested lane).
+fn read_only_lane_record(
+    socket_path: &std::path::Path,
+    replacement_id: &str,
+) -> Result<Option<Val>, RpcError> {
+    let params = object(vec![("replacement_id", string(replacement_id))]);
+    match read_only_call(socket_path, "lane.replacement.status", Some(&params)) {
+        Ok(result) => Ok(Some(result)),
+        Err(RpcError { code, .. }) if code == "state.not_found" => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// The read-only retained workers/reviewers/gates read: the committed
+/// checkpoint snapshot's orchestration block, when one exists.
+fn read_only_retained(
+    socket_path: &std::path::Path,
+    replacement_id: &str,
+) -> crate::handoff::RetainedView {
+    let params = object(vec![("replacement_id", string(replacement_id))]);
+    match read_only_call(socket_path, "lane.checkpoint.status", Some(&params)) {
+        Ok(result) => result
+            .get("checkpoint")
+            .and_then(|checkpoint| checkpoint.get("snapshot"))
+            .map(crate::handoff::RetainedView::from_checkpoint_snapshot)
+            .unwrap_or_default(),
+        Err(_) => crate::handoff::RetainedView::default(),
+    }
+}
+
+/// Require a live daemon for the lane mutation/read paths (mirrors the
+/// `daemon status` presence rules; JSON/prompt behavior is unaffected).
+fn require_live_daemon(paths: &DaemonPaths) -> Result<(), Box<CmdResult>> {
+    match crate::lock::socket_presence(&paths.socket_path) {
+        crate::lock::SocketPresence::Active => Ok(()),
+        crate::lock::SocketPresence::Stale => Err(Box::new(lane_error(
+            "daemon.stale",
+            format!(
+                "a stale daemon socket exists at {}; a fresh `daemon run` reclaims it",
+                paths.socket_path.display()
+            ),
+            true,
+        ))),
+        crate::lock::SocketPresence::Absent => Err(Box::new(lane_error(
+            "daemon.absent",
+            format!(
+                "no daemon is running on {}; the lane handoff surface needs the daemon (read-only commands like `canter status` stay available without it)",
+                paths.socket_path.display()
+            ),
+            false,
+        ))),
+        crate::lock::SocketPresence::Unsafe(reason) => Err(Box::new(lane_error(
+            "daemon.unsafe_socket",
+            format!("{} ({})", reason, paths.socket_path.display()),
+            false,
+        ))),
+    }
+}
+
+/// Build the plan (inputs already validated during parsing) plus the bound
+/// target profile when `--profile KEY` names one.
+fn build_lane_plan(
+    args: &LaneArgs,
+    config: Option<&Config>,
+) -> Result<crate::handoff::LanePlan, Box<CmdResult>> {
+    let input = crate::handoff::PlanInput {
+        lane_id: args.lane_id.clone(),
+        generation: args.generation,
+        session: args.session.clone(),
+        process: args.process.clone(),
+        role: args.role.clone(),
+        worktree: args.worktree.clone(),
+        reason: args.reason.clone(),
+    };
+    let profile = match &args.profile {
+        None => None,
+        Some(key) => {
+            let Some(config) = config else {
+                return Err(Box::new(error_result(
+                    5,
+                    "config.not_found",
+                    format!(
+                        "--profile {key:?} needs a config to derive the reviewed plan; run \
+                         `canter config init` and save the template, or omit --profile"
+                    ),
+                    false,
+                )));
+            };
+            let Some(harness) = config.harnesses.iter().find(|harness| harness.key == *key) else {
+                return Err(Box::new(error_result(
+                    5,
+                    "config.harness",
+                    format!(
+                        "no configured harness {key:?}; --profile names a harness key (see \
+                         `canter config show --json`)"
+                    ),
+                    false,
+                )));
+            };
+            let env = crate::config::credential_environment(harness);
+            match crate::config::ProfileBinding::from_config(config, key, &env) {
+                Some(binding) => Some(binding),
+                None => {
+                    return Err(Box::new(error_result(
+                        5,
+                        "config.harness",
+                        format!(
+                            "harness {key:?} declares no provider/model binding; there is no \
+                             inferred profile plan (declare `provider`/`model` or omit --profile)"
+                        ),
+                        false,
+                    )));
+                }
+            }
+        }
+    };
+    Ok(crate::handoff::LanePlan::build(input, profile))
+}
+
+/// The requested authorization mode, or the typed usage refusal when none
+/// (or more than one) was given. JSON mode NEVER prompts; the read-only
+/// JSON contract is upheld by refusing instead of waiting on stdin.
+fn resolve_confirmation(
+    args: &LaneRequestArgs,
+    digest: &str,
+    json: bool,
+) -> Result<crate::handoff::Confirmation, Box<CmdResult>> {
+    let modes = usize::from(args.confirm_digest.is_some())
+        + usize::from(args.confirm)
+        + usize::from(args.yes);
+    if modes > 1 {
+        return Err(Box::new(error_result(
+            2,
+            "usage.confirmation",
+            "pass exactly one authorization mode: --confirm-digest HEX64, --confirm, or --yes"
+                .to_string(),
+            false,
+        )));
+    }
+    if let Some(presented) = &args.confirm_digest {
+        return Ok(crate::handoff::Confirmation::Digest(presented.clone()));
+    }
+    if args.yes {
+        return Ok(crate::handoff::Confirmation::Blanket);
+    }
+    if args.confirm && json {
+        return Err(Box::new(error_result(
+            2,
+            "usage.confirmation_required",
+            "`--confirm` reads the plan digest from the terminal and is never used with --json \
+             (JSON never prompts): pass --confirm-digest HEX64"
+                .to_string(),
+            false,
+        )));
+    }
+    let interactive =
+        args.confirm || (!json && std::io::IsTerminal::is_terminal(&std::io::stdin()));
+    if !interactive {
+        return Err(Box::new(error_result(
+            2,
+            "usage.confirmation_required",
+            crate::handoff::CONFIRMATION_REQUIRED.to_string(),
+            false,
+        )));
+    }
+    // Human confirmation: the prompt goes to stderr and the human types the
+    // exact plan digest (binding the same digest the noninteractive mode
+    // presents).
+    eprintln!("authorize lane handoff plan {digest}");
+    eprint!("type the plan digest to confirm (or 'abort'): ");
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+    if let Err(err) = read {
+        return Err(Box::new(lane_error(
+            "refusal.confirmation.aborted",
+            format!("cannot read the confirmation: {err}"),
+            false,
+        )));
+    }
+    let typed = line.trim();
+    if typed.is_empty() || typed.eq_ignore_ascii_case("abort") {
+        return Err(Box::new(lane_error(
+            "refusal.confirmation.aborted",
+            "the plan was not confirmed".to_string(),
+            false,
+        )));
+    }
+    Ok(crate::handoff::Confirmation::Digest(typed.to_string()))
+}
+
+/// The `lane.replacement.request` params for one authorized plan: exactly
+/// the validated inputs the digest bound (never anything else), plus the
+/// fresh or caller-supplied idempotency key.
+fn lane_request_params(plan: &crate::handoff::LanePlan, key: Option<&str>) -> Val {
+    let replacement_id = plan.replacement_id();
+    let key = key.map(str::to_string).unwrap_or_else(|| {
+        // The generated key is unique per invocation (replacement identity +
+        // a per-process nonce): a re-run is a fresh claim, and the daemon's
+        // record-level refusal is what keeps one successor owner. Automation
+        // that needs replay semantics passes --idempotency-key explicitly.
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        format!(
+            "ik_lane-{}-{secs}-{}",
+            &replacement_id[3..],
+            client::fresh_id()
+        )
+    });
+    let mut fields = vec![
+        ("idempotency_key", string(&key)),
+        ("lane_id", string(&plan.input.lane_id)),
+        ("generation", integer(plan.input.generation)),
+        ("source_session", string(&plan.input.session)),
+        ("source_process", string(&plan.input.process)),
+        ("role", string(&plan.input.role)),
+        ("worktree", string(&plan.input.worktree)),
+        ("reason", string(&plan.input.reason)),
+    ];
+    if let Some(profile) = &plan.profile {
+        fields.push(("profile", profile.to_doc()));
+    }
+    object(fields)
+}
+
+/// `lane preview`: render the reviewable plan. Read-only: the only daemon
+/// interaction is the read-only record/checkpoint read when a live daemon
+/// exists; the preview never dispatches a mutation.
+fn execute_lane_preview(args: &LaneArgs, invocation: &Invocation) -> CmdResult {
+    let config = match load_optional_config(invocation) {
+        Ok(config) => config,
+        Err(result) => return result,
+    };
+    let plan = match build_lane_plan(args, config.as_ref()) {
+        Ok(plan) => plan,
+        Err(result) => return *result,
+    };
+    let socket = effective_socket(args.socket.as_deref(), config.as_ref());
+    let mut diagnostics = String::new();
+    let mut record: Option<Val> = None;
+    let mut retained = crate::handoff::RetainedView::default();
+    // The plan is local and read-only; the daemon enrichment (the durable
+    // record and its retained block) is optional and degrades explicitly.
+    match derive_paths(socket) {
+        Ok(paths) => {
+            if crate::lock::socket_presence(&paths.socket_path)
+                == crate::lock::SocketPresence::Active
+            {
+                match read_only_lane_record(&paths.socket_path, &plan.replacement_id()) {
+                    Ok(Some(status)) => {
+                        retained = read_only_retained(&paths.socket_path, &plan.replacement_id());
+                        record = Some(status);
+                    }
+                    Ok(None) => {}
+                    Err(RpcError { code, message }) => {
+                        diagnostics =
+                            format!("read-only record read unavailable: {code}: {message}\n");
+                    }
+                }
+            } else {
+                diagnostics =
+                    "no live daemon: the plan is rendered without the durable record (read-only)\n"
+                        .to_string();
+            }
+        }
+        Err(result) => {
+            let detail = result
+                .error
+                .as_ref()
+                .map(|error| format!("{}: {}", error.code, error.message))
+                .unwrap_or_default();
+            diagnostics = format!("read-only daemon enrichment unavailable ({detail})\n");
+        }
+    }
+    let document = plan.document(
+        config.as_ref().and_then(|config| config.policy.as_ref()),
+        &retained,
+        record.as_ref(),
+    );
+    let human = render_lane_preview_human(&document);
+    let mut result = ok_result(document, human);
+    result.diagnostics = diagnostics;
+    result
+}
+
+/// `lane request`: authorize and record ONE explicit lane replacement
+/// request through the daemon. This is the ONLY mutating dispatch site on
+/// the lane surface.
+fn execute_lane_request(args: &LaneRequestArgs, invocation: &Invocation) -> CmdResult {
+    let config = match load_optional_config(invocation) {
+        Ok(config) => config,
+        Err(result) => return result,
+    };
+    let plan = match build_lane_plan(&args.plan, config.as_ref()) {
+        Ok(plan) => plan,
+        Err(result) => return *result,
+    };
+    let confirmation = match resolve_confirmation(args, &plan.digest, invocation.json) {
+        Ok(confirmation) => confirmation,
+        Err(result) => return *result,
+    };
+    if let Err(err) = crate::handoff::confirm(
+        config.as_ref().and_then(|config| config.policy.as_ref()),
+        &confirmation,
+        &plan.digest,
+    ) {
+        return lane_error(err.code, err.message, false);
+    }
+    let socket = effective_socket(args.plan.socket.as_deref(), config.as_ref());
+    let paths = match derive_paths(socket) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    if let Err(result) = require_live_daemon(&paths) {
+        return *result;
+    }
+    let params = lane_request_params(&plan, args.idempotency_key.as_deref());
+    match client::call(
+        &paths.socket_path,
+        "lane.replacement.request",
+        Some(&params),
+    ) {
+        Ok(result) => {
+            let replacement = result.get("replacement").cloned().unwrap_or_else(null);
+            let replacement_id = replacement
+                .get("replacement_id")
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string();
+            let authorization = match confirmation {
+                crate::handoff::Confirmation::Digest(_) => "digest",
+                crate::handoff::Confirmation::Blanket => "blanket",
+            };
+            let data = object(vec![
+                ("schema", string(crate::handoff::LANE_PLAN_SCHEMA)),
+                ("plan_digest", string(&plan.digest)),
+                ("authorization", string(authorization)),
+                ("replacement", replacement),
+                (
+                    "profile",
+                    result.get("profile").cloned().unwrap_or_else(null),
+                ),
+                (
+                    "next",
+                    object(vec![
+                        ("operation", string("lane.replacement.status")),
+                        (
+                            "command",
+                            string(&format!(
+                                "canter lane status --replacement {replacement_id}"
+                            )),
+                        ),
+                    ]),
+                ),
+            ]);
+            let human = render_lane_request_human(&data);
+            ok_result(data, human)
+        }
+        Err(RpcError { code, message }) => {
+            lane_error(&code, format!("lane request: {message}"), false)
+        }
+    }
+}
+
+/// `lane status`: read one replacement record read-only and render the
+/// status contract (phase, intended/actual binding, blocker, last verified
+/// transition, next supported action, guidance). Never mutates; never
+/// advances; never resumes anything.
+fn execute_lane_status(args: &LaneStatusArgs, invocation: &Invocation) -> CmdResult {
+    let config = match load_optional_config(invocation) {
+        Ok(config) => config,
+        Err(result) => return result,
+    };
+    let replacement_id = match &args.replacement {
+        Some(replacement) => replacement.clone(),
+        None => crate::state::replacement_id_for(
+            args.lane_id.as_deref().unwrap_or_default(),
+            args.generation.unwrap_or(0),
+        ),
+    };
+    let socket = effective_socket(args.socket.as_deref(), config.as_ref());
+    let paths = match derive_paths(socket) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    if let Err(result) = require_live_daemon(&paths) {
+        return *result;
+    }
+    let status = match read_only_lane_record(&paths.socket_path, &replacement_id) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            return lane_error(
+                "state.not_found",
+                format!(
+                    "no lane replacement {replacement_id:?} exists on this daemon; request one \
+                     with `canter lane request`"
+                ),
+                false,
+            );
+        }
+        Err(RpcError { code, message }) => {
+            return lane_error(&code, format!("lane status: {message}"), false);
+        }
+    };
+    let retained = read_only_retained(&paths.socket_path, &replacement_id);
+    let document = crate::handoff::status_document(&status, &retained);
+    let human = render_lane_status_human(&document);
+    ok_result(document, human)
+}
+
+/// Execute one lane subcommand.
+fn execute_lane(action: LaneAction, invocation: &Invocation) -> CmdResult {
+    match action {
+        LaneAction::Preview(args) => execute_lane_preview(&args, invocation),
+        LaneAction::Request(args) => execute_lane_request(&args, invocation),
+        LaneAction::Status(args) => execute_lane_status(&args, invocation),
+    }
+}
+
+/// The human rendering of one preview document (a rendering of the same
+/// data, never a second contradicting contract).
+fn render_lane_preview_human(document: &Val) -> String {
+    let plan = document.get("plan").cloned().unwrap_or_else(null);
+    let source = plan.get("source").cloned().unwrap_or_else(null);
+    let text = |value: &Val, key: &str| -> String {
+        value
+            .get(key)
+            .and_then(Val::as_str)
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let number =
+        |value: &Val, key: &str| -> i64 { value.get(key).and_then(Val::as_int).unwrap_or(0) };
+    let mut lines = vec![
+        format!(
+            "lane handoff plan: {} generation {} -> successor generation {}",
+            text(&plan, "lane"),
+            number(&plan, "generation"),
+            number(&plan, "successor_generation")
+        ),
+        format!(
+            "replacement: {} ({}), worktree {}",
+            text(&plan, "replacement_id"),
+            if document
+                .get("record")
+                .map(|record| !record.is_null())
+                .unwrap_or(false)
+            {
+                "durable record present"
+            } else {
+                "not requested yet"
+            },
+            text(&source, "worktree")
+        ),
+        format!(
+            "source: session {}, process {}, role {}",
+            text(&source, "session"),
+            text(&source, "process"),
+            text(&source, "role")
+        ),
+    ];
+    if let Some(profile) = plan.get("profile").filter(|profile| !profile.is_null()) {
+        lines.push(format!(
+            "profile: {} (revision {}, intended {}/{})",
+            text(profile, "key"),
+            text(profile, "revision"),
+            text(profile, "provider"),
+            text(profile, "model")
+        ));
+    } else {
+        lines.push(
+            "profile: none (unbound request; no target-profile revision is bound)".to_string(),
+        );
+    }
+    lines.push("effect boundaries:".to_string());
+    lines.extend(crate::handoff::boundary_lines());
+    let retained = document.get("retained").cloned().unwrap_or_else(null);
+    if retained.get("captured").and_then(Val::as_bool) == Some(true) {
+        let list = |key: &str| -> String {
+            retained
+                .get(key)
+                .and_then(Val::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Val::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default()
+        };
+        lines.push(format!(
+            "retained: workers [{}] reviewers [{}] gates [{}] (captured; never addressed by the handoff)",
+            list("workers"),
+            list("reviewers"),
+            list("pending_gates")
+        ));
+    } else {
+        lines.push(
+            "retained: not yet captured (the checkpoint captures the retained workers/reviewers/\
+             gates at the `checkpointed` boundary)"
+                .to_string(),
+        );
+    }
+    let authorization = document.get("authorization").cloned().unwrap_or_else(null);
+    let requirement = text(&authorization, "requirement");
+    let policy = authorization
+        .get("policy")
+        .and_then(Val::as_str)
+        .unwrap_or("none");
+    lines.push(format!(
+        "authorization: {requirement} (policy production_confirmation: {policy})"
+    ));
+    let digest = text(document, "digest");
+    lines.push("preview: no mutation performed (read-only)".to_string());
+    lines.push(format!("plan digest: {digest}"));
+    lines.push(format!(
+        "authorize with: canter lane request --confirm-digest {digest}"
+    ));
+    lines.join("\n") + "\n"
+}
+
+/// The human rendering of one request result.
+fn render_lane_request_human(data: &Val) -> String {
+    let replacement = data.get("replacement").cloned().unwrap_or_else(null);
+    let text = |value: &Val, key: &str| -> String {
+        value
+            .get(key)
+            .and_then(Val::as_str)
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let mut lines = vec![
+        format!(
+            "lane handoff requested: {} (lane {}, generation {} -> successor generation {})",
+            text(&replacement, "replacement_id"),
+            text(&replacement, "lane_id"),
+            replacement
+                .get("generation")
+                .and_then(Val::as_int)
+                .unwrap_or(0),
+            replacement
+                .get("successor_generation")
+                .and_then(Val::as_int)
+                .unwrap_or(0)
+        ),
+        format!("phase: {}", text(&replacement, "phase")),
+        format!(
+            "plan digest: {} (authorized by {})",
+            text(data, "plan_digest"),
+            text(data, "authorization")
+        ),
+    ];
+    if let Some(next) = data.get("next") {
+        lines.push(format!("next: {}", text(next, "command")));
+    }
+    lines.join("\n") + "\n"
+}
+
+/// The human rendering of one status document.
+fn render_lane_status_human(document: &Val) -> String {
+    let replacement = document.get("replacement").cloned().unwrap_or_else(null);
+    let text = |value: &Val, key: &str| -> String {
+        value
+            .get(key)
+            .and_then(Val::as_str)
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let mut lines = vec![
+        format!(
+            "lane handoff: {} (lane {}, generation {} -> successor generation {})",
+            text(&replacement, "replacement_id"),
+            text(&replacement, "lane_id"),
+            replacement
+                .get("generation")
+                .and_then(Val::as_int)
+                .unwrap_or(0),
+            replacement
+                .get("successor_generation")
+                .and_then(Val::as_int)
+                .unwrap_or(0)
+        ),
+        format!(
+            "phase: {} · outcome: {}",
+            text(document, "phase"),
+            text(document, "outcome")
+        ),
+    ];
+    lines.push(
+        match document.get("blocker").filter(|blocker| !blocker.is_null()) {
+            Some(blocker) => format!("blocker: {}", text(blocker, "blocker")),
+            None => "blocker: none".to_string(),
+        },
+    );
+    lines.push(
+        match document.get("intended").filter(|value| !value.is_null()) {
+            Some(intended) => format!(
+                "intended: {}/{} (revision {})",
+                text(intended, "provider"),
+                text(intended, "model"),
+                text(intended, "revision")
+            ),
+            None => "intended: no bound profile plan".to_string(),
+        },
+    );
+    lines.push(
+        match document.get("actual").filter(|value| !value.is_null()) {
+            Some(actual) => format!(
+                "actual: {} ({}/{})",
+                text(actual, "status"),
+                actual
+                    .get("provider")
+                    .and_then(Val::as_str)
+                    .unwrap_or("unknown"),
+                actual
+                    .get("model")
+                    .and_then(Val::as_str)
+                    .unwrap_or("unknown")
+            ),
+            None => "actual: no successor verification recorded".to_string(),
+        },
+    );
+    lines.push(
+        match document
+            .get("last_transition")
+            .filter(|value| !value.is_null())
+        {
+            Some(transition) => format!(
+                "last transition: {} -> {} at {}",
+                transition
+                    .get("from")
+                    .and_then(Val::as_str)
+                    .unwrap_or("(start)"),
+                text(transition, "to"),
+                text(transition, "at")
+            ),
+            None => "last transition: none recorded".to_string(),
+        },
+    );
+    if let Some(next) = document.get("next") {
+        lines.push(match next.get("phase").and_then(Val::as_str) {
+            Some(phase) => format!(
+                "next: {} (daemon {}; not exposed by this CLI slice)",
+                phase,
+                text(next, "operation")
+            ),
+            None => "next: none (the record cannot advance)".to_string(),
+        });
+    }
+    let retained = document.get("retained").cloned().unwrap_or_else(null);
+    if retained.get("captured").and_then(Val::as_bool) == Some(true) {
+        let list = |key: &str| -> String {
+            retained
+                .get(key)
+                .and_then(Val::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Val::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default()
+        };
+        lines.push(format!(
+            "retained: workers [{}] reviewers [{}] gates [{}]",
+            list("workers"),
+            list("reviewers"),
+            list("pending_gates")
+        ));
+    }
+    if let Some(guidance) = document.get("guidance").and_then(Val::as_array)
+        && !guidance.is_empty()
+    {
+        lines.push("guidance:".to_string());
+        for line in guidance {
+            lines.push(format!("  - {}", line.as_str().unwrap_or_default()));
+        }
+    }
+    lines.join("\n") + "\n"
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1542,6 +2631,62 @@ doctor checks the daemon environment read-only (platform, config, socket
 state, per-user unit placement). The *-plan commands render the first-party
 launchd/systemd unit text and the exact command steps for a clean host —
 they never install, start, stop, or query the host service manager.
+";
+
+const LANE_USAGE: &str = "\
+canter lane <preview|request|status> — ONE explicit lane handoff
+
+USAGE:
+    canter lane preview --lane ID --generation N --session S --process P \
+--role R --worktree W --reason TEXT [--profile KEY] [--socket PATH] \
+[--config PATH] [--json]
+    canter lane request --lane ID --generation N --session S --process P \
+--role R --worktree W --reason TEXT [--profile KEY] \
+[--confirm-digest HEX64 | --confirm | --yes] [--idempotency-key IK] \
+[--socket PATH] [--config PATH] [--json]
+    canter lane status (--replacement RP_ID | --lane ID --generation N) \
+[--socket PATH] [--config PATH] [--json]
+
+preview renders the reviewable hf-lane-handoff/v1 plan for one lane
+replacement: the source identity (session, process, role, generation), the
+target profile plan (--profile KEY derives the reviewed
+hf-profile-binding/v1 document from the config, the same plan
+`canter config show` previews), the repository-relative worktree, the
+effect boundaries of the phase chain, the retained workers/reviewers/gates
+(captured at the checkpointed boundary; read-only when a checkpoint
+exists), and the plan digest. preview NEVER mutates: it performs no
+mutating RPC (only read-only record reads) and writes nothing.
+
+request records ONE durable lane replacement request at phase `requested`
+(daemon `lane.replacement.request`). The authorization binds the exact
+plan digest: --confirm-digest HEX64 is the noninteractive explicit mode
+and --confirm reads the digest you type on stdin (prompt on stderr).
+--yes is a blanket authorization and is refused whenever the policy
+overlay declares a production_confirmation rule (`tty` or `deny`) — it can
+never bypass that policy. JSON mode never prompts: pass --confirm-digest.
+A presented digest that does not match the current plan is refused as a
+stale plan (refusal.plan.stale); the request has no spawn, kill, or Git
+effect and never resumes a paused fleet.
+
+status reads one replacement record read-only (daemon
+`lane.replacement.status` plus the committed checkpoint): phase, outcome,
+blocker, intended/actual model binding, the last verified transition, the
+next supported action and actionable guidance. It never mutates, never
+advances a record, and never resumes anything.
+
+EXIT CODES: 0 ok · 1 daemon/transport error · 2 usage · 4 refusal
+(refusal.plan.stale, refusal.confirmation.policy, refusal.policy.production,
+daemon refusals, state.not_found) · 5 config/policy error.
+
+EXAMPLES:
+    canter lane preview --lane lane-0001 --generation 1 --session sess-1 \
+--process proc-1 --role implementer --worktree worktrees/issues/78 \
+--reason 'rotate the implementer lane' --profile lane-harness --json
+    canter lane request --lane lane-0001 --generation 1 --session sess-1 \
+--process proc-1 --role implementer --worktree worktrees/issues/78 \
+--reason 'rotate the implementer lane' --confirm-digest <64-hex>
+    canter lane status --lane lane-0001 --generation 1 --json
+    canter lane status --replacement rp_0123456789abcdef --json
 ";
 
 /// Resolve the daemon socket override: the CLI flag wins over
@@ -1982,6 +3127,9 @@ fn per_command_usage(command: &str) -> &'static str {
         "service" => {
             "usage: canter service <doctor|install-plan|status-plan|uninstall-plan> [--config PATH] [--json]"
         }
+        "lane" => {
+            "usage: canter lane preview|request --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY]\n       canter lane status --replacement RP_ID | --lane ID --generation N"
+        }
         _ => "usage: canter [--help] [--version] | canter <command> [options]",
     }
 }
@@ -2098,5 +3246,190 @@ mod tests {
         let samples = [3u64, 1, 2];
         assert_eq!(crate::observe::percentile_ms(&samples, 50.0), 2);
         assert_eq!(crate::observe::percentile_ms(&samples, 95.0), 3);
+    }
+
+    // -----------------------------------------------------------------
+    // lane (issue #78)
+    // -----------------------------------------------------------------
+
+    fn lane_plan_flags(lane: &str) -> Vec<String> {
+        [
+            "--lane",
+            lane,
+            "--generation",
+            "1",
+            "--session",
+            "sess-1",
+            "--process",
+            "proc-1",
+            "--role",
+            "implementer",
+            "--worktree",
+            "worktrees/issues/78",
+            "--reason",
+            "lane window",
+        ]
+        .iter()
+        .map(|value| value.to_string())
+        .collect()
+    }
+
+    fn lane_args(sub: &str, lane: &str, extra: &[&str]) -> Vec<String> {
+        let mut args = vec!["lane".to_string(), sub.to_string()];
+        args.extend(lane_plan_flags(lane));
+        args.extend(extra.iter().map(|value| value.to_string()));
+        args
+    }
+
+    fn invocation_of(args: Vec<String>) -> Invocation {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        invocation(&refs)
+    }
+
+    fn parse_of(args: Vec<String>) -> Result<Invocation, ParseError> {
+        parse_invocation(&args)
+    }
+
+    #[test]
+    fn lane_invocations_parse_and_validate() {
+        let preview = invocation_of(lane_args("preview", "lane-1", &["--json"]));
+        assert_eq!(preview.command, "lane preview");
+        assert!(matches!(preview.lane_action, Some(LaneAction::Preview(_))));
+
+        let request = invocation_of(lane_args("request", "lane-1", &["--yes"]));
+        assert_eq!(request.command, "lane request");
+        match request.lane_action {
+            Some(LaneAction::Request(args)) => {
+                assert!(args.yes);
+                assert!(args.confirm_digest.is_none());
+            }
+            other => panic!("expected a request action, got {other:?}"),
+        }
+
+        let status = invocation(&[
+            "lane",
+            "status",
+            "--replacement",
+            "rp_0123456789abcdef",
+            "--json",
+        ]);
+        assert_eq!(status.command, "lane status");
+        match status.lane_action {
+            Some(LaneAction::Status(args)) => {
+                assert_eq!(args.replacement.as_deref(), Some("rp_0123456789abcdef"));
+            }
+            other => panic!("expected a status action, got {other:?}"),
+        }
+
+        // Malformed or mixed invocations are usage errors (exit 2).
+        for args in [
+            lane_args("preview", "lane-1", &["--confirm-digest", &"a".repeat(64)]),
+            lane_args("request", "lane-1", &["--confirm-digest", "not-hex"]),
+            lane_args("request", "lane-1", &["--idempotency-key", "bad"]),
+            lane_args("preview", "Bad Lane", &[]),
+            lane_args("preview", "lane-1", &["--generation", "0"]),
+            vec!["lane".to_string(), "status".to_string()],
+            vec![
+                "lane".to_string(),
+                "status".to_string(),
+                "--lane".to_string(),
+                "lane-1".to_string(),
+            ],
+            vec![
+                "lane".to_string(),
+                "status".to_string(),
+                "--replacement".to_string(),
+                "rp_0123456789abcdef".to_string(),
+                "--lane".to_string(),
+                "lane-1".to_string(),
+            ],
+            vec!["lane".to_string(), "unknown".to_string()],
+        ] {
+            assert!(
+                parse_of(args.clone()).is_err(),
+                "expected a usage error for {args:?}"
+            );
+        }
+
+        // Help requests print the lane usage.
+        match parse_invocation(&["lane".to_string(), "--help".to_string()]) {
+            Err(ParseError::Help(text)) => {
+                assert!(text.contains("canter lane <preview|request|status>"))
+            }
+            other => panic!("expected lane help, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lane_request_parameters_carry_exactly_the_plan_inputs() {
+        let plan = crate::handoff::LanePlan::build(
+            crate::handoff::validate_plan_input(
+                "lane-1",
+                2,
+                "sess-1",
+                "proc-1",
+                "implementer",
+                "worktrees/issues/78",
+                "lane window",
+            )
+            .expect("valid plan input"),
+            None,
+        );
+        let params = lane_request_params(&plan, None);
+        assert_eq!(params.get("lane_id").and_then(Val::as_str), Some("lane-1"));
+        assert_eq!(params.get("generation").and_then(Val::as_int), Some(2));
+        assert_eq!(
+            params.get("source_session").and_then(Val::as_str),
+            Some("sess-1")
+        );
+        assert_eq!(
+            params.get("reason").and_then(Val::as_str),
+            Some("lane window")
+        );
+        assert!(params.get("profile").is_none(), "no bound profile");
+        let key = params
+            .get("idempotency_key")
+            .and_then(Val::as_str)
+            .expect("generated key");
+        assert!(
+            crate::formats::is_idempotency_key(key),
+            "the generated key is well formed: {key:?}"
+        );
+        let explicit = lane_request_params(&plan, Some("ik_explicit-0001"));
+        assert_eq!(
+            explicit.get("idempotency_key").and_then(Val::as_str),
+            Some("ik_explicit-0001")
+        );
+    }
+
+    #[test]
+    fn the_read_only_lane_guard_refuses_every_mutating_method() {
+        // The guard is the closed allowlist: a mutating lane method is
+        // refused typed BEFORE any socket is opened. Removing this check
+        // makes this test fail (the mutation probe for issue #78).
+        let path = std::env::temp_dir().join("canter-lane-read-only-guard.sock");
+        for method in [
+            "lane.replacement.request",
+            "lane.replacement.advance",
+            "lane.replacement.hold",
+            "lane.replacement.cancel",
+            "lane.checkpoint.create",
+            "lane.retire",
+            "lane.start",
+            "lane.adopt",
+            "lane.successor.consume",
+            "apply",
+        ] {
+            let error = read_only_call(&path, method, None)
+                .expect_err("a mutating method must never pass the read-only guard");
+            assert_eq!(error.code, "client.read_only", "{method}: {error:?}");
+        }
+        // The allowlisted read-only methods pass the guard and fail only at
+        // the (absent) socket.
+        for method in READ_ONLY_METHODS {
+            let error = read_only_call(&path, method, None)
+                .expect_err("no socket exists at the probe path");
+            assert_eq!(error.code, "client.connect", "{method}: {error:?}");
+        }
     }
 }
