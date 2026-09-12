@@ -101,6 +101,51 @@ by construction. Redaction is conservative: false positives cost nothing,
 false negatives leak; when in doubt, redact. Fixtures contain no real
 secrets and no machine paths (AC8).
 
+## 7. Lane handoff commands (issue #78)
+
+`canter lane <preview|request|status>` is the thin client over the completed
+daemon handoff path ([spec-daemon.md](spec-daemon.md), lane replacement
+methods). Vocabulary follows the daemon (`lane.*`); no alternate control
+plane is introduced. One invocation addresses exactly ONE lane.
+
+| Command | Socket impact | Mutates? | Digest |
+| --- | --- | --- | --- |
+| `lane preview` | read-only reads (`lane.replacement.status`, `lane.checkpoint.status`) when a live daemon exists; works offline | no | renders `digest` |
+| `lane request` | one `lane.replacement.request` (idempotency-keyed) | records ONE durable request; no spawn/kill/Git/grant/resume | binds `--confirm-digest` / typed `--confirm` |
+| `lane status` | read-only reads only | no | — |
+
+- The read-only commands may issue **only** the read-only methods listed
+  above; a closed allowlist guard refuses any other method before a socket
+  is opened. Preview/status never prompt, never advance, and never resume.
+- `lane preview` emits the plan document (`hf-lane-handoff/v1` inside the
+  `hf-output/v1` envelope): source identity, target profile plan
+  (`--profile KEY` derives the reviewed `hf-profile-binding/v1` document),
+  repository-relative worktree, the closed effect-boundary chain, the
+  retained workers/reviewers/pending gates (from the committed checkpoint
+  when captured), the policy-derived `authorization` requirement and the
+  plan `digest`.
+- The plan `digest` is sha256 over the canonical bytes of the exact request
+  inputs plus the bound profile document; it is a pure function of the
+  reviewable plan (render-only derivations never change it).
+- Authorization: `--confirm-digest HEX64` (noninteractive) and `--confirm`
+  (the human types the digest; prompt on stderr) both bind the same digest;
+  a presented digest that does not match the current plan is refused
+  `refusal.plan.stale` before any daemon call. A blanket `--yes` is refused
+  under a declared policy overlay (`production_confirmation`): `tty` →
+  `refusal.confirmation.policy`, `deny` → `refusal.policy.production`.
+- `lane status` emits `phase`, `outcome`, `blocker`, `intended`
+  (provider/model + revision), `actual` (successor evidence; `unknown` with
+  a null pair is never copied from the intended), `last_transition`, `next`
+  (`phase`, `operation`, `exposed_by_cli: false` in this slice), the
+  retained view and bounded `guidance` strings that name only existing
+  commands.
+- JSON mode: exactly one `hf-output/v1` document on stdout, no prompt ever
+  (a missing authorization is `usage.confirmation_required`, exit 2). The
+  human rendering carries the same data; error diagnostics carry the stable
+  code. Exit codes: 0 ok, 1 daemon/transport (`daemon.absent`, `daemon.stale`,
+  bounded-read `client.read`), 2 usage, 4 refusal (`refusal.*`,
+  `state.not_found`), 5 config/policy.
+
 ## Fixtures (accept / refuse discrimination)
 
 - accept: `output.valid.json` (ok), `output.partial.valid.json` (partial,
