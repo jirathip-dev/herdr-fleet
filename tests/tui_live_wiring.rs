@@ -1036,6 +1036,13 @@ mod pty {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        // The window size is read by `forkpty`; the libc signature takes
+        // `*mut winsize` on the BSD/macOS builds and `*const winsize` on
+        // Linux, so the size is passed as an explicit raw pointer. That is
+        // what both signatures accept, and it keeps the call free of a
+        // mutable borrow one of the two platforms does not need
+        // (`clippy::unnecessary_mut_passed` on Linux).
+        let winsize_ptr: *mut libc::winsize = &raw mut winsize;
         let mut master: libc::c_int = -1;
         // SAFETY: `forkpty` is the POSIX pseudo-terminal fork. The child
         // performs only `execve`/`_exit` before replacing its image, so no
@@ -1045,7 +1052,7 @@ mod pty {
                 &mut master,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut winsize,
+                winsize_ptr,
             )
         };
         if pid < 0 {
