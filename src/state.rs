@@ -30,7 +30,7 @@ use crate::time;
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The schema version this binary understands (also `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// Bounded-retention defaults (rows kept besides the chain genesis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,6 +180,46 @@ pub struct GrantRow {
     pub created_at: String,
 }
 
+/// One durable run retry authorization (issue #86): exactly ONE bounded
+/// re-dispatch of ONE diagnosed step of ONE run. Row count bounds attempts;
+/// a row is never edited except to record its single consumption.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunRetryRow {
+    /// Retry id (`rt_` + 16 hex, derived from the run and the step).
+    pub retry_id: String,
+    /// The owning run.
+    pub instance_id: String,
+    /// The diagnosed step id.
+    pub step_id: String,
+    /// 1-based bounded attempt number within (run, step).
+    pub attempt: i64,
+    /// When the authorization was recorded (RFC3339 UTC).
+    pub authorized_at: String,
+    /// When the authorization was consumed ('' while unconsumed).
+    pub consumed_at: String,
+    /// The idempotency key of the dispatch that consumed it ('' otherwise).
+    pub consumed_key: String,
+}
+
+/// The outcome of checking one step dispatch against the bounded-retry
+/// fence (issue #86): a first dispatch needs no authorization, a
+/// re-dispatch of a diagnosed failed step consumes exactly one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunRetryClaim {
+    /// No diagnosed failure exists for this (run, step): no authorization
+    /// is required (the fence only bounds RE-dispatches).
+    NotRequired,
+    /// One unconsumed authorization existed and was consumed by this
+    /// dispatch (single use; the row records the claim key).
+    Consumed(String),
+    /// A diagnosed failed attempt exists but no unconsumed authorization
+    /// does: the re-dispatch is refused (`refusal.run.retry_required`).
+    Missing,
+}
+
+/// The number of bounded retries one (run, step) may ever authorize.
+pub const RUN_RETRY_MAX: i64 = 3;
+
 /// A workflow engine instance row (m0002: workflow pin, phase, node, review
 /// rounds, pause state). Issuance/advance decisions belong to the engine;
 /// this handle persists them durably.
@@ -221,6 +261,16 @@ pub struct InstanceRow {
     pub paused: bool,
     /// Stored fresh authorized resume digest (AC8).
     pub resume_digest: String,
+    /// Durable pause REQUEST recorded by the run-scoped control surface
+    /// (issue #86): new step dispatch is refused from this moment on while
+    /// in-flight work keeps running, and the pause reaches its safe
+    /// boundary (commits `paused`) at the run's next recorded step
+    /// boundary.
+    pub pause_requested: bool,
+    /// Bounded operator reason of the pause request ('' when none).
+    pub pause_reason: String,
+    /// When the pause request was recorded (RFC3339 UTC; '' when none).
+    pub pause_requested_at: String,
     /// State epoch the instance runs under.
     pub state_epoch: i64,
     /// Status (`new` | `running` | `paused` | `human_queue` | `blocked` |
@@ -1001,6 +1051,10 @@ impl State {
             run_m0009(&mut conn)?;
             user_version = M0009_APPLIES_TO;
         }
+        if user_version == M0010_APPLIES_FROM {
+            run_m0010(&mut conn)?;
+            user_version = M0010_APPLIES_TO;
+        }
         match user_version {
             v if v == SCHEMA_VERSION => {
                 for (migration_id, _, _) in MIGRATIONS {
@@ -1764,6 +1818,546 @@ impl State {
             ));
         }
         Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Run-scoped controls (issue #86): safe-boundary pause, resume and
+    // bounded retry over the durable instance rows.
+    // ---------------------------------------------------------------------
+
+    /// The step id of a step-dispatch claim (`method:"apply"`) still in
+    /// flight for one run, or `None` when nothing is in flight. An
+    /// unreadable claimed line is treated as unknown in-flight work
+    /// (conservative: the safe boundary is never claimed without proof).
+    pub fn in_flight_run_step(&self, instance_id: &str) -> Result<Option<String>, StateError> {
+        let held = self.in_flight_steps()?;
+        Ok(held
+            .into_iter()
+            .find(|(run, _)| run == instance_id || run == "*")
+            .map(|(_, step)| step))
+    }
+
+    /// Every in-flight step claim as `(instance_id, step)`; an unreadable
+    /// claimed line is reported as `("*", "")` (attribution unknown).
+    fn in_flight_steps(&self) -> Result<Vec<(String, String)>, StateError> {
+        let conn = self.lock("in_flight_steps")?;
+        in_flight_steps_locked(&conn)
+    }
+
+    /// Record ONE durable run pause (issue #86) in one transaction. The
+    /// pause REQUEST takes effect immediately — new step dispatch for the
+    /// run is refused from this moment on — while in-flight work keeps
+    /// running: with a step still in flight the row carries
+    /// `pause_requested` and the pause commits `paused` at the recorded
+    /// step boundary ([`State::complete_run_pause_boundary`]); with no
+    /// step in flight the safe boundary is already reached and the commit
+    /// is immediate. The engine-minted resume digest is stored with the
+    /// request (required and consumed by [`State::resume_run`]).
+    pub fn request_run_pause(
+        &self,
+        instance_id: &str,
+        reason: &str,
+        resume_digest: &str,
+        at: &str,
+    ) -> Result<InstanceRow, StateError> {
+        self.ensure_writable()?;
+        let conn = self.lock("request_run_pause")?;
+        let row = conn
+            .query_row(
+                format!("{} WHERE instance_id = ?1", instance_select_sql()).as_str(),
+                params![instance_id],
+                instance_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("request_run_pause: read", err))?;
+        let Some(row) = row else {
+            return Err(state_error(
+                "state.not_found",
+                format!("no instance {instance_id:?}"),
+            ));
+        };
+        if row.status == "done" || row.status == "invalidated" {
+            return Err(state_error(
+                "refusal.run.terminal",
+                format!(
+                    "run {instance_id} is {}; a terminal run cannot be paused",
+                    row.status
+                ),
+            ));
+        }
+        if row.paused || row.pause_requested {
+            return Err(state_error(
+                "refusal.run.control",
+                format!(
+                    "run {instance_id} already carries a pause (paused={}, pause_requested={}); \
+                     a duplicate request never creates a second intent",
+                    row.paused, row.pause_requested
+                ),
+            ));
+        }
+        let in_flight = in_flight_steps_locked(&conn)?
+            .iter()
+            .any(|(run, _)| run == instance_id || run == "*");
+        // The reached boundary commits `paused`; the in-flight case records
+        // the durable intent and leaves the running state untouched (no
+        // signal, no kill, no cleanup — the in-flight work keeps its
+        // worktree, its node and its dirty state).
+        let (paused, requested, status): (i64, i64, &str) = if in_flight {
+            (0, 1, row.status.as_str())
+        } else {
+            (1, 0, "paused")
+        };
+        let affected = conn
+            .execute(
+                "UPDATE instances SET paused = ?2, pause_requested = ?3, pause_reason = ?4,
+                        pause_requested_at = ?5, resume_digest = ?6, status = ?7, updated_at = ?5
+                  WHERE instance_id = ?1 AND paused = 0 AND pause_requested = 0",
+                params![
+                    instance_id,
+                    paused,
+                    requested,
+                    reason,
+                    at,
+                    resume_digest,
+                    status
+                ],
+            )
+            .map_err(|err| StateError::from_sqlite("request_run_pause: update", err))?;
+        if affected != 1 {
+            return Err(state_error(
+                "refusal.run.control",
+                format!("run {instance_id} moved while the pause request committed"),
+            ));
+        }
+        let row = conn
+            .query_row(
+                format!("{} WHERE instance_id = ?1", instance_select_sql()).as_str(),
+                params![instance_id],
+                instance_row_from,
+            )
+            .map_err(|err| StateError::from_sqlite("request_run_pause: reread", err))?;
+        Ok(row)
+    }
+
+    /// Commit the reached safe boundary of one pause request (issue #86):
+    /// `paused` becomes true and `pause_requested` false ONLY when no step
+    /// claim of the run is in flight any more. Returns whether the
+    /// boundary commit happened. Idempotent: a run without a pending
+    /// request is left untouched.
+    pub fn complete_run_pause_boundary(
+        &self,
+        instance_id: &str,
+        at: &str,
+    ) -> Result<bool, StateError> {
+        self.ensure_writable()?;
+        let conn = self.lock("complete_run_pause_boundary")?;
+        let requested: Option<i64> = conn
+            .query_row(
+                "SELECT pause_requested FROM instances WHERE instance_id = ?1",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("complete_run_pause_boundary: read", err))?;
+        if requested != Some(1) {
+            return Ok(false);
+        }
+        let in_flight = in_flight_steps_locked(&conn)?
+            .iter()
+            .any(|(run, _)| run == instance_id || run == "*");
+        if in_flight {
+            return Ok(false);
+        }
+        let affected = conn
+            .execute(
+                "UPDATE instances SET paused = 1, pause_requested = 0, status = 'paused',
+                        updated_at = ?2
+                  WHERE instance_id = ?1 AND pause_requested = 1 AND paused = 0",
+                params![instance_id, at],
+            )
+            .map_err(|err| StateError::from_sqlite("complete_run_pause_boundary: update", err))?;
+        Ok(affected == 1)
+    }
+
+    /// Complete every pause request whose in-flight work is gone (boot
+    /// reconciliation, issue #86): after a restart no step is executing,
+    /// so a recorded request with no in-flight claim has reached its safe
+    /// boundary. Returns the number of boundary commits.
+    pub fn reconcile_run_pause_boundaries(&self, at: &str) -> Result<usize, StateError> {
+        self.ensure_writable()?;
+        let requested: Vec<String> = {
+            let conn = self.lock("reconcile_run_pause_boundaries")?;
+            let mut statement = conn
+                .prepare("SELECT instance_id FROM instances WHERE pause_requested = 1")
+                .map_err(|err| {
+                    StateError::from_sqlite("reconcile_run_pause_boundaries: prepare", err)
+                })?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|err| {
+                    StateError::from_sqlite("reconcile_run_pause_boundaries: query", err)
+                })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|err| {
+                    StateError::from_sqlite("reconcile_run_pause_boundaries: row", err)
+                })?);
+            }
+            out
+        };
+        let mut committed = 0usize;
+        for instance_id in requested {
+            if self.complete_run_pause_boundary(&instance_id, at)? {
+                committed += 1;
+            }
+        }
+        Ok(committed)
+    }
+
+    /// Resume a paused run (issue #86). The caller must present the fresh
+    /// engine-minted digest stored by [`State::request_run_pause`]; the
+    /// digest binds the exact run and epoch and is consumed on success, so
+    /// a stale or foreign digest can never resume anything. Fresh
+    /// eligibility is re-derived under the guard: the run must still be
+    /// live (not terminal), its epoch current, and its issue still owned
+    /// by this run. The update is fenced on the EXACT instance id: an
+    /// unrelated run's pause (or any fleet-level hold expressed as one) is
+    /// never lifted.
+    pub fn resume_run(
+        &self,
+        instance_id: &str,
+        presented_digest: &str,
+        at: &str,
+    ) -> Result<InstanceRow, StateError> {
+        self.ensure_writable()?;
+        let conn = self.lock("resume_run")?;
+        let row = conn
+            .query_row(
+                format!("{} WHERE instance_id = ?1", instance_select_sql()).as_str(),
+                params![instance_id],
+                instance_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("resume_run: read", err))?;
+        let Some(row) = row else {
+            return Err(state_error(
+                "state.not_found",
+                format!("no instance {instance_id:?}"),
+            ));
+        };
+        if row.status == "done" || row.status == "invalidated" {
+            return Err(state_error(
+                "refusal.run.terminal",
+                format!(
+                    "run {instance_id} is {}; a terminal run cannot be resumed",
+                    row.status
+                ),
+            ));
+        }
+        if !row.paused {
+            return Err(state_error(
+                "refusal.run.control",
+                format!(
+                    "run {instance_id} is not paused; there is nothing to resume (status {})",
+                    row.status
+                ),
+            ));
+        }
+        crate::engine::authorize_resume(&row.resume_digest, presented_digest)
+            .map_err(|err| state_error("state.stale_resume", err.message))?;
+        // Fresh eligibility under the guard.
+        let epoch = current_epoch_locked(&conn)?;
+        if epoch != row.state_epoch {
+            return Err(state_error(
+                "refusal.state.epoch",
+                format!(
+                    "run {instance_id} was pinned to epoch {}; the live epoch is {epoch} (a \
+                     resume authorization dies with its epoch)",
+                    row.state_epoch
+                ),
+            ));
+        }
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT instance_id FROM queue_ownership
+                  WHERE repository = ?1 AND issue_number = ?2",
+                params![row.repository, row.issue_number],
+                |owner| owner.get(0),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("resume_run: ownership", err))?;
+        if let Some(owner) = owner
+            && owner != instance_id
+        {
+            return Err(state_error(
+                "refusal.run.superseded",
+                format!(
+                    "run {instance_id} no longer owns issue {} of {}; live ownership belongs to \
+                     {owner}",
+                    row.issue_number, row.repository
+                ),
+            ));
+        }
+        let affected = conn
+            .execute(
+                "UPDATE instances SET paused = 0, pause_requested = 0, pause_reason = '',
+                        pause_requested_at = '', resume_digest = '', status = 'running',
+                        updated_at = ?2
+                  WHERE instance_id = ?1 AND paused = 1",
+                params![instance_id, at],
+            )
+            .map_err(|err| StateError::from_sqlite("resume_run: update", err))?;
+        if affected != 1 {
+            return Err(state_error(
+                "refusal.run.control",
+                format!("run {instance_id} left its paused state while the resume committed"),
+            ));
+        }
+        let row = conn
+            .query_row(
+                format!("{} WHERE instance_id = ?1", instance_select_sql()).as_str(),
+                params![instance_id],
+                instance_row_from,
+            )
+            .map_err(|err| StateError::from_sqlite("resume_run: reread", err))?;
+        Ok(row)
+    }
+
+    /// The bound step spine of one run (`None` for a run without a
+    /// committed queue submission). The spine is read from the committed
+    /// submission's canonical bound-input line — never from a caller.
+    pub fn run_step_spine(&self, instance_id: &str) -> Result<Option<Vec<String>>, StateError> {
+        let conn = self.lock("run_step_spine")?;
+        let line: Option<String> = conn
+            .query_row(
+                "SELECT s.request_line FROM queue_submissions s
+                   JOIN queue_submission_items i ON i.submission_id = s.submission_id
+                  WHERE i.instance_id = ?1 AND i.status = 'admitted'",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("run_step_spine: query", err))?;
+        let Some(line) = line else {
+            return Ok(None);
+        };
+        let doc = Val::parse_json(&line).map_err(|message| {
+            state_error(
+                "state.corrupt",
+                format!("the committed bound-input line of {instance_id} is unreadable: {message}"),
+            )
+        })?;
+        let steps = doc
+            .get("steps")
+            .and_then(Val::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(Some(
+            steps
+                .iter()
+                .filter_map(|step| step.get("id").and_then(Val::as_str))
+                .map(str::to_string)
+                .collect(),
+        ))
+    }
+
+    /// The recorded step attempts of one run as `(step, status)` in claim
+    /// order, from the durable apply claims (request line + resolved
+    /// `hf-outcome/v1`). Diagnosis input for the bounded retry control:
+    /// never inferred, always read back.
+    pub fn run_step_attempts(
+        &self,
+        instance_id: &str,
+    ) -> Result<Vec<(String, String)>, StateError> {
+        let conn = self.lock("run_step_attempts")?;
+        let mut statement = conn
+            .prepare(
+                "SELECT request_line, outcome FROM idempotency
+                  WHERE method = 'apply' AND outcome IS NOT NULL
+                  ORDER BY claimed_at, key",
+            )
+            .map_err(|err| StateError::from_sqlite("run_step_attempts: prepare", err))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|err| StateError::from_sqlite("run_step_attempts: query", err))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (line, outcome) =
+                row.map_err(|err| StateError::from_sqlite("run_step_attempts: row", err))?;
+            let Some(outcome) = outcome else {
+                continue;
+            };
+            let Ok(request) = Val::parse_json(&line) else {
+                continue;
+            };
+            let params = request.get("params").cloned().unwrap_or_else(null);
+            if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
+                continue;
+            }
+            let step = params
+                .get("step")
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string();
+            let Ok(outcome) = Val::parse_json(&outcome) else {
+                continue;
+            };
+            let status = outcome
+                .get("status")
+                .and_then(Val::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            out.push((step, status));
+        }
+        Ok(out)
+    }
+
+    /// Every durable retry authorization of one run, oldest first.
+    pub fn run_retries(&self, instance_id: &str) -> Result<Vec<RunRetryRow>, StateError> {
+        let conn = self.lock("run_retries")?;
+        let mut statement = conn
+            .prepare(
+                "SELECT retry_id, instance_id, step_id, attempt, authorized_at,
+                        consumed_at, consumed_key
+                   FROM run_retries WHERE instance_id = ?1
+                  ORDER BY step_id, attempt",
+            )
+            .map_err(|err| StateError::from_sqlite("run_retries: prepare", err))?;
+        let rows = statement
+            .query_map(params![instance_id], |row| {
+                Ok(RunRetryRow {
+                    retry_id: row.get(0)?,
+                    instance_id: row.get(1)?,
+                    step_id: row.get(2)?,
+                    attempt: row.get(3)?,
+                    authorized_at: row.get(4)?,
+                    consumed_at: row.get(5)?,
+                    consumed_key: row.get(6)?,
+                })
+            })
+            .map_err(|err| StateError::from_sqlite("run_retries: query", err))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|err| StateError::from_sqlite("run_retries: row", err))?);
+        }
+        Ok(out)
+    }
+
+    /// Record ONE bounded retry authorization for one diagnosed step of
+    /// one run (issue #86). The attempt number is the next unused slot,
+    /// the deterministic retry id derives from (run, step, attempt), and
+    /// the bound is enforced here (row count); a still-unconsumed
+    /// authorization for the same step refuses a second one (no duplicate
+    /// effect).
+    pub fn record_run_retry(
+        &self,
+        instance_id: &str,
+        step_id: &str,
+        at: &str,
+    ) -> Result<RunRetryRow, StateError> {
+        self.ensure_writable()?;
+        let conn = self.lock("record_run_retry")?;
+        let existing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_retries WHERE instance_id = ?1 AND step_id = ?2",
+                params![instance_id, step_id],
+                |row| row.get(0),
+            )
+            .map_err(|err| StateError::from_sqlite("record_run_retry: count", err))?;
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_retries
+                  WHERE instance_id = ?1 AND step_id = ?2 AND consumed_at = ''",
+                params![instance_id, step_id],
+                |row| row.get(0),
+            )
+            .map_err(|err| StateError::from_sqlite("record_run_retry: pending", err))?;
+        if pending > 0 {
+            return Err(state_error(
+                "refusal.run.retry_pending",
+                format!(
+                    "run {instance_id} already holds an unconsumed retry authorization for step \
+                     {step_id:?}; a duplicate request never creates a second one"
+                ),
+            ));
+        }
+        if existing >= RUN_RETRY_MAX {
+            return Err(state_error(
+                "refusal.run.retry_bound",
+                format!(
+                    "step {step_id:?} of run {instance_id} already used all {RUN_RETRY_MAX} \
+                     bounded retries"
+                ),
+            ));
+        }
+        let attempt = existing + 1;
+        let retry_id = crate::run_control::retry_id(instance_id, step_id, attempt);
+        conn.execute(
+            "INSERT INTO run_retries (retry_id, instance_id, step_id, attempt, authorized_at,
+                    consumed_at, consumed_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, '', '')",
+            params![retry_id, instance_id, step_id, attempt, at],
+        )
+        .map_err(|err| StateError::from_sqlite("record_run_retry: insert", err))?;
+        Ok(RunRetryRow {
+            retry_id,
+            instance_id: instance_id.to_string(),
+            step_id: step_id.to_string(),
+            attempt,
+            authorized_at: at.to_string(),
+            consumed_at: String::new(),
+            consumed_key: String::new(),
+        })
+    }
+
+    /// Check one step dispatch against the bounded-retry fence (issue #86)
+    /// and consume the single-use authorization when one is needed:
+    /// a first dispatch of a step is never fenced; a re-dispatch of a step
+    /// whose recorded outcomes include a terminal non-success consumes one
+    /// unconsumed authorization, and refuses (`RunRetryClaim::Missing`)
+    /// when none exists.
+    pub fn claim_run_retry(
+        &self,
+        instance_id: &str,
+        step_id: &str,
+        claim_key: &str,
+        at: &str,
+    ) -> Result<RunRetryClaim, StateError> {
+        self.ensure_writable()?;
+        let attempts = self.run_step_attempts(instance_id)?;
+        let diagnosed = attempts.iter().any(|(step, status)| {
+            step == step_id && matches!(status.as_str(), "failed" | "refused" | "ambiguous")
+        });
+        if !diagnosed {
+            return Ok(RunRetryClaim::NotRequired);
+        }
+        let conn = self.lock("claim_run_retry")?;
+        let pending: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT retry_id, attempt FROM run_retries
+                  WHERE instance_id = ?1 AND step_id = ?2 AND consumed_at = ''
+                  ORDER BY attempt LIMIT 1",
+                params![instance_id, step_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("claim_run_retry: pending", err))?;
+        let Some((retry_id, attempt)) = pending else {
+            return Ok(RunRetryClaim::Missing);
+        };
+        let affected = conn
+            .execute(
+                "UPDATE run_retries SET consumed_at = ?3, consumed_key = ?4
+                  WHERE retry_id = ?1 AND attempt = ?2 AND consumed_at = ''",
+                params![retry_id, attempt, at, claim_key],
+            )
+            .map_err(|err| StateError::from_sqlite("claim_run_retry: consume", err))?;
+        if affected != 1 {
+            return Ok(RunRetryClaim::Missing);
+        }
+        Ok(RunRetryClaim::Consumed(retry_id))
     }
 
     /// Advance a running instance: record the current node and review-round
@@ -6549,18 +7143,66 @@ fn grant_row_from_doc(doc: &Val) -> Result<GrantRow, StateError> {
     })
 }
 
+/// Every in-flight step claim (`method:"apply"`, status `claimed`) as
+/// `(instance_id, step)` from its recorded request line. An unreadable
+/// claimed line is reported as `("*", "")`: its attribution is unknown, so
+/// no run may claim a safe boundary while it exists (fail closed).
+fn in_flight_steps_locked(conn: &Connection) -> Result<Vec<(String, String)>, StateError> {
+    let mut statement = conn
+        .prepare("SELECT method, request_line FROM idempotency WHERE status = 'claimed'")
+        .map_err(|err| StateError::from_sqlite("in_flight_steps: prepare", err))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|err| StateError::from_sqlite("in_flight_steps: query", err))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (method, line) =
+            row.map_err(|err| StateError::from_sqlite("in_flight_steps: row", err))?;
+        if method != "apply" {
+            continue;
+        }
+        match Val::parse_json(&line) {
+            Ok(request) => {
+                let params = request.get("params").cloned().unwrap_or_else(null);
+                let instance = params
+                    .get("instance_id")
+                    .and_then(Val::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let step = params
+                    .get("step")
+                    .and_then(Val::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                out.push((instance, step));
+            }
+            Err(_) => out.push(("*".to_string(), String::new())),
+        }
+    }
+    Ok(out)
+}
+
 /// Shared SELECT for instance rows (m0002 columns).
 fn instance_select_sql() -> String {
+    // The issue #86 pause columns are APPENDED after the historical
+    // 22-column shape: every projection that predates them (the board page
+    // keeps its own SELECT list) still decodes through
+    // [`instance_row_from`] — an absent trailing column means "no pause
+    // recorded" (see the optional reads there).
     "SELECT instance_id, repository, workflow_id, workflow_hash, policy_hash, grant_id,
             issue_number, issue_revision, phase, scope, caps, current_node,
             normal_rounds, recovery_rounds, human_queue, terminal_blockers,
-            paused, resume_digest, state_epoch, status, created_at, updated_at
+            paused, resume_digest, state_epoch, status, created_at, updated_at,
+            pause_requested, pause_reason, pause_requested_at
        FROM instances"
         .to_string()
 }
 
 /// Map one SQLite row onto [`InstanceRow`] (column order of
-/// [`instance_select_sql`]).
+/// [`instance_select_sql`]; the three trailing issue #86 pause columns are
+/// optional so the historical 22-column projections keep decoding).
 fn instance_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<InstanceRow> {
     Ok(InstanceRow {
         instance_id: row.get(0)?,
@@ -6585,7 +7227,20 @@ fn instance_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<InstanceRow> {
         status: row.get(19)?,
         created_at: row.get(20)?,
         updated_at: row.get(21)?,
+        pause_requested: optional_column::<i64>(row, 22).unwrap_or(0) == 1,
+        pause_reason: optional_column::<String>(row, 23).unwrap_or_default(),
+        pause_requested_at: optional_column::<String>(row, 24).unwrap_or_default(),
     })
+}
+
+/// Read one column of a row that may not carry it at all (a historical
+/// projection whose SELECT list predates the column): `None` when the index
+/// is out of range, the column is NULL, or it holds an unexpected type.
+fn optional_column<T: rusqlite::types::FromSql>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> Option<T> {
+    row.get::<_, Option<T>>(index).ok().flatten()
 }
 
 /// Map one SQLite row onto [`EvidenceRow`] (column order of the evidence
@@ -8191,9 +8846,21 @@ const M0009_ID: &str = "m0009_queue_submissions_v9";
 const M0009_APPLIES_FROM: i64 = 8;
 const M0009_APPLIES_TO: i64 = 9;
 
+/// Migration m0010 (issue #86: run-scoped controls). Purely additive: three
+/// run-control columns on `instances` (`pause_requested`, `pause_reason`,
+/// `pause_requested_at`; the pause REQUEST that stops admitting while
+/// in-flight work finishes) and the bounded `run_retries` table (one row =
+/// one authorized re-dispatch of one diagnosed step; the row count is the
+/// attempt bound, `consumed_at`/`consumed_key` record the single
+/// consumption). No existing table or row is touched, so stored grants,
+/// instances, lane records and queue submissions are never reinterpreted.
+const M0010_ID: &str = "m0010_run_controls_v10";
+const M0010_APPLIES_FROM: i64 = 9;
+const M0010_APPLIES_TO: i64 = 10;
+
 /// Ordered migration chain (id, applies_from, applies_to). The runner in
 /// [`State::open`] applies every pending migration before serving.
-const MIGRATIONS: [(&str, i64, i64); 9] = [
+const MIGRATIONS: [(&str, i64, i64); 10] = [
     (M0001_ID, M0001_APPLIES_FROM, M0001_APPLIES_TO),
     (M0002_ID, M0002_APPLIES_FROM, M0002_APPLIES_TO),
     (M0003_ID, M0003_APPLIES_FROM, M0003_APPLIES_TO),
@@ -8203,15 +8870,17 @@ const MIGRATIONS: [(&str, i64, i64); 9] = [
     (M0007_ID, M0007_APPLIES_FROM, M0007_APPLIES_TO),
     (M0008_ID, M0008_APPLIES_FROM, M0008_APPLIES_TO),
     (M0009_ID, M0009_APPLIES_FROM, M0009_APPLIES_TO),
+    (M0010_ID, M0010_APPLIES_FROM, M0010_APPLIES_TO),
 ];
 
-/// Ordered migration-chain identifiers (`m0001`..`m0009`), exposed for the
+/// Ordered migration-chain identifiers (`m0001`..`m0010`), exposed for the
 /// release provenance chain (issue #10): `canter --version` prints
 /// them so a release archive's provenance record can bind the exact
 /// state-schema migration chain of the binary it ships.
 pub fn migration_chain_ids() -> &'static [&'static str] {
     const IDS: [&str; MIGRATIONS.len()] = [
         M0001_ID, M0002_ID, M0003_ID, M0004_ID, M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID,
+        M0010_ID,
     ];
     &IDS
 }
@@ -8392,6 +9061,33 @@ CREATE TABLE queue_ownership (
     created_at TEXT NOT NULL,
     PRIMARY KEY (repository, issue_number)
 );
+";
+
+/// m0010 run-scoped controls (issue #86). Three additive `instances`
+/// columns carry the durable pause REQUEST (`pause_requested` stops new
+/// step dispatch immediately; `pause_reason` is the bounded operator
+/// reason; `pause_requested_at` the request time) — `paused` remains the
+/// reached-safe-boundary flag, so a restart loses neither the intent nor
+/// the boundary. `run_retries` holds one row per authorized bounded
+/// re-dispatch of one diagnosed step: the row count bounds the attempts,
+/// `UNIQUE (instance_id, step_id, attempt)` makes a duplicate authorization
+/// impossible, and `consumed_at`/`consumed_key` record the single
+/// consumption (a re-dispatch without an unconsumed authorization refuses).
+const M0010_SQL: &str = "\
+ALTER TABLE instances ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE instances ADD COLUMN pause_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE instances ADD COLUMN pause_requested_at TEXT NOT NULL DEFAULT '';
+CREATE TABLE run_retries (
+    retry_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL,
+    step_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    authorized_at TEXT NOT NULL,
+    consumed_at TEXT NOT NULL DEFAULT '',
+    consumed_key TEXT NOT NULL DEFAULT '',
+    UNIQUE (instance_id, step_id, attempt)
+);
+CREATE INDEX idx_run_retries_run ON run_retries(instance_id, step_id, attempt);
 ";
 
 /// Ordered lane replacement phases (issue #73): one replacement moves
@@ -9499,6 +10195,33 @@ fn run_m0009(conn: &mut Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+/// Run migration m0010 in one transaction (issue #86: run-scoped controls).
+fn run_m0010(conn: &mut Connection) -> Result<(), StateError> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| StateError::from_sqlite("migrate m0010: begin", err))?;
+    let checksum = sha256_hex(M0010_SQL.as_bytes());
+    tx.execute_batch(M0010_SQL)
+        .map_err(|err| StateError::from_sqlite("migrate m0010", err))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (migration_id, applies_from, applies_to, checksum, applied_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            M0010_ID,
+            M0010_APPLIES_FROM,
+            M0010_APPLIES_TO,
+            checksum,
+            time::rfc3339_now()
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("migrate m0010: bookkeeping", err))?;
+    tx.pragma_update(None, "user_version", M0010_APPLIES_TO)
+        .map_err(|err| StateError::from_sqlite("migrate m0010: user_version", err))?;
+    tx.commit()
+        .map_err(|err| StateError::from_sqlite("migrate m0010: commit", err))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10357,12 +11080,10 @@ mod tests {
         assert_eq!(grant.status, "active");
         assert_eq!(grant.state_epoch, 1);
         assert_eq!(state.current_epoch().expect("epoch"), 1);
-        assert_eq!(SCHEMA_VERSION, 9);
+        assert_eq!(SCHEMA_VERSION, 10);
         {
-            let conn = state
-                .lock("test: m0005/m0006/m0007/m0008/m0009 bookkeeping")
-                .expect("lock");
-            for migration_id in [M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID] {
+            let conn = state.lock("test: m0005..m0010 bookkeeping").expect("lock");
+            for migration_id in [M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID, M0010_ID] {
                 let recorded: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",

@@ -30,7 +30,8 @@ remain usable without it; SQLite owns state; no network control API).
   `lane.replacement.cancel`, `lane.replacement.status`,
   `lane.checkpoint.create`, `lane.checkpoint.status`, `lane.retire`,
   `lane.start`, `lane.adopt`, `lane.successor.consume`,
-  `state.epoch`, `queue.submit`, `queue.status`, `backup.create`,
+  `state.epoch`, `queue.submit`, `queue.status`, `run.pause`,
+  `run.resume`, `run.retry`, `run.status`, `backup.create`,
   `restore.begin`, `journal.tail`,
   `events.subscribe` (issue #77 adds no method: the target-profile plan
   travels as an optional `params.profile` on `lane.replacement.request` and
@@ -38,9 +39,10 @@ remain usable without it; SQLite owns state; no network control API).
   `lane.start` / `lane.adopt`)
   (issues #5/#9/#73/#74/#75 add the event stream, the lifecycle methods, the
   request-only lane replacement surface, the safe-boundary checkpoint
-  surface, and the guarded single-session retirement over the socket; the
-  closed set above is mirrored by the Rust schema validator and the fixture
-  oracle).
+  surface, and the guarded single-session retirement over the socket;
+  issues #85/#86 add the queue submission surface and the run-scoped
+  controls; the closed set above is mirrored by the Rust schema validator
+  and the fixture oracle).
 - `apply` **requires** `params.idempotency_key` (`ik_` format): an apply
   without a key is refused at parse time (`rpc/request.malformed.json`).
   Replaying the same request id + idempotency key returns the recorded
@@ -270,6 +272,82 @@ outcome after the effect transaction commits.
   all-or-nothing transaction never committed. The interrupted claim is
   resolved `ambiguous` like every other interrupted mutation, so a retry
   needs a fresh key and no effect is ever repeated.
+
+## Run-scoped control methods (issue #86)
+
+Safe-boundary pause, resume and bounded retry over exactly ONE run — the
+`run-` instance row the queue executor commits for every admitted issue
+(spec-state.md "Run control additions"). All four methods address one
+exact run identity, journal through the same claim machinery as every
+daemon mutation (`params.idempotency_key` required on the mutating paths;
+a same-key retry replays the recorded response) and render a module-local
+document (`hf-run-control/v1` / `hf-run-retry/v1`, deliberately outside
+the closed `hf-*` family set like the #84 preview and the #85 submission).
+
+**Scope matrix (run vs fleet vs lane), normative:**
+
+| level | identity | methods | effect of a control |
+| --- | --- | --- | --- |
+| run | one `run-` + 16 hex instance id | `run.pause` / `run.resume` / `run.retry` / `run.status` | exactly this run: stop admitting new steps, lift THIS run's pause, authorize one bounded re-dispatch of one diagnosed step |
+| fleet | the whole run population | NONE — there is no `fleet.*` method in the closed set | a fleet-level hold is an operator policy expressed as the set of paused runs; every resume is fenced on the exact instance id, so no run control ever lifts another run's pause or anything fleet-wide |
+| lane | one handoff lane generation (`rp_` records) | `lane.*` only | run controls never touch lane records; a non-run identity refuses `refusal.run.target` |
+
+No method on this surface kills a process, cleans up work, mutates Git,
+clears a repository/fleet-level hold or bypasses a gate.
+
+- `run.pause` requires `params.instance_id` (`run-` + 16 hex),
+  `params.reason` (1-300 printable characters) and `params.idempotency_key`.
+  It records ONE durable pause REQUEST: new step dispatch for the run is
+  refused from that moment on (`refusal.run.paused` before any effect)
+  while in-flight work keeps running untouched. When a step dispatch of the
+  run is still in flight the row carries `pause_requested` (the rendered
+  control state is `pause_requested`) and the pause commits `paused` at the
+  run's next recorded step boundary (the apply path completes the boundary;
+  a restart completes any request whose in-flight work is gone); when no
+  step is in flight the safe boundary is already reached and `paused`
+  commits immediately. The response carries the run control document with
+  the engine-minted resume digest (`mint_resume_digest` over the exact run,
+  the pause-time epoch and the claim key) and the live boundary
+  (`boundary.reached`, `boundary.in_flight_step`). A second pause for the
+  same run is refused `refusal.run.control` (a duplicate never creates a
+  second intent); a terminal run refuses `refusal.run.terminal`; an unknown
+  run is `state.not_found`.
+- `run.resume` requires `params.instance_id` and `params.digest` (the
+  64-hex digest `run.pause` returned). It refuses before any effect when
+  the run is unknown (`state.not_found`), terminal
+  (`refusal.run.terminal`), not paused (`refusal.run.control`), when the
+  digest does not equal the stored one (`state.stale_resume` — the digest
+  binds the exact run/epoch, so a stale or foreign digest can never resume
+  anything), when the run's epoch moved (`refusal.state.epoch`) or when the
+  run no longer owns its issue (`refusal.run.superseded`). The update is
+  fenced on the exact instance id (`WHERE instance_id = ? AND paused = 1`)
+  and consumes the digest on success: an unrelated run's pause — or any
+  fleet-level hold expressed as paused runs — is NEVER cleared.
+- `run.retry` requires `params.instance_id` and `params.step` (a plan step
+  id). It refuses: a terminal run (`refusal.run.terminal`), a paused or
+  pause-requested run (`refusal.run.paused` — resume first), a run without
+  a committed submission spine (`refusal.run.scope`), a step outside the
+  bound spine (`refusal.run.step_unknown`), a step that is not the run's
+  current unachieved frontier step (`refusal.run.step_order`), a step that
+  already succeeded or whose last recorded attempt succeeded
+  (`refusal.run.step_done`), a step with no recorded terminal failed
+  attempt (`refusal.run.step_undiagnosed` — a retry is for a DIAGNOSED
+  failure), a moved epoch (`refusal.state.epoch`), an inactive or absent
+  grant (`refusal.grant.inactive`), an unconsumed authorization that
+  already exists (`refusal.run.retry_pending`) and an exhausted attempt
+  bound (`refusal.run.retry_bound`, three bounded retries per step). On
+  success it records ONE single-use authorization (`run_retries`); the next
+  dispatch of that exact step consumes it (a re-dispatch of a diagnosed
+  failed step without an unconsumed authorization refuses
+  `refusal.run.retry_required` before any effect). Nothing is spawned by
+  the retry itself.
+- `run.status` requires `params.instance_id` and renders the control state
+  read-only: `active` / `pause_requested` / `paused`, the durable request
+  fields, the live boundary and the scope block. No claim and no journal
+  write.
+- Restart reconciliation reads each interrupted `run.*` claim's commit
+  marker (the run's control rows) and logs whether the control committed
+  (`reconcile.run-control`); no control is ever repeated.
 
 ## Responses: `hf-rpc-response/v1`
 

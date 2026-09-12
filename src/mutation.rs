@@ -72,6 +72,12 @@ pub mod code {
     pub const POLICY_CHANGED: &str = "refusal.policy.changed";
     /// The instance is not in a runnable state for the effect.
     pub const INSTANCE_STATE: &str = "refusal.instance.state";
+    /// The run carries a pause request (issue #86): new step dispatch is
+    /// refused until the pause reaches its boundary and is resumed.
+    pub const RUN_PAUSED: &str = "refusal.run.paused";
+    /// A re-dispatch of a diagnosed failed step needs (and consumes) one
+    /// recorded bounded retry authorization (issue #86).
+    pub const RETRY_REQUIRED: &str = "refusal.run.retry_required";
     /// The step's required capability is not granted.
     pub const CAP_MISSING: &str = "refusal.capability.missing";
     /// The step's required phase is not granted.
@@ -330,6 +336,9 @@ pub struct InstanceSnapshot {
     pub current_node: String,
     /// Pause state.
     pub paused: bool,
+    /// Durable pause REQUEST (issue #86): new step dispatch is refused
+    /// from the request on, while in-flight work keeps running.
+    pub pause_requested: bool,
     /// Instance status.
     pub status: String,
     /// Epoch the instance runs under.
@@ -608,6 +617,19 @@ pub fn revalidate_effect(
             code::INSTANCE_STATE,
             format!(
                 "instance {} is paused; a fresh authorized resume digest is required",
+                instance.instance_id
+            ),
+        ));
+    }
+    if instance.pause_requested {
+        // Issue #86: the pause request is durable BEFORE the run reaches
+        // its safe boundary, so stop-admitting takes effect before any
+        // further step is dispatched. In-flight work is untouched.
+        return Err(MutationError::new(
+            code::RUN_PAUSED,
+            format!(
+                "instance {} carries a pause request; a new step is never dispatched until the \
+                 pause reaches its boundary and is explicitly resumed",
                 instance.instance_id
             ),
         ));
@@ -2287,6 +2309,7 @@ mod tests {
             ],
             current_node: "review_evidence".to_string(),
             paused: false,
+            pause_requested: false,
             status: "running".to_string(),
             state_epoch: 1,
         }

@@ -75,8 +75,8 @@ facts the binary was built against:
 ```console
 canter 0.1.0
 canter: typed, plan-first companion CLI for operating Herdr coding-agent fleets (read-only core; no daemon, no live fleet mutations)
-state schema version: 9
-migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4, m0005_lane_replacements_v5, m0006_lane_checkpoints_v6, m0007_lane_successors_v7, m0008_lane_replacement_profiles_v8, m0009_queue_submissions_v9
+state schema version: 10
+migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4, m0005_lane_replacements_v5, m0006_lane_checkpoints_v6, m0007_lane_successors_v7, m0008_lane_replacement_profiles_v8, m0009_queue_submissions_v9, m0010_run_controls_v10
 document schema families: hf-config/v1, hf-policy/v1, hf-output/v1, hf-error/v1, ...
 ```
 
@@ -242,7 +242,7 @@ $ canter daemon status --json   # from another terminal: exit 0
 {"command":"daemon status","data":{"daemon":{"pid":<pid>,
  "started_at":"<ts>","version":"0.1.0"},
  "freshness":"fresh","state":{"active_grants":0,"epoch":1,"event_seq":0,
- "journal_seq":0,"pending_claims":0,"poisoned":false,"schema_version":9}},
+ "journal_seq":0,"pending_claims":0,"poisoned":false,"schema_version":10}},
  "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
 ```
 
@@ -365,11 +365,11 @@ prints and the daemon speaks conforms to the versioned corpus in
 [docs/contracts/README.md](docs/contracts/README.md) — schema registry,
 spec-cli/config/plans/capabilities, spec-daemon/state/workflow, capability-map,
 compatibility, and benchmarks. `canter --version` prints the exact schema
-facts a build binds (`state schema version: 9`; migration chain m0001–m0009;
+facts a build binds (`state schema version: 10`; migration chain m0001–m0010;
 18 document schema families from `hf-config/v1` to `hf-board/v1`).
 
 **Command surface** — mirrors `canter --help` on the release binary
-exactly (one line per shipped command; 18 subcommands):
+exactly (one line per shipped command; 22 subcommands):
 
 | Command | Behavior (from `--help`) |
 | --- | --- |
@@ -387,6 +387,10 @@ exactly (one line per shipped command; 18 subcommands):
 | `lane status (--replacement RP_ID | --lane ID --generation N) [--socket PATH] [--config PATH] [--json]` | Read one replacement record read-only (phase, binding, blocker, next action). |
 | `queue submit --request FILE --confirm-digest HEX64 --caps G/R/H [--epoch N] [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]... [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]` | Commit ONE approved selected-issue run after an exact preview-digest authorization: durable run membership with per-issue admitted/waiting/refused outcomes and unique work ownership. |
 | `queue status --submission QS_ID [--socket PATH] [--config PATH] [--json]` | Read one committed submission document back read-only. |
+| `run pause --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]` | Record ONE durable pause request for exactly one run: new step dispatch stops immediately while in-flight work keeps running, and the pause reaches its safe boundary at the next recorded step. | 
+| `run resume --run RUN_ID --digest HEX64 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]` | Resume exactly the named run with its engine-minted digest (fresh eligibility re-derived; no other run's pause is ever cleared). |
+| `run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]` | Authorize ONE bounded re-dispatch of ONE diagnosed step of the run (invalid/revoked/stale/succeeded/exhausted retries refuse). |
+| `run status --run RUN_ID [--socket PATH] [--config PATH] [--json]` | Read one run's control state back read-only (active / pause_requested / paused + live boundary). |
 | `service doctor [--config PATH] [--json]` | Check the daemon environment read-only (platform, config, socket state, unit placement). |
 | `service install-plan [--config PATH] [--json]` | Render the per-user launchd/systemd unit text + install steps (never installs). |
 | `service status-plan [--config PATH] [--json]` | Render the status/verification steps for the unit (never queries the service manager). |

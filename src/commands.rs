@@ -62,6 +62,10 @@ USAGE:
     canter lane status (--replacement RP_ID | --lane ID --generation N) [--socket PATH] [--config PATH] [--json]
     canter queue submit --request FILE --confirm-digest HEX64 [--epoch N] [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]... [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter queue status --submission QS_ID [--socket PATH] [--config PATH] [--json]
+    canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter run resume --run RUN_ID --digest HEX64 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter run status --run RUN_ID [--socket PATH] [--config PATH] [--json]
     canter service doctor [--config PATH] [--json]
     canter service install-plan [--config PATH] [--json]
     canter service status-plan [--config PATH] [--json]
@@ -85,6 +89,9 @@ COMMANDS:
                      (preview/status are read-only; request records intent).
     queue            Submit one approved selected-issue run, or read one
                      committed submission back (status is read-only).
+    run              Pause, resume, retry, or inspect exactly ONE run
+                     (pause/resume/retry are typed controls; status is
+                     read-only; the surface is run-scoped only).
     service          Render per-user launchd/systemd plans; doctor checks.
 
 EXIT CODES (with or without --json):
@@ -115,6 +122,74 @@ pub struct Invocation {
     pub lane_action: Option<LaneAction>,
     /// Queue executor subcommand (submit/status; issue #85).
     pub queue_action: Option<QueueAction>,
+    /// Run-scoped control subcommand (pause/resume/retry/status; issue #86).
+    pub run_action: Option<RunAction>,
+}
+
+/// Run-scoped control subcommands (issue #86): pause, resume, retry or
+/// inspect exactly ONE run. Pause/resume/retry are typed controls (each
+/// journals its intent through the daemon claim machinery); status is
+/// read-only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunAction {
+    /// Record ONE durable pause request: `run pause`.
+    Pause(RunPauseArgs),
+    /// Resume exactly one paused run with its engine-minted digest:
+    /// `run resume`.
+    Resume(RunResumeArgs),
+    /// Authorize ONE bounded re-dispatch of ONE diagnosed step:
+    /// `run retry`.
+    Retry(RunRetryArgs),
+    /// Read one run's control state back (read-only): `run status`.
+    Status(RunStatusArgs),
+}
+
+/// `run pause`: the exact target plus the bounded operator reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunPauseArgs {
+    /// Explicit run id (`run-` + 16 hex).
+    pub run: String,
+    /// Operator reason (1-300 printable characters).
+    pub reason: String,
+    /// `--idempotency-key`: replay-safe automation key.
+    pub idempotency_key: Option<String>,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
+}
+
+/// `run resume`: the exact target plus the engine-minted resume digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunResumeArgs {
+    /// Explicit run id (`run-` + 16 hex).
+    pub run: String,
+    /// The 64-hex digest the pause returned.
+    pub digest: String,
+    /// `--idempotency-key`: replay-safe automation key.
+    pub idempotency_key: Option<String>,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
+}
+
+/// `run retry`: the exact target plus the exact diagnosed step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunRetryArgs {
+    /// Explicit run id (`run-` + 16 hex).
+    pub run: String,
+    /// The exact plan step id being retried.
+    pub step: String,
+    /// `--idempotency-key`: replay-safe automation key.
+    pub idempotency_key: Option<String>,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
+}
+
+/// `run status`: one exact run read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunStatusArgs {
+    /// Explicit run id (`run-` + 16 hex).
+    pub run: String,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
 }
 
 /// Queue executor subcommands (issue #85): submit one approved selected-issue
@@ -409,6 +484,7 @@ pub fn parse_invocation(args: &[String]) -> Result<Invocation, ParseError> {
         "service" => parse_service(&rest),
         "lane" => parse_lane(&rest),
         "queue" => parse_queue(&rest),
+        "run" => parse_run(&rest),
         other => Err(ParseError::Usage(format!("unknown command {other:?}"))),
     }
 }
@@ -448,6 +524,7 @@ fn parse_flag_command(name: &str, args: &[&String]) -> Result<Invocation, ParseE
         service_action: None,
         lane_action: None,
         queue_action: None,
+        run_action: None,
     })
 }
 
@@ -498,6 +575,7 @@ fn parse_board(args: &[&String]) -> Result<Invocation, ParseError> {
         // The board surface is not a queue submission (issue #85): the field
         // exists on every initializer so the merged struct has one shape.
         queue_action: None,
+        run_action: None,
     })
 }
 
@@ -513,6 +591,7 @@ fn help_request(name: &str) -> String {
         "daemon" => DAEMON_USAGE.trim_end().to_string(),
         "lane" => LANE_USAGE.trim_end().to_string(),
         "queue" => QUEUE_USAGE.trim_end().to_string(),
+        "run" => RUN_USAGE.trim_end().to_string(),
         "service" => SERVICE_USAGE.trim_end().to_string(),
         _ => USAGE.to_string(),
     }
@@ -663,6 +742,7 @@ fn parse_config(args: &[&String]) -> Result<Invocation, ParseError> {
         service_action: None,
         lane_action: None,
         queue_action: None,
+        run_action: None,
     })
 }
 
@@ -755,6 +835,7 @@ fn parse_daemon(args: &[&String]) -> Result<Invocation, ParseError> {
         service_action: None,
         lane_action: None,
         queue_action: None,
+        run_action: None,
     })
 }
 
@@ -813,6 +894,7 @@ fn parse_service(args: &[&String]) -> Result<Invocation, ParseError> {
         service_action: Some(action),
         lane_action: None,
         queue_action: None,
+        run_action: None,
     })
 }
 
@@ -996,6 +1078,7 @@ fn parse_lane(args: &[&String]) -> Result<Invocation, ParseError> {
             service_action: None,
             lane_action: Some(LaneAction::Status(status)),
             queue_action: None,
+            run_action: None,
         });
     }
 
@@ -1066,6 +1149,191 @@ fn parse_lane(args: &[&String]) -> Result<Invocation, ParseError> {
         service_action: None,
         lane_action: Some(lane_action),
         queue_action: None,
+        run_action: None,
+    })
+}
+
+/// Parse `run <pause|resume|retry|status>` (issue #86).
+fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
+    let action = args
+        .first()
+        .ok_or_else(|| ParseError::Help(help_request("run")))?;
+    let command = match action.as_str() {
+        "pause" => "run pause",
+        "resume" => "run resume",
+        "retry" => "run retry",
+        "status" => "run status",
+        "-h" | "--help" => return Err(ParseError::Help(help_request("run"))),
+        other => {
+            return Err(ParseError::Usage(format!(
+                "run: unknown subcommand {other:?}; run `canter run --help`"
+            )));
+        }
+    };
+    let mut json = false;
+    let mut config_path: Option<PathBuf> = None;
+    let mut socket: Option<String> = None;
+    let mut run: Option<String> = None;
+    let mut reason: Option<String> = None;
+    let mut digest: Option<String> = None;
+    let mut step: Option<String> = None;
+    let mut idempotency_key: Option<String> = None;
+    let rest = &args[1..];
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--json" => json = true,
+            "--config" => {
+                let value = flag_value(rest, &mut index, command, "--config")?;
+                config_path = Some(PathBuf::from(value));
+            }
+            "--socket" => {
+                socket = Some(flag_value(rest, &mut index, command, "--socket")?);
+            }
+            "--run" => {
+                let value = flag_value(rest, &mut index, command, "--run")?;
+                if !crate::formats::is_run_id(&value) {
+                    return Err(ParseError::Usage(format!(
+                        "{command}: --run must be `run-` + 16 lowercase hex, got {value:?}"
+                    )));
+                }
+                run = Some(value);
+            }
+            "--reason" => {
+                let value = flag_value(rest, &mut index, command, "--reason")?;
+                if value.is_empty()
+                    || value.len() > crate::run_control::REASON_MAX
+                    || value.chars().any(char::is_control)
+                {
+                    return Err(ParseError::Usage(format!(
+                        "{command}: --reason must be 1-{} printable characters, got {value:?}",
+                        crate::run_control::REASON_MAX
+                    )));
+                }
+                reason = Some(value);
+            }
+            "--digest" => {
+                let value = flag_value(rest, &mut index, command, "--digest")?;
+                if !crate::formats::is_hex64(&value) {
+                    return Err(ParseError::Usage(format!(
+                        "{command}: --digest must be the 64-hex engine-minted resume digest, got \
+                         {value:?}"
+                    )));
+                }
+                digest = Some(value);
+            }
+            "--step" => {
+                let value = flag_value(rest, &mut index, command, "--step")?;
+                if !crate::formats::is_slug(&value) {
+                    return Err(ParseError::Usage(format!(
+                        "{command}: --step must be a plan step id (slug), got {value:?}"
+                    )));
+                }
+                step = Some(value);
+            }
+            "--idempotency-key" => {
+                let value = flag_value(rest, &mut index, command, "--idempotency-key")?;
+                if !crate::formats::is_idempotency_key(&value) {
+                    return Err(ParseError::Usage(format!(
+                        "{command}: --idempotency-key must match `ik_` + 8-64 of [a-z0-9-], got \
+                         {value:?}"
+                    )));
+                }
+                idempotency_key = Some(value);
+            }
+            "-h" | "--help" => return Err(ParseError::Help(help_request("run"))),
+            flag => {
+                return Err(ParseError::Usage(format!(
+                    "run: unknown flag {flag:?}; run `canter run --help`"
+                )));
+            }
+        }
+        index += 1;
+    }
+    let Some(run) = run else {
+        return Err(ParseError::Usage(format!(
+            "{command}: --run RUN_ID is required"
+        )));
+    };
+    let action = match action.as_str() {
+        "pause" => {
+            if digest.is_some() || step.is_some() {
+                return Err(ParseError::Usage(
+                    "run pause takes --run and --reason only".to_string(),
+                ));
+            }
+            let Some(reason) = reason else {
+                return Err(ParseError::Usage(
+                    "run pause: --reason TEXT is required (the journaled pause reason)".to_string(),
+                ));
+            };
+            RunAction::Pause(RunPauseArgs {
+                run,
+                reason,
+                idempotency_key,
+                socket,
+            })
+        }
+        "resume" => {
+            if reason.is_some() || step.is_some() {
+                return Err(ParseError::Usage(
+                    "run resume takes --run and --digest only".to_string(),
+                ));
+            }
+            let Some(digest) = digest else {
+                return Err(ParseError::Usage(
+                    "run resume: --digest HEX64 is required (the digest the pause returned)"
+                        .to_string(),
+                ));
+            };
+            RunAction::Resume(RunResumeArgs {
+                run,
+                digest,
+                idempotency_key,
+                socket,
+            })
+        }
+        "retry" => {
+            if reason.is_some() || digest.is_some() {
+                return Err(ParseError::Usage(
+                    "run retry takes --run and --step only".to_string(),
+                ));
+            }
+            let Some(step) = step else {
+                return Err(ParseError::Usage(
+                    "run retry: --step STEP is required (the one diagnosed step)".to_string(),
+                ));
+            };
+            RunAction::Retry(RunRetryArgs {
+                run,
+                step,
+                idempotency_key,
+                socket,
+            })
+        }
+        _ => {
+            if reason.is_some() || digest.is_some() || step.is_some() {
+                return Err(ParseError::Usage("run status takes --run only".to_string()));
+            }
+            if idempotency_key.is_some() {
+                return Err(ParseError::Usage(
+                    "run status is read-only and takes no --idempotency-key".to_string(),
+                ));
+            }
+            RunAction::Status(RunStatusArgs { run, socket })
+        }
+    };
+    Ok(Invocation {
+        command: command.to_string(),
+        json,
+        config_path,
+        plan: None,
+        config_action: None,
+        daemon_action: None,
+        service_action: None,
+        lane_action: None,
+        queue_action: None,
+        run_action: Some(action),
     })
 }
 
@@ -1346,6 +1614,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
         service_action: None,
         lane_action: None,
         queue_action: Some(queue_action),
+        run_action: None,
     })
 }
 
@@ -1440,6 +1709,7 @@ fn parse_plan(args: &[&String]) -> Result<Invocation, ParseError> {
         config_action: None,
         lane_action: None,
         queue_action: None,
+        run_action: None,
     })
 }
 
@@ -1527,6 +1797,9 @@ pub fn render_envelope(command: &str, result: &CmdResult) -> String {
 
 /// Execute one parsed invocation.
 pub fn execute(invocation: &Invocation) -> CmdResult {
+    if let Some(action) = invocation.run_action.clone() {
+        return execute_run(action, invocation);
+    }
     if let Some(action) = invocation.queue_action.clone() {
         return execute_queue(action, invocation);
     }
@@ -2364,16 +2637,17 @@ fn lane_error(code: &str, message: String, retryable: bool) -> CmdResult {
     result
 }
 
-/// The closed read-only method allowlist of the lane/queue surface: lane
-/// preview/status and queue status may issue ONLY these methods (plus the
+/// The closed read-only method allowlist of the lane/queue/run surface: lane
+/// preview/status, queue status and run status may issue ONLY these methods (plus the
 /// live-epoch read `queue submit` needs to present the state epoch). Every
 /// read-only call goes through [`read_only_call`], which fails closed
 /// (typed) on anything else — the guard that keeps the read-only commands
 /// free of mutations even if a call site is ever edited.
-const READ_ONLY_METHODS: [&str; 4] = [
+const READ_ONLY_METHODS: [&str; 5] = [
     "lane.replacement.status",
     "lane.checkpoint.status",
     "queue.status",
+    "run.status",
     "state.epoch",
 ];
 
@@ -3043,6 +3317,118 @@ fn execute_queue_status(args: &QueueStatusArgs, invocation: &Invocation) -> CmdR
     }
 }
 
+/// Execute one `run <pause|resume|retry|status>` invocation (issue #86).
+fn execute_run(action: RunAction, invocation: &Invocation) -> CmdResult {
+    match action {
+        RunAction::Pause(args) => execute_run_pause(&args, invocation),
+        RunAction::Resume(args) => execute_run_resume(&args, invocation),
+        RunAction::Retry(args) => execute_run_retry(&args, invocation),
+        RunAction::Status(args) => execute_run_status(&args, invocation),
+    }
+}
+
+/// A fresh per-invocation idempotency key for one run control: a re-run is a
+/// fresh claim, and the daemon's record-level refusals keep one effect per
+/// control (a duplicate pause is refused, a retry is single-use).
+fn fresh_run_key() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    format!("ik_run-{secs}-{}", client::fresh_id())
+}
+
+/// Resolve the daemon paths for one run control (config + socket + a live
+/// daemon: every run control is a daemon-owned operation).
+#[allow(clippy::result_large_err)]
+fn run_control_paths(
+    socket: Option<&str>,
+    invocation: &Invocation,
+) -> Result<DaemonPaths, CmdResult> {
+    let config = load_optional_config(invocation)?;
+    let socket = effective_socket(socket, config.as_ref());
+    let paths = derive_paths(socket)?;
+    if let Err(result) = require_live_daemon(&paths) {
+        return Err(*result);
+    }
+    Ok(paths)
+}
+
+/// `run pause`: record ONE durable pause request through the daemon.
+fn execute_run_pause(args: &RunPauseArgs, invocation: &Invocation) -> CmdResult {
+    let paths = match run_control_paths(args.socket.as_deref(), invocation) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    let key = args.idempotency_key.clone().unwrap_or_else(fresh_run_key);
+    let params = crate::run_control::pause_params(&key, &args.run, &args.reason);
+    match client::call(&paths.socket_path, "run.pause", Some(&params)) {
+        Ok(result) => {
+            let human = crate::run_control::render_human(&result);
+            ok_result(result, human)
+        }
+        Err(RpcError { code, message }) => {
+            lane_error(&code, format!("run pause: {message}"), false)
+        }
+    }
+}
+
+/// `run resume`: lift exactly one run's pause with its stored digest.
+fn execute_run_resume(args: &RunResumeArgs, invocation: &Invocation) -> CmdResult {
+    let paths = match run_control_paths(args.socket.as_deref(), invocation) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    let key = args.idempotency_key.clone().unwrap_or_else(fresh_run_key);
+    let params = crate::run_control::resume_params(&key, &args.run, &args.digest);
+    match client::call(&paths.socket_path, "run.resume", Some(&params)) {
+        Ok(result) => {
+            let human = crate::run_control::render_human(&result);
+            ok_result(result, human)
+        }
+        Err(RpcError { code, message }) => {
+            lane_error(&code, format!("run resume: {message}"), false)
+        }
+    }
+}
+
+/// `run retry`: authorize ONE bounded re-dispatch of ONE diagnosed step.
+fn execute_run_retry(args: &RunRetryArgs, invocation: &Invocation) -> CmdResult {
+    let paths = match run_control_paths(args.socket.as_deref(), invocation) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    let key = args.idempotency_key.clone().unwrap_or_else(fresh_run_key);
+    let params = crate::run_control::retry_params(&key, &args.run, &args.step);
+    match client::call(&paths.socket_path, "run.retry", Some(&params)) {
+        Ok(result) => {
+            let human = crate::run_control::render_human(&result);
+            ok_result(result, human)
+        }
+        Err(RpcError { code, message }) => {
+            lane_error(&code, format!("run retry: {message}"), false)
+        }
+    }
+}
+
+/// `run status`: read one run's control state back read-only.
+fn execute_run_status(args: &RunStatusArgs, invocation: &Invocation) -> CmdResult {
+    let paths = match run_control_paths(args.socket.as_deref(), invocation) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    let params = crate::run_control::status_params(&args.run);
+    match read_only_call(&paths.socket_path, "run.status", Some(&params)) {
+        Ok(result) => {
+            let human = crate::run_control::render_human(&result);
+            ok_result(result, human)
+        }
+        Err(RpcError { code, message }) => {
+            lane_error(&code, format!("run status: {message}"), false)
+        }
+    }
+}
+
 /// The human rendering of one preview document (a rendering of the same
 /// data, never a second contradicting contract).
 fn render_lane_preview_human(document: &Val) -> String {
@@ -3462,6 +3848,58 @@ EXIT CODES: 0 ok · 1 daemon/transport error · 2 usage · 4 refusal
 (refusal.plan.stale, refusal.profile.revision, refusal.state.epoch,
 refusal.grant.*, preview.*, submission.*, daemon refusals,
 state.not_found) · 5 config error.
+";
+
+const RUN_USAGE: &str = "\
+canter run <pause|resume|retry|status> — run-scoped controls for ONE run
+
+USAGE:
+    canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] \
+[--socket PATH] [--config PATH] [--json]
+    canter run resume --run RUN_ID --digest HEX64 [--idempotency-key IK] \
+[--socket PATH] [--config PATH] [--json]
+    canter run retry --run RUN_ID --step STEP [--idempotency-key IK] \
+[--socket PATH] [--config PATH] [--json]
+    canter run status --run RUN_ID [--socket PATH] [--config PATH] [--json]
+
+The scope is the RUN only: --run names exactly one durable run record
+(`run-` + 16 hex) and every control is fenced on that exact identity.
+There is deliberately no fleet-level control on this surface: a resume
+lifts only the named run's pause, never another run's, and never any
+fleet-wide hold; lane handoff records are untouched. Nothing here kills a
+process, cleans up work, mutates repositories or bypasses a gate.
+
+pause records ONE durable pause request (daemon `run.pause`): new step
+dispatch for the run is refused from that moment on, while work already in
+flight keeps running — nothing is signalled or killed — and the pause
+commits its reached `paused` state at the run's next recorded step
+boundary. The response carries the engine-minted resume digest; hold it
+for `run resume`. A second pause of the same run is refused (no duplicate
+intent), and a request that replays the same --idempotency-key returns the
+recorded response.
+
+resume lifts the pause of exactly that run (daemon `run.resume`). It
+requires the stored digest (the operator authorization) and re-derives
+fresh eligibility under the daemon guard: the run must still be live, at
+the current state epoch, and still own its issue — a stale or foreign
+digest refuses, and the digest is consumed on success (single use).
+
+retry authorizes exactly ONE bounded re-dispatch of ONE diagnosed step
+(daemon `run.retry`): the step must be a step of the run's committed
+spine, its current unachieved frontier step, and must carry a recorded
+terminal non-success attempt. Invalid (unknown/undiagnosed/out-of-order),
+revoked (inactive grant), stale (moved epoch), already-succeeded and
+exhausted (bounded attempts used) retries refuse; the authorization is
+consumed by the next dispatch of that exact step. Nothing is spawned by
+this command.
+
+status reads the control state back read-only (daemon `run.status`):
+active / pause_requested (request durable, in-flight work still running) /
+paused (the safe boundary has been reached).
+
+EXIT CODES: 0 ok · 1 daemon/transport error · 2 usage · 4 refusal
+(refusal.run.*, refusal.state.epoch, refusal.grant.inactive,
+state.not_found, state.stale_resume, daemon refusals) · 5 config error.
 ";
 
 /// Resolve the daemon socket override: the CLI flag wins over
@@ -4223,6 +4661,9 @@ mod tests {
             "lane.adopt",
             "lane.successor.consume",
             "apply",
+            "run.pause",
+            "run.resume",
+            "run.retry",
         ] {
             let error = read_only_call(&path, method, None)
                 .expect_err("a mutating method must never pass the read-only guard");
