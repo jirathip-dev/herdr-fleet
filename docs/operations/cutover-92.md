@@ -310,14 +310,24 @@ $ python3 scripts/test-cutover-92.py                                     # mutat
   `CUTOVER92_REHEARSAL_KEEP=1` keeps the sandbox directory for inspection
   but still stops every fixture process, so no mode leaves a process behind.
 
+  **Nothing this run did not create is ever deleted or killed (issue
+  #92-R2):** the run writes an ownership marker in the sandbox it creates,
+  and every removal — its own teardown and the reaper — requires that marker,
+  so a refused or pre-existing operator path (including an existing
+  `cutover-92-rehearsal.*` directory) is never reused, never emptied and
+  never deleted; refusal clears the sandbox variable, and the teardown
+  refuses rather than deletes when ownership cannot be proven. Only
+  processes this run started (the fixture instances it spawned and its
+  reaper) are ever signalled; a path-naming process it did not start — the
+  operator's own shell, for example — is reported, never killed.
+
   **Zero fixture processes on every exit path (issue #92-R1):** teardown is
-  verified, not assumed — every process naming this run's sandbox root is
-  stopped (TERM, bounded wait, KILL, bounded wait, re-scan), a sandbox
-  *reaper* started before any fixture survives the rehearsal's own kills and
-  finishes the job even when the rehearsal is killed with SIGKILL (where no
-  trap can run), and the fixture itself self-destructs as soon as the
-  rehearsal is gone. INT/TERM/HUP are trapped and re-raised through the exit
-  trap. The final stdout line reports it:
+  verified, not assumed — the recorded fixture pids are stopped (TERM,
+  bounded wait, KILL, bounded wait, re-scan), a sandbox *reaper* started
+  before any fixture survives the rehearsal's own kills and finishes the job
+  even when the rehearsal is killed with SIGKILL (where no trap can run), and
+  the fixture itself self-destructs as soon as the rehearsal is gone.
+  INT/TERM/HUP are trapped and re-raised through the exit trap. The final stdout line reports it:
   `REHEARSAL result=… steps=… verifications=… failures=… sandbox=…
   live_paths_touched=0 fixtures_left=0 sandbox_removed=yes mode=full
   dry_run_exit=…`; a non-zero exit means a verification failed or something

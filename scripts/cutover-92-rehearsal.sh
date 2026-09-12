@@ -62,7 +62,10 @@ TMP_BASE="${TMPDIR:-/tmp}"
 TMP_BASE="${TMP_BASE%/}"
 
 SANDBOX=""
+SANDBOX_OWNED=0
+OWNERSHIP_MARKER=".cutover-92-rehearsal-owned"
 FIXTURE_PID=""
+FIXTURE_PIDS=""
 STEPS=0
 VERIFICATIONS=0
 FAILURES=0
@@ -135,11 +138,10 @@ fixture_pid_is_ours() {
     esac
 }
 
-# Every process whose command line names THIS run's sandbox root. The root is
-# a fresh mktemp directory, so anything naming it was started by this
-# rehearsal; the scan excludes itself and its parent so the checker never
-# matches the process reading the table.
-fixture_pids_now() {
+# Read-only, informational: processes whose command line names this run's
+# sandbox root. This is a report, never a kill list — a process this run did
+# not start (for example the operator's own shell) is none of its business.
+sandbox_naming_pids() {
     [ -n "${SANDBOX:-}" ] || return 0
     python3 - "$SANDBOX" <<'PY'
 import os
@@ -159,39 +161,50 @@ for line in out.splitlines():
 PY
 }
 
-# Every sandbox-named pid except the reaper (mode keep-reaper) or all of them.
-sandbox_pids() {
-    for pid in $(fixture_pids_now); do
-        if [ "${1:-all}" = "keep-reaper" ] && [ -n "${REAPER_PID:-}" ] && [ "$pid" = "$REAPER_PID" ]; then
-            continue
-        fi
-        printf '%s\n' "$pid"
-    done
+# Processes this run started: the fixture instances ($!) plus the reaper.
+our_recorded_pids() {
+    pids="$FIXTURE_PIDS"
+    if [ "${1:-}" = "with-reaper" ] && [ -n "${REAPER_PID:-}" ]; then
+        pids="$pids $REAPER_PID"
+    fi
+    printf '%s\n' "$pids"
 }
 
-# Stop sandbox processes: TERM, bounded wait, KILL, bounded wait, verify.
-# `keep-reaper` spares the reaper (used mid-run, where the reaper must survive
-# so an untrappable death later still leaves nothing behind).
-stop_sandbox_processes() {
-    mode="${1:-all}"
-    pids="$(sandbox_pids "$mode")"
+our_pids_alive() {
+    count=0
+    for pid in $(our_recorded_pids "$@"); do
+        if kill -0 "$pid" 2>/dev/null; then
+            count=$((count + 1))
+        fi
+    done
+    printf '%s' "$count"
+}
+
+# Stop exactly the pids this run started (never a path scan — that could hit a
+# process this run did not create): TERM, bounded wait, KILL, bounded wait.
+stop_our_processes() {
+    pids="$(our_recorded_pids "$@")"
     for pid in $pids; do
         kill "$pid" 2>/dev/null || true
     done
+    for pid in $pids; do
+        wait "$pid" 2>/dev/null || true
+    done
     tries=0
     while [ "$tries" -lt 100 ]; do
-        pids="$(sandbox_pids "$mode")"
-        [ -z "$pids" ] && return 0
+        [ "$(our_pids_alive "$@")" -eq 0 ] && return 0
         sleep 0.1
         tries=$((tries + 1))
     done
     for pid in $pids; do
         kill -9 "$pid" 2>/dev/null || true
     done
+    for pid in $pids; do
+        wait "$pid" 2>/dev/null || true
+    done
     tries=0
     while [ "$tries" -lt 100 ]; do
-        pids="$(sandbox_pids "$mode")"
-        [ -z "$pids" ] && return 0
+        [ "$(our_pids_alive "$@")" -eq 0 ] && return 0
         sleep 0.1
         tries=$((tries + 1))
     done
@@ -220,34 +233,36 @@ wait_for_reaper() {
     return 1
 }
 
-# Idempotent, verified teardown: no fixture process may reference the sandbox
-# when this returns, and (unless the sandbox is explicitly kept for
-# inspection) the sandbox directory must be gone.
+# Idempotent, verified teardown. Nothing this run did not create is ever
+# removed: without the ownership marker written at creation time there is
+# nothing of ours to clean and the function refuses to touch the path.
 teardown() {
     if [ "$TEARDOWN_DONE" -eq 1 ]; then
         return "$TEARDOWN_FAILED"
     fi
     TEARDOWN_DONE=1
-    if [ -z "${SANDBOX:-}" ]; then
-        return 0
-    fi
-    if [ -n "${CUTOVER92_REHEARSAL_KEEP:-}" ]; then
-        if ! stop_sandbox_processes all; then
-            echo "FAIL: fixture process(es) survived teardown: $(fixture_pids_now | tr '\n' ' ')" >&2
-            TEARDOWN_FAILED=1
-            return 1
+    if [ "$SANDBOX_OWNED" -ne 1 ] || [ -z "${SANDBOX:-}" ] || [ ! -f "$SANDBOX/$OWNERSHIP_MARKER" ]; then
+        if [ -n "${SANDBOX:-}" ]; then
+            echo "NOTE: not cleaning $SANDBOX — this run did not create it (no ownership marker); nothing was deleted" >&2
         fi
-        echo "NOTE: CUTOVER92_REHEARSAL_KEEP is set — sandbox kept at $SANDBOX (no fixture or reaper process is left running)"
         return 0
     fi
-    # 1) stop the fixtures but keep the reaper watching
-    if ! stop_sandbox_processes keep-reaper; then
-        echo "FAIL: fixture process(es) survived teardown: $(fixture_pids_now | tr '\n' ' ')" >&2
+    if ! stop_our_processes; then
+        echo "FAIL: fixture process(es) started by this run survived teardown: $FIXTURE_PIDS" >&2
         TEARDOWN_FAILED=1
         return 1
     fi
-    # 2) remove the sandbox (retried: a concurrent remover must never leave a
-    #    partially-emptied tree behind); the reaper notices and exits on its own
+    if [ -n "${CUTOVER92_REHEARSAL_KEEP:-}" ]; then
+        if ! stop_our_processes with-reaper; then
+            echo "FAIL: the sandbox reaper survived teardown" >&2
+            TEARDOWN_FAILED=1
+            return 1
+        fi
+        echo "NOTE: CUTOVER92_REHEARSAL_KEEP is set — sandbox kept at $SANDBOX (no process started by this run is left running)"
+        return 0
+    fi
+    # Remove the sandbox this run created (retried: a partially-emptied tree
+    # must never be left behind); the reaper notices and exits on its own.
     tries=0
     while [ "$tries" -lt 5 ]; do
         [ -e "$SANDBOX" ] || break
@@ -256,7 +271,7 @@ teardown() {
         sleep 0.2
         tries=$((tries + 1))
     done
-    # 3) the reaper must be gone before the rehearsal exits (verified)
+    # The reaper must be gone before the rehearsal exits (verified).
     if ! wait_for_reaper; then
         echo "FAIL: the sandbox reaper did not exit after the sandbox was removed" >&2
         TEARDOWN_FAILED=1
@@ -264,11 +279,6 @@ teardown() {
     fi
     if [ -e "$SANDBOX" ]; then
         echo "FAIL: sandbox directory survived removal: $SANDBOX" >&2
-        TEARDOWN_FAILED=1
-        return 1
-    fi
-    if [ -n "$(fixture_pids_now)" ]; then
-        echo "FAIL: process(es) still name the sandbox after teardown: $(fixture_pids_now | tr '\n' ' ')" >&2
         TEARDOWN_FAILED=1
         return 1
     fi
@@ -288,22 +298,38 @@ trap 'exit 129' HUP
 # already looks like it) is accepted.
 # --------------------------------------------------------------------------
 if [ -n "${CUTOVER92_REHEARSAL_ROOT:-}" ]; then
-    SANDBOX="$CUTOVER92_REHEARSAL_ROOT"
-    case "$SANDBOX" in
+    operator_root="$CUTOVER92_REHEARSAL_ROOT"
+    case "$operator_root" in
         "$TMP_BASE"/cutover-92-rehearsal.*) ;;
-        *) refuse "CUTOVER92_REHEARSAL_ROOT must be a cutover-92-rehearsal.* path under $TMP_BASE (got: $SANDBOX)" ;;
+        *)
+            # SANDBOX stays empty: the exit trap must never touch a path this
+            # run did not create (#92-R2).
+            SANDBOX=""
+            refuse "CUTOVER92_REHEARSAL_ROOT must be a cutover-92-rehearsal.* path under $TMP_BASE (got: $operator_root); nothing was created or removed" ;;
     esac
-    if [ -e "$SANDBOX" ]; then
-        refuse "refusing to reuse an existing path: $SANDBOX"
+    if [ -e "$operator_root" ]; then
+        SANDBOX=""
+        refuse "refusing to reuse an existing path: $operator_root; nothing was created or removed"
     fi
-    mkdir -p "$SANDBOX" || refuse "cannot create $SANDBOX"
+    SANDBOX="$operator_root"
+    mkdir -p "$SANDBOX" || { SANDBOX=""; refuse "cannot create $operator_root; nothing was removed"; }
 else
     SANDBOX="$(mktemp -d "$TMP_BASE/cutover-92-rehearsal.XXXXXX")" || refuse "mktemp failed"
 fi
 case "$SANDBOX" in
     "$TMP_BASE"/cutover-92-rehearsal.*) ;;
-    *) refuse "sandbox is not under the OS temp dir: $SANDBOX" ;;
+    *) SANDBOX=""; refuse "sandbox is not under the OS temp dir; nothing was removed" ;;
 esac
+
+# Ownership proof (#92-R2): this run writes the marker immediately after it
+# creates the sandbox, and *every* removal (this script's teardown and the
+# reaper) requires it. A pre-existing directory can never carry the marker, so
+# a refused or reused operator path is never deleted.
+if ! : >"$SANDBOX/$OWNERSHIP_MARKER" 2>/dev/null; then
+    SANDBOX=""
+    refuse "cannot write the ownership marker; nothing was removed"
+fi
+SANDBOX_OWNED=1
 
 if ! command -v python3 >/dev/null 2>&1; then
     refuse "python3 is required (stdlib only)"
@@ -322,10 +348,13 @@ fi
 REAPER="$SANDBOX/reaper.sh"
 cat >"$REAPER" <<'EOF'
 #!/usr/bin/env bash
-# Sandbox reaper: independent of the fixture; exits only after it has stopped
-# every process naming the sandbox and removed the sandbox root.
+# Sandbox reaper: independent of the fixture. On an untrappable death it stops
+# the fixture this run started (recorded in its own pid file) and removes the
+# sandbox root — but only one carrying this run's ownership marker, so a
+# pre-existing operator path is never deleted.
 sandbox="${CUTOVER92_REAPER_SANDBOX:-}"
 tmp_base="${CUTOVER92_REAPER_TMP_BASE:-/nonexistent}"
+marker=".cutover-92-rehearsal-owned"
 while :; do
     parent="$(ps -ww -p "${CUTOVER92_REAPER_PARENT_PID:-0}" -o command= 2>/dev/null || true)"
     case "$parent" in
@@ -340,38 +369,27 @@ while :; do
     esac
     break
 done
-tries=0
-while [ "$tries" -lt 20 ]; do
-    pids="$(python3 - "$sandbox" "$$" <<'PY'
-import os
-import subprocess
-import sys
-
-root = sys.argv[1].rstrip("/") + "/"
-# never match this reaper itself (its own command line names the sandbox),
-# the subshell running this scan, or the scan process
-excluded = {os.getpid(), os.getppid(), int(sys.argv[2])}
-out = subprocess.run(["ps", "-Aww", "-o", "pid=,command="],
-                     capture_output=True, text=True).stdout
-for line in out.splitlines():
-    pid, _sep, command = line.strip().partition(" ")
-    if pid.isdigit() and int(pid) not in excluded and root in command:
-        print(pid)
-PY
-)"
-    [ -z "$pids" ] && break
-    for pid in $pids; do
-        if [ "$tries" -ge 10 ]; then
-            kill -9 "$pid" 2>/dev/null || true
-        else
+pid="$(cat "${CUTOVER92_REAPER_PIDFILE:-/nonexistent}" 2>/dev/null || true)"
+case "$pid" in
+    ''|*[!0-9]*) pid="" ;;
+esac
+if [ -n "$pid" ]; then
+    cmdline="$(ps -ww -p "$pid" -o command= 2>/dev/null || true)"
+    case "$cmdline" in
+        *"$sandbox"*)
             kill "$pid" 2>/dev/null || true
-        fi
-    done
-    sleep 0.3
-    tries=$((tries + 1))
-done
+            sleep 1
+            kill -9 "$pid" 2>/dev/null || true
+            ;;
+    esac
+fi
 case "$sandbox" in
     "$tmp_base"/cutover-92-*)
+        # ownership proof: never remove a path this run did not create
+        if [ ! -f "$sandbox/$marker" ]; then
+            echo "reaper: refusing to remove $sandbox — no ownership marker (not created by this run)" >&2
+            exit 0
+        fi
         tries=0
         while [ "$tries" -lt 10 ]; do
             [ -e "$sandbox" ] || break
@@ -389,6 +407,7 @@ export CUTOVER92_REAPER_PARENT_PID="$$"
 export CUTOVER92_REAPER_PARENT_MATCH="cutover-92-rehearsal"
 export CUTOVER92_REAPER_SANDBOX="$SANDBOX"
 export CUTOVER92_REAPER_TMP_BASE="$TMP_BASE"
+export CUTOVER92_REAPER_PIDFILE="$SANDBOX/host/run/supervisor.pid"  # == "$ROOT/run/supervisor.pid"
 "$REAPER" >"$SANDBOX/reaper.log" 2>&1 &
 REAPER_PID=$!
 
@@ -474,6 +493,8 @@ start_fixture() {
     contain "$ROOT/run/supervisor.pid"
     rm -f "$ROOT/run/supervisor.pid"
     "$PROGRAM" --serve >>"$ROOT/log/fixture-supervisor.log" 2>&1 &
+    FIXTURE_JOB_PID=$!
+    FIXTURE_PIDS="$FIXTURE_PIDS $FIXTURE_JOB_PID"
     tries=0
     while [ ! -s "$ROOT/run/supervisor.pid" ] && [ "$tries" -lt 100 ]; do
         sleep 0.1
@@ -639,8 +660,8 @@ printf '%s\n' \
     '  </array>' \
     '</dict>' \
     '</plist>' >"$UNIT"
-if ! stop_sandbox_processes keep-reaper; then
-    fail "could not stop the fixture supervisor"
+if ! stop_our_processes; then
+    fail "could not stop the fixture supervisor this run started"
 fi
 python3 "$DRY_RUN" --target "$TARGET" >"$ROOT/log/dryrun-during-cutover.log" 2>&1
 DURING_RC=$?
@@ -736,11 +757,10 @@ if teardown; then
 else
     fail "teardown left fixture process(es) or the sandbox behind"
 fi
-LEFT_PIDS="$(fixture_pids_now)"
-if [ -z "$LEFT_PIDS" ]; then
-    FIXTURES_LEFT=0
-else
-    FIXTURES_LEFT="$(printf '%s\n' "$LEFT_PIDS" | wc -l | tr -d ' ')"
+FIXTURES_LEFT="$(our_pids_alive)"
+OTHER_NAMING="$(sandbox_naming_pids | tr '\n' ' ' | sed 's/ *$//')"
+if [ -n "$OTHER_NAMING" ]; then
+    echo "NOTE: process(es) naming the (removed) sandbox root were not started by this run: $OTHER_NAMING" >&2
 fi
 if [ -e "$SANDBOX" ]; then
     SANDBOX_REMOVED="no"

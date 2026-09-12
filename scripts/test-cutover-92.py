@@ -68,6 +68,37 @@ def sha256_file(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def own_process_chain() -> set[int]:
+    """This suite and its ancestors: their command lines can name a marker
+    (the runner's own command contains the script name), so they are never
+    counted as stragglers."""
+    chain: set[int] = set()
+    pid = os.getpid()
+    for _ in range(32):
+        chain.add(pid)
+        out = subprocess.run(
+            ["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, check=False
+        ).stdout.strip()
+        if not out.isdigit():
+            break
+        parent = int(out)
+        if parent <= 1:
+            chain.add(parent)
+            break
+        pid = parent
+    return chain
+
+
+def tree_fingerprint(root: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        digest.update(str(path.relative_to(root)).encode())
+        if path.is_file():
+            digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def fixture_root_pids(root: pathlib.Path) -> list[int]:
     """Pids whose command line names this fixture root (self/ancestors excepted)."""
     prefix = str(root).rstrip("/") + "/"
@@ -86,7 +117,15 @@ def leftover_processes() -> list[str]:
     """Any process naming a rehearsal sandbox, a self-test fixture or the
     fixture program: all three are this suite's own, so any hit is a leak."""
     markers = ("cutover-92-rehearsal", "cutover-92-selftest", "fixture-supervisor --serve")
-    return [line for line in ps_lines() if any(marker in line for marker in markers)]
+    chain = own_process_chain()
+    hits = []
+    for line in ps_lines():
+        pid, _sep, _command = line.strip().partition(" ")
+        if pid.isdigit() and int(pid) in chain:
+            continue
+        if any(marker in line for marker in markers):
+            hits.append(line)
+    return hits
 
 
 def ps_lines() -> list[str]:
@@ -438,6 +477,18 @@ def static_guards() -> None:
         else f"{len(mentions)} data/echo mention line(s), no invocation",
     )
     record(
+        "static guard: rehearsal removes only a sandbox this run created (ownership marker + flag)",
+        "OWNERSHIP_MARKER" in rehearsal_source
+        and "SANDBOX_OWNED" in rehearsal_source
+        and ".cutover-92-rehearsal-owned" in rehearsal_source,
+        "ownership marker and flag present",
+    )
+    record(
+        "static guard: rehearsal kills only pids it recorded (no path-scan kill list)",
+        "stop_our_processes" in rehearsal_source and "stop_sandbox_processes" not in rehearsal_source,
+        "recorded-pid stops only",
+    )
+    record(
         "static guard: rehearsal executes only sandbox-runnable commands via the path guard",
         'guard_command_paths "$RCOMMAND"' in rehearsal_source
         and rehearsal_source.index('guard_command_paths "$RCOMMAND"')
@@ -570,6 +621,87 @@ def rehearsal_guards(tmp: pathlib.Path) -> None:
         f"processes={len(stale)} new sandbox dirs={len(new_dirs)}"
         + (f": {stale[0].strip()[:100]}" if stale else ""),
     )
+
+    # -- #92-R2: never delete anything this run did not create ---------------
+    outside = tmp / "operator-root"
+    outside.mkdir(parents=True, exist_ok=True)
+    (outside / "keep.txt").write_text("operator data that must survive\n", encoding="utf-8")
+    nested = outside / "nested"
+    nested.mkdir(exist_ok=True)
+    (nested / "more.txt").write_bytes(b"\x00\x01\x02 operator bytes \xff\n")
+    before = tree_fingerprint(outside)
+    proc = subprocess.run(
+        ["bash", str(REHEARSAL)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+        env={**os.environ, "CUTOVER92_REHEARSAL_ROOT": str(outside)},
+    )
+    after = tree_fingerprint(outside) if outside.exists() else "(deleted)"
+    record(
+        "refused root outside the expected pattern: operator directory survives byte-for-byte",
+        proc.returncode == 2 and "REFUSED" in proc.stderr and outside.exists() and after == before,
+        f"exit={proc.returncode}, exists={outside.exists()}, content_equal={after == before}",
+    )
+
+    existing = pathlib.Path(tempfile.gettempdir()) / f"cutover-92-rehearsal.selftest-preexisting-{os.getpid()}"
+    if existing.exists():
+        shutil.rmtree(existing)
+    existing.mkdir(parents=True)
+    (existing / "keep.txt").write_text("pre-existing sandbox-shaped data\n", encoding="utf-8")
+    before = tree_fingerprint(existing)
+    try:
+        proc = subprocess.run(
+            ["bash", str(REHEARSAL)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
+            env={**os.environ, "CUTOVER92_REHEARSAL_ROOT": str(existing)},
+        )
+        after = tree_fingerprint(existing) if existing.exists() else "(deleted)"
+        record(
+            "refused reuse of an existing sandbox-shaped directory: it survives byte-for-byte",
+            proc.returncode == 2 and "REFUSED" in proc.stderr and existing.exists() and after == before,
+            f"exit={proc.returncode}, exists={existing.exists()}, content_equal={after == before}",
+        )
+    finally:
+        if existing.exists():
+            shutil.rmtree(existing)
+
+    bystander_root = pathlib.Path(tempfile.gettempdir()) / f"cutover-92-rehearsal.selftest-bystander-{os.getpid()}"
+    if bystander_root.exists():
+        shutil.rmtree(bystander_root)
+    bystander = subprocess.Popen(
+        ["bash", "-c", f"exec -a 'operator-shell {bystander_root}/notes.txt' sleep 30"],
+        start_new_session=True,
+    )
+    time.sleep(0.3)
+    try:
+        proc = subprocess.run(
+            ["bash", str(REHEARSAL)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=600,
+            env={**os.environ, "CUTOVER92_REHEARSAL_ROOT": str(bystander_root)},
+        )
+        alive = bystander.poll() is None
+        record(
+            "a process this run did not start (naming the sandbox root) is not killed",
+            proc.returncode == 0 and alive,
+            f"rehearsal exit={proc.returncode}, bystander_alive={alive}",
+        )
+    finally:
+        if bystander.poll() is None:
+            try:
+                os.killpg(os.getpgid(bystander.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            bystander.wait(timeout=10)
+        if bystander_root.exists():
+            shutil.rmtree(bystander_root, ignore_errors=True)
 
     deadline = time.monotonic() + 12
     stale = leftover_processes()
