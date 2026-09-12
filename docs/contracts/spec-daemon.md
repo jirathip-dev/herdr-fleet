@@ -30,7 +30,8 @@ remain usable without it; SQLite owns state; no network control API).
   `lane.replacement.cancel`, `lane.replacement.status`,
   `lane.checkpoint.create`, `lane.checkpoint.status`, `lane.retire`,
   `lane.start`, `lane.adopt`, `lane.successor.consume`,
-  `state.epoch`, `backup.create`, `restore.begin`, `journal.tail`,
+  `state.epoch`, `queue.submit`, `queue.status`, `backup.create`,
+  `restore.begin`, `journal.tail`,
   `events.subscribe` (issue #77 adds no method: the target-profile plan
   travels as an optional `params.profile` on `lane.replacement.request` and
   `lane.start`, and returns on `lane.replacement.status` /
@@ -216,6 +217,59 @@ touches Git, or requires/issues/consumes a grant.
   identity, unreadable backend) parks the record `ambiguous`. The stop is
   issued at most once — reconciliation never repeats a signal, and never
   against a reused identity.
+
+## Queue submission methods (issue #85)
+
+`queue.submit` commits ONE approved selected-issue run; `queue.status`
+reads one committed submission back read-only. Both require
+`params.idempotency_key` (`ik_` format) on the mutating path only;
+`queue.submit` journals a claim before any effect and records the typed
+outcome after the effect transaction commits.
+
+- `queue.submit` requires `params`: `idempotency_key`, `digest` (the
+  approved 64-hex preview digest), `epoch` (the presented state epoch the
+  approval was rendered against), `preview` (the exact bound-input
+  document the #84 preview rendered), `binding` (the reviewed
+  `hf-profile-binding/v1` document), `role_revision` (the 64-hex revision
+  of the CURRENT profile configuration, re-observed by the caller),
+  `caps` `{global, repository, harness}` and `observations`
+  `{host_available, harness_lanes}` (both may be null = unknown, which is
+  never readiness); optional `grants` (`[{id, grant_id}]`, the per-issue
+  route-grant bindings) and `resume` (`[{instance_id, digest}]`, the
+  explicit engine-minted authorizations for paused runs).
+- Refusals happen BEFORE the claim (nothing is journaled, no effect
+  exists): malformed params, a digest that does not match the freshly
+  re-rendered preview (`refusal.plan.stale`), a stale epoch
+  (`refusal.state.epoch`), a configuration/credential change
+  (`refusal.profile.revision`), an unsupported/unresolved/empty step
+  spine or a step outside the reviewed boundary (`preview.step_*`,
+  `submission.steps`, `submission.boundary`), and a production/protected
+  completion boundary (`refusal.policy.production_confirmation`,
+  `preview.protected_branch`).
+- The committed document (`hf-queue-submission/v1`, module-local like the
+  preview) carries the submission id (`qs_` + 16 hex of sha256 over
+  `hf-queue-submission/v1|<digest>|<idempotency_key>`), the bound
+  state/role/workflow/boundary block, per-issue items with their closed
+  status (`admitted` | `waiting` | `refused`), stable reason code,
+  bounded message and the bound run id, the executable spine, and an
+  explicit statement that no workflow step has been executed.
+- One transaction decides and writes: live ownership (a duplicate owner
+  is refused `submission.already_owned`), grant status/epoch/expiry
+  (`refusal.grant.*`, `refusal.state.epoch`), scope overlap
+  (`refusal.admission.monorepo_overlap`) and capacity
+  (`refusal.admission.cap_*`); waiting items consume no capacity slot. A
+  paused run refuses `submission.paused` unless the presented engine
+  digest authorizes exactly that run's resume (applied once, in the same
+  transaction, against the same run).
+- `queue.status` requires `params.submission_id` (`qs_` + 16 hex) and
+  returns the same document the submit response carried (a pure
+  projection of the committed rows; `state.not_found` for an unknown id).
+- Restart reconciliation reads the committed submission row (the commit
+  marker) back: a present row means exactly the committed effects exist
+  and its digest binding is re-verified; a missing row means the
+  all-or-nothing transaction never committed. The interrupted claim is
+  resolved `ambiguous` like every other interrupted mutation, so a retry
+  needs a fresh key and no effect is ever repeated.
 
 ## Responses: `hf-rpc-response/v1`
 

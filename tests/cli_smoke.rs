@@ -113,6 +113,11 @@ fn every_documented_command_has_working_help() {
         "status",
         "plan",
         "capabilities",
+        "lane preview",
+        "lane request",
+        "lane status",
+        "queue submit",
+        "queue status",
     ] {
         assert!(usage.contains(command), "USAGE must document `{command}`");
     }
@@ -122,6 +127,7 @@ fn every_documented_command_has_working_help() {
         &["status", "--help"][..],
         &["plan", "--help"][..],
         &["capabilities", "--help"][..],
+        &["queue", "--help"][..],
     ] {
         let out = run(args);
         assert!(out.status.success(), "{args:?} --help should exit 0");

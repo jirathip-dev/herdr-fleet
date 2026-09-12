@@ -25,6 +25,7 @@ pub mod mutation;
 pub mod observe;
 pub mod plan;
 pub mod process;
+pub mod queue_executor;
 pub mod queue_preview;
 pub mod redact;
 pub mod remote;

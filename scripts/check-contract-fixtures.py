@@ -98,7 +98,8 @@ RPC_METHODS = frozenset(
      "lane.checkpoint.create", "lane.checkpoint.status",
      "lane.retire",
      "lane.start", "lane.adopt", "lane.successor.consume",
-     "state.epoch", "backup.create", "restore.begin", "journal.tail",
+     "state.epoch", "queue.submit", "queue.status",
+     "backup.create", "restore.begin", "journal.tail",
      "events.subscribe"}
 )
 EVENT_KINDS = frozenset(

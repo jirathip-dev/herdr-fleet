@@ -356,6 +356,51 @@ release process activates (docs/RELEASING.md), then semver applies.
   pagination/restart behavior, the empty/stale/missing-source cases, the
   redaction boundary, read-only behavior, and the absence of any
   process/remote surface per rendered row.
+### Added (issue #85 — Daemon-owned durable selected-run submission path)
+
+- The queue executor consumes the reviewed preview: `queue.submit`
+  commits ONE approved selected-issue run. The local/operator material is
+  the exact bound-input document the preview rendered (its sha256 IS the
+  approved digest), the reviewed role-configuration revision re-observed
+  from configuration, the presented state epoch, the per-issue grant
+  bindings and the presented observations; the daemon re-renders the
+  preview and refuses a stale digest (`refusal.plan.stale`), a moved
+  epoch (`refusal.state.epoch`), a changed configuration
+  (`refusal.profile.revision`) or a revoked grant
+  (`refusal.grant.inactive` / `refusal.grant.expired`) before any effect.
+- Persistence is ONE transaction (`m0009_queue_submissions_v9`): the
+  submission binding, the per-issue membership with explicit
+  admitted/waiting/refused outcomes, the admitted run rows and the unique
+  work-ownership rows (`PRIMARY KEY (repository, issue_number)`) commit
+  together or not at all. Live ownership, grant status/expiry, declared
+  scope overlap and concurrency capacity are re-verified under the
+  transaction guard, so a double click, a retry or a restart can never
+  duplicate an owner or leave a partially admitted run.
+- Only supported workflow steps exist on this surface: an empty spine, a
+  kind outside the closed executable effect set, unresolved step
+  parameters or a step outside the reviewed boundary caps refuse the
+  whole flow, labelled — an unsupported end-to-end flow is never
+  represented by stub success, and no step is executed by the submission
+  itself (step execution stays with the merged grant/apply machinery).
+- Paused runs stay paused: a paused run in scope refuses the item
+  (`submission.paused`) unless a separate explicit engine-minted resume
+  authorization is presented, which resumes exactly that run once and
+  admits it against the same run (never a new owner). The scope stays
+  exactly the approved selected set (no implicit backlog expansion) and
+  a production/protected boundary is refused (main/release stays
+  human-only).
+- `queue.submit` / `queue.status` are the first two methods added after
+  #76 (closed RPC set 29 -> 31); restart reconciliation treats the
+  committed submission row as the commit marker (an interrupted
+  pre-commit claim leaves nothing behind), and `queue.status` is the same
+  pure projection of the committed rows the submit response carried.
+- CLI parity: `canter queue submit` (exact-digest authorization, local
+  stale-digest refusal, re-observed role revision, optional pinned
+  epoch) and `canter queue status` render the daemon document
+  byte-identically (`tests/queue_cli.rs`); `tests/queue_submit.rs` pins
+  the wire contract, the double-click/concurrent retry behavior, both
+  crash windows and the per-issue outcomes over a real daemon.
+
 ### Added (issue #78 — CLI preview / request / inspect for one explicit lane handoff)
 
 - The thin CLI lane surface over the completed daemon handoff path
