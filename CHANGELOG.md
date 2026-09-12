@@ -401,6 +401,41 @@ release process activates (docs/RELEASING.md), then semver applies.
   the wire contract, the double-click/concurrent retry behavior, both
   crash windows and the per-issue outcomes over a real daemon.
 
+### Added (issue #86 — Run-scoped safe-boundary pause, resume and bounded retry)
+
+- `run.pause` / `run.resume` / `run.retry` / `run.status` complete the
+  closed RPC set (31 -> 35) with a typed control surface over exactly ONE
+  run (the `run-` instance row the queue executor commits). Scope is the
+  run only: no `fleet.*` control exists, a resume never lifts another
+  run's pause, and lane handoff records are untouched.
+- Safe-boundary pause: a pause request is durable BEFORE the run reaches
+  its boundary (`pause_requested`, `pause_reason`, `pause_requested_at`
+  columns, m0010) and stops admitting new step dispatch from that moment
+  (`refusal.run.paused` before any effect) while in-flight work keeps
+  running untouched — nothing is signalled, killed or cleaned up. The
+  pause commits its reached `paused` state at the run's next recorded
+  step boundary (the apply path), and a restart commits any request whose
+  in-flight work is gone; `run.status` renders `active` |
+  `pause_requested` | `paused` plus the live boundary.
+- Resume requires the engine-minted digest minted at pause time (bound to
+  the exact run, epoch and claim), re-derives fresh eligibility under the
+  guard (live, non-terminal, current epoch, still owning its issue) and is
+  fenced on the exact instance id; the digest is single-use.
+- Bounded retry names exactly ONE diagnosed step: it must be a step of the
+  run's committed spine, the current unachieved frontier step, and carry a
+  recorded terminal non-success attempt. Invalid, revoked (inactive
+  grant), stale (moved epoch), already-succeeded and exhausted retries
+  refuse; each `run.retry` records one single-use authorization
+  (`run_retries`, bounded attempts) that the next dispatch of that exact
+  step consumes — a re-dispatch of a diagnosed failed step without one
+  refuses (`refusal.run.retry_required`).
+- Duplicate and concurrent controls serialize: the same idempotency key
+  replays the recorded response, a second pause/retry intent is refused
+  typed, and every control journals through the shared claim machinery
+  (restart reconciliation reads the durable rows back — `reconcile.run-control`).
+- CLI parity: `canter run pause|resume|retry|status` (`tests/run_control.rs`,
+  `tests/run_control_cli.rs`), `run.status` on the read-only allowlist.
+
 ### Added (issue #78 — CLI preview / request / inspect for one explicit lane handoff)
 
 - The thin CLI lane surface over the completed daemon handoff path

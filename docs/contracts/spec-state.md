@@ -335,6 +335,56 @@ to journal fails closed — the mutation does not start.
   document from the committed rows, and the original submit response is
   the same projection, so CLI/JSON and daemon readback agree.
 
+## Run control additions (issue #86)
+
+- **Columns and table (m0010/schema v10, purely additive)**: three
+  `instances` columns — `pause_requested` (the durable pause REQUEST that
+  stops new step dispatch while in-flight work finishes),
+  `pause_reason` (the bounded operator reason) and `pause_requested_at`
+  — plus `run_retries` (one row per authorized bounded re-dispatch of one
+  diagnosed step: `UNIQUE (instance_id, step_id, attempt)` bounds the
+  attempts, `consumed_at`/`consumed_key` record the single consumption).
+  No existing table or row is touched, so stored grants, instances, lane
+  records and queue submissions are never reinterpreted by the upgrade.
+- **Two-phase pause**: `request_run_pause` commits ONE transaction. With a
+  step-dispatch claim (`method:"apply"`, status `claimed`) still in flight
+  for the run the row carries `pause_requested` — the request is durable
+  and new dispatch is already refused, while the in-flight work keeps its
+  worktree, node and dirty state (nothing is signalled, killed or cleaned
+  up) — and `complete_run_pause_boundary` commits `paused` (clearing
+  `pause_requested`) only when no step of the run is in flight any more.
+  With no step in flight the boundary is already reached: `paused` commits
+  in the same transaction as the request. Boot reconciliation completes
+  every request whose in-flight work is gone (after a restart nothing is
+  executing), so a restart loses neither the intent nor the boundary. An
+  unreadable claimed line is unknown in-flight work: no run claims a safe
+  boundary while it exists.
+- **Exact-target resume**: `resume_run` requires the fresh engine-minted
+  digest stored at pause time (`mint_resume_digest` over the instance, the
+  pause-time epoch and the claim key; `authorize_resume` compares), refuses
+  a terminal run, a run that is not paused, a moved epoch
+  (`refusal.state.epoch`) and a superseded owner
+  (`refusal.run.superseded`), consumes the digest on success
+  (`resume_digest = ''`) and updates `WHERE instance_id = ?1 AND paused = 1`
+  — an unrelated run's pause (or any fleet-level hold expressed as paused
+  runs) is never cleared by a resume.
+- **Bounded retry state**: `run_retries` rows are the single-use
+  authorizations. `record_run_retry` refuses a second authorization while
+  one is unconsumed (`refusal.run.retry_pending`) and refuses beyond the
+  bound (`refusal.run.retry_bound`, three per (run, step)); the deterministic
+  retry id derives from `(run, step, attempt)`. `claim_run_retry` is the
+  dispatch-side fence: a first dispatch of a step is never fenced, a
+  re-dispatch of a step with a recorded terminal non-success attempt
+  consumes one unconsumed authorization, and `Missing` refuses the dispatch
+  (`refusal.run.retry_required`) before any effect. The diagnosis input
+  (`run_step_attempts`) and the bound spine (`run_step_spine`) are read
+  back from the durable apply claims and the committed submission's
+  bound-input line — never from a caller.
+- **Restart reconciliation**: an interrupted `run.*` claim is read back
+  against its commit marker (the run's control rows) and logged
+  (`reconcile.run-control`); no control is ever repeated and nothing is
+  ever signalled.
+
 ## Fixture map
 
 Accept: `migration.valid.json` (0→1, checksummed), `audit.valid.jsonl`

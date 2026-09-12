@@ -143,6 +143,15 @@ pub fn is_submission_id(text: &str) -> bool {
         && is_lower_hex(&text[PREFIX.len()..], 16)
 }
 
+/// Run instance id: `run-` + 16 lowercase hex (issue #85/#86: the durable
+/// run identity the queue executor commits for every admitted issue).
+pub fn is_run_id(text: &str) -> bool {
+    const PREFIX: &str = "run-";
+    text.len() == PREFIX.len() + 16
+        && text.starts_with(PREFIX)
+        && is_lower_hex(&text[PREFIX.len()..], 16)
+}
+
 /// Schedule id: `sd_` + 16 lowercase hex (lifecycle slice, issue #9).
 pub fn is_schedule_id(text: &str) -> bool {
     const PREFIX: &str = "sd_";

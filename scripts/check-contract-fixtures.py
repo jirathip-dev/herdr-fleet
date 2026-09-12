@@ -99,6 +99,7 @@ RPC_METHODS = frozenset(
      "lane.retire",
      "lane.start", "lane.adopt", "lane.successor.consume",
      "state.epoch", "queue.submit", "queue.status",
+     "run.pause", "run.resume", "run.retry", "run.status",
      "backup.create", "restore.begin", "journal.tail",
      "events.subscribe"}
 )

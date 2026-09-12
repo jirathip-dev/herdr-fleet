@@ -29,6 +29,7 @@ pub mod queue_executor;
 pub mod queue_preview;
 pub mod redact;
 pub mod remote;
+pub mod run_control;
 pub mod schema;
 pub mod service;
 pub mod state;

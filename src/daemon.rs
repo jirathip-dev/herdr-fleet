@@ -285,6 +285,29 @@ pub fn serve(paths: &DaemonPaths) -> Result<(), DaemonError> {
         );
     }
     let reconciled = reconcile_claims(&state, &log, &paths.checkpoints_dir)?;
+    // Issue #86 run-scoped controls: after a restart no step is executing,
+    // so every recorded pause request without in-flight work has reached
+    // its safe boundary and commits `paused` here (the intent is durable;
+    // the boundary is re-derived, never guessed).
+    match state.reconcile_run_pause_boundaries(&time::rfc3339_now()) {
+        Ok(reached) if reached > 0 => {
+            log.write(
+                "info",
+                "run.pause.reconciled",
+                &format!("{reached} pause request(s) reached their safe boundary"),
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            return Err(daemon_error(
+                "daemon.reconcile",
+                format!(
+                    "run pause boundary reconciliation failed: {}: {}",
+                    err.code, err.message
+                ),
+            ));
+        }
+    }
     // Cold-boot schedule recovery (issue #9 AC2/AC9): every due schedule
     // fires at most ONE fresh coalesced evaluation per boot (missed windows
     // are skipped, never replayed), refused schedules park themselves, and
@@ -543,6 +566,10 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "state.epoch" => method_state_epoch(shared, request),
         "queue.submit" => method_queue_submit(shared, request),
         "queue.status" => method_queue_status(shared, request),
+        "run.pause" => method_run_pause(shared, request),
+        "run.resume" => method_run_resume(shared, request),
+        "run.retry" => method_run_retry(shared, request),
+        "run.status" => method_run_status(shared, request),
         "schedules.list" => method_schedules(shared, request),
         "schedules.create" => method_schedule_create(shared, request),
         "schedules.pause" => method_schedule_pause(shared, request),
@@ -1239,6 +1266,29 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
     {
         return response;
     }
+    // Issue #86 safe-boundary completion: this apply arrives at the run
+    // BEFORE its own claim, so a recorded pause request whose previous
+    // in-flight step has already resolved has reached its safe boundary
+    // here — the pause commits `paused` first, and this new dispatch is
+    // then refused as paused (stop-admitting takes effect before any
+    // further step is dispatched).
+    {
+        let state = match shared.lock_state() {
+            Ok(state) => state,
+            Err(message) => {
+                return err_response(&request.id, "state.unavailable", message);
+            }
+        };
+        if let Err(err) =
+            state.complete_run_pause_boundary(&parsed.instance_id, &time::rfc3339_now())
+        {
+            shared.log.write(
+                "error",
+                "run.pause.boundary_failed",
+                &format!("{}: {}", err.code, err.message),
+            );
+        }
+    }
     // Journal the durable intent (pre-action audit record + idempotency
     // claim; action mutate.<kind>, target repo:instance:step).
     let action = format!("mutate.{kind}");
@@ -1375,6 +1425,7 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
             caps: caps(&instance.caps),
             current_node: instance.current_node.clone(),
             paused: instance.paused,
+            pause_requested: instance.pause_requested,
             status: instance.status.clone(),
             state_epoch: instance.state_epoch,
         };
@@ -1494,6 +1545,69 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
         return resolve_apply_refusal(shared, request, &key, err.code, err.message);
     }
     let _ = latest_evidence;
+
+    // Bounded retry fence (issue #86), queue runs only: a re-dispatch of a
+    // step whose recorded outcome was a terminal non-success requires (and
+    // consumes) exactly one recorded retry authorization; a first dispatch
+    // is never fenced. A missing authorization refuses BEFORE the effect.
+    let bounded_step = {
+        let state = match shared.lock_state() {
+            Ok(state) => state,
+            Err(message) => {
+                return resolve_apply_refusal(shared, request, &key, "state.unavailable", message);
+            }
+        };
+        match state.run_step_spine(&parsed.instance_id) {
+            Ok(spine) => spine
+                .map(|steps| steps.iter().any(|step| step == &parsed.step))
+                .unwrap_or(false),
+            Err(err) => {
+                return resolve_apply_refusal(shared, request, &key, err.code, err.message);
+            }
+        }
+    };
+    if bounded_step {
+        let claim = {
+            let state = match shared.lock_state() {
+                Ok(state) => state,
+                Err(message) => {
+                    return resolve_apply_refusal(
+                        shared,
+                        request,
+                        &key,
+                        "state.unavailable",
+                        message,
+                    );
+                }
+            };
+            state.claim_run_retry(
+                &parsed.instance_id,
+                &parsed.step,
+                &key,
+                &time::rfc3339_now(),
+            )
+        };
+        match claim {
+            Ok(crate::state::RunRetryClaim::NotRequired)
+            | Ok(crate::state::RunRetryClaim::Consumed(_)) => {}
+            Ok(crate::state::RunRetryClaim::Missing) => {
+                return resolve_apply_refusal(
+                    shared,
+                    request,
+                    &key,
+                    crate::mutation::code::RETRY_REQUIRED,
+                    format!(
+                        "step {:?} of run {} already has a recorded failed attempt; a re-dispatch \
+                         needs an unconsumed bounded retry authorization (`run.retry`)",
+                        parsed.step, parsed.instance_id
+                    ),
+                );
+            }
+            Err(err) => {
+                return resolve_apply_refusal(shared, request, &key, err.code, err.message);
+            }
+        }
+    }
 
     // Execute the effect OUTSIDE the state lock (bounded subprocesses never
     // stall other daemon work; the claim already journals the intent).
@@ -1744,6 +1858,17 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
         },
         result,
     );
+    // Issue #86: the step resolved (the claim is no longer in flight) — a
+    // recorded pause request reaches its safe boundary here and commits
+    // `paused`. The in-flight work was never interrupted: the effect ran to
+    // its recorded outcome with its worktree and dirty state untouched.
+    if let Err(err) = state.complete_run_pause_boundary(&parsed.instance_id, &time::rfc3339_now()) {
+        shared.log.write(
+            "error",
+            "run.pause.boundary_failed",
+            &format!("{}: {}", err.code, err.message),
+        );
+    }
     drop(state);
     publish_after_state_change(shared, None);
     response
@@ -2456,6 +2581,394 @@ fn method_queue_status(shared: &Arc<Shared>, request: &Request) -> String {
                 &request.id,
                 "state.not_found",
                 format!("no submission {submission_id:?} exists"),
+            ),
+            Err(err) => err_response(&request.id, err.code, err.message),
+        },
+        Err(message) => err_response(&request.id, "state.unavailable", message),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Run-scoped controls (issue #86): safe-boundary pause, resume and bounded
+// retry for exactly ONE queue run. Every method journals its intent through
+// the shared claim machinery; nothing on this surface spawns, kills, cleans
+// up, mutates Git, clears a fleet/repository-level hold or bypasses a gate.
+// ---------------------------------------------------------------------------
+
+/// `run.pause`: record ONE durable pause request for exactly one run. The
+/// request stops admitting new step dispatch for the run immediately; work
+/// already in flight keeps running and the pause commits its reached
+/// `paused` state at the run's next recorded step boundary. The response
+/// carries the engine-minted resume digest (the operator's authorization)
+/// and the live boundary state.
+fn method_run_pause(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "run.pause requires params: idempotency_key, instance_id, reason",
+        );
+    };
+    let parsed = match crate::run_control::parse_pause_params(params) {
+        Ok(parsed) => parsed,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let target = format!("run:{}", parsed.instance_id);
+    let key = match journal_mutation(shared, request, "mutate.run.pause", &target) {
+        Intent::Claimed { key } => key,
+        Intent::Replay { response } => return replay(shared, &response),
+        Intent::Refused { code, message } => return err_response(&request.id, code, &message),
+    };
+    crash_point("run.control.after-intent");
+    let outcome = (|| -> Result<Val, (&'static str, String)> {
+        let state = shared
+            .lock_state()
+            .map_err(|message| ("state.unavailable", message))?;
+        let epoch = state
+            .current_epoch()
+            .map_err(|err| (err.code, err.message))?;
+        // The digest binds the exact run, the pause-time epoch and this one
+        // claim: one pause produces exactly one authorization.
+        let digest = crate::engine::mint_resume_digest(&parsed.instance_id, epoch, &key);
+        let row = state
+            .request_run_pause(
+                &parsed.instance_id,
+                &parsed.reason,
+                &digest,
+                &time::rfc3339_now(),
+            )
+            .map_err(|err| (err.code, err.message))?;
+        let in_flight = state
+            .in_flight_run_step(&parsed.instance_id)
+            .map_err(|err| (err.code, err.message))?;
+        Ok(crate::run_control::control_doc(
+            &row,
+            in_flight.as_deref(),
+            Some(&row.resume_digest),
+        ))
+    })();
+    match outcome {
+        Ok(doc) => finish_mutation(shared, request, &key, "run.pause", true, doc, None),
+        Err((code, message)) => finish_mutation(
+            shared,
+            request,
+            &key,
+            "run.pause",
+            false,
+            null(),
+            Some((code, message)),
+        ),
+    }
+}
+
+/// `run.resume`: lift the pause of exactly ONE run. It requires the
+/// engine-minted digest stored at pause time (an authorized operator), an
+/// exact target and fresh eligibility (live, non-terminal, current epoch,
+/// still owning its issue) — and the update is fenced on the exact
+/// instance id, so no unrelated run's pause (or any fleet-level hold
+/// expressed as paused runs) is ever cleared.
+fn method_run_resume(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "run.resume requires params: idempotency_key, instance_id, digest",
+        );
+    };
+    let parsed = match crate::run_control::parse_resume_params(params) {
+        Ok(parsed) => parsed,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let target = format!("run:{}", parsed.instance_id);
+    let key = match journal_mutation(shared, request, "mutate.run.resume", &target) {
+        Intent::Claimed { key } => key,
+        Intent::Replay { response } => return replay(shared, &response),
+        Intent::Refused { code, message } => return err_response(&request.id, code, &message),
+    };
+    crash_point("run.control.after-intent");
+    let outcome = (|| -> Result<Val, (&'static str, String)> {
+        let state = shared
+            .lock_state()
+            .map_err(|message| ("state.unavailable", message))?;
+        let row = state
+            .resume_run(&parsed.instance_id, &parsed.digest, &time::rfc3339_now())
+            .map_err(|err| (err.code, err.message))?;
+        let in_flight = state
+            .in_flight_run_step(&parsed.instance_id)
+            .map_err(|err| (err.code, err.message))?;
+        Ok(crate::run_control::control_doc(
+            &row,
+            in_flight.as_deref(),
+            None,
+        ))
+    })();
+    match outcome {
+        Ok(doc) => finish_mutation(shared, request, &key, "run.resume", true, doc, None),
+        Err((code, message)) => finish_mutation(
+            shared,
+            request,
+            &key,
+            "run.resume",
+            false,
+            null(),
+            Some((code, message)),
+        ),
+    }
+}
+
+/// `run.retry`: authorize exactly ONE bounded re-dispatch of ONE diagnosed
+/// step of one run. The step must be a step of the run's committed spine,
+/// must be its current unachieved frontier step, must carry a recorded
+/// terminal non-success attempt (the diagnosis), and the run must be live,
+/// unpaused, at the current epoch, with an active grant. Invalid, revoked,
+/// stale, already-succeeded and exhausted retries refuse; nothing is
+/// spawned here — the authorization is consumed by the next dispatch of
+/// that exact step.
+fn method_run_retry(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "run.retry requires params: idempotency_key, instance_id, step",
+        );
+    };
+    let parsed = match crate::run_control::parse_retry_params(params) {
+        Ok(parsed) => parsed,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let target = format!("run:{}:{}", parsed.instance_id, parsed.step);
+    let key = match journal_mutation(shared, request, "mutate.run.retry", &target) {
+        Intent::Claimed { key } => key,
+        Intent::Replay { response } => return replay(shared, &response),
+        Intent::Refused { code, message } => return err_response(&request.id, code, &message),
+    };
+    crash_point("run.control.after-intent");
+    let outcome = (|| -> Result<Val, (&'static str, String)> {
+        let state = shared
+            .lock_state()
+            .map_err(|message| ("state.unavailable", message))?;
+        let run = state
+            .instance_by_id(&parsed.instance_id)
+            .map_err(|err| (err.code, err.message))?
+            .ok_or_else(|| {
+                (
+                    "state.not_found",
+                    format!("no instance {:?}", parsed.instance_id),
+                )
+            })?;
+        if run.status == "done" || run.status == "invalidated" {
+            return Err((
+                crate::run_control::codes::TERMINAL,
+                format!(
+                    "run {} is {}; a terminal run is never retried",
+                    parsed.instance_id, run.status
+                ),
+            ));
+        }
+        if run.paused || run.pause_requested {
+            return Err((
+                crate::run_control::codes::PAUSED,
+                format!(
+                    "run {} is {}; a paused run is resumed before any step is retried",
+                    parsed.instance_id,
+                    crate::run_control::control_state(&run)
+                ),
+            ));
+        }
+        let spine = state
+            .run_step_spine(&parsed.instance_id)
+            .map_err(|err| (err.code, err.message))?
+            .ok_or_else(|| {
+                (
+                    crate::run_control::codes::SCOPE,
+                    format!(
+                        "run {} has no committed queue submission spine; retry addresses queue \
+                         runs only",
+                        parsed.instance_id
+                    ),
+                )
+            })?;
+        if crate::run_control::step_index_of(&spine, &parsed.step).is_none() {
+            return Err((
+                crate::run_control::codes::STEP_UNKNOWN,
+                format!(
+                    "step {:?} is not a step of run {} (spine {:?})",
+                    parsed.step, parsed.instance_id, spine
+                ),
+            ));
+        }
+        let next_step = crate::run_control::next_step_of(&spine, &run.current_node);
+        let current_index = crate::run_control::step_index_of(&spine, &run.current_node);
+        let named_index = crate::run_control::step_index_of(&spine, &parsed.step);
+        if next_step.as_deref() != Some(parsed.step.as_str()) {
+            let already_done = match (named_index, current_index) {
+                (Some(named), Some(current)) => named <= current,
+                _ => false,
+            };
+            let (code, message) = if already_done {
+                (
+                    crate::run_control::codes::STEP_DONE,
+                    format!(
+                        "step {:?} of run {} already succeeded (current node {:?}); a \
+                         terminal-success step is never retried",
+                        parsed.step, parsed.instance_id, run.current_node
+                    ),
+                )
+            } else {
+                (
+                    crate::run_control::codes::STEP_ORDER,
+                    format!(
+                        "step {:?} is not the current frontier step of run {} (next step {:?}); a \
+                         retry names exactly the diagnosed frontier step",
+                        parsed.step, parsed.instance_id, next_step
+                    ),
+                )
+            };
+            return Err((code, message));
+        }
+        // The diagnosis: a recorded terminal non-success attempt for THIS
+        // run and THIS step. A step that never ran, or whose last attempt
+        // succeeded, is never retried.
+        let attempts = state
+            .run_step_attempts(&parsed.instance_id)
+            .map_err(|err| (err.code, err.message))?;
+        let latest = attempts
+            .iter()
+            .rfind(|(step, _)| step == &parsed.step)
+            .map(|(_, status)| status.clone());
+        match latest.as_deref() {
+            Some("failed") | Some("refused") | Some("ambiguous") => {}
+            Some("succeeded") => {
+                return Err((
+                    crate::run_control::codes::STEP_DONE,
+                    format!(
+                        "the recorded attempt of step {:?} of run {} succeeded; a terminal-success \
+                         step is never retried",
+                        parsed.step, parsed.instance_id
+                    ),
+                ));
+            }
+            Some(other) => {
+                return Err((
+                    crate::run_control::codes::STEP_UNDIAGNOSED,
+                    format!(
+                        "the recorded attempt of step {:?} of run {} ended {other:?}; a retry names \
+                         a diagnosed failed step",
+                        parsed.step, parsed.instance_id
+                    ),
+                ));
+            }
+            None => {
+                return Err((
+                    crate::run_control::codes::STEP_UNDIAGNOSED,
+                    format!(
+                        "step {:?} of run {} has no recorded attempt; an unattempted step is not \
+                         retried",
+                        parsed.step, parsed.instance_id
+                    ),
+                ));
+            }
+        }
+        // Fresh eligibility: the run must still be at the live epoch and
+        // its grant must still be active (a revoked authorization refuses).
+        let epoch = state
+            .current_epoch()
+            .map_err(|err| (err.code, err.message))?;
+        if epoch != run.state_epoch {
+            return Err((
+                crate::mutation::code::EPOCH_STALE,
+                format!(
+                    "run {} was pinned to epoch {}; the live epoch is {epoch}",
+                    parsed.instance_id, run.state_epoch
+                ),
+            ));
+        }
+        let grant = state
+            .grant_by_id(&run.grant_id)
+            .map_err(|err| (err.code, err.message))?;
+        match grant {
+            Some(grant) if grant.status == "active" => {}
+            Some(grant) => {
+                return Err((
+                    crate::mutation::code::GRANT_INACTIVE,
+                    format!(
+                        "grant {} of run {} is {}; a revoked grant refuses the retry",
+                        grant.grant_id, parsed.instance_id, grant.status
+                    ),
+                ));
+            }
+            None => {
+                return Err((
+                    crate::mutation::code::GRANT_INACTIVE,
+                    format!(
+                        "grant {:?} of run {} does not exist; a revoked grant refuses the retry",
+                        run.grant_id, parsed.instance_id
+                    ),
+                ));
+            }
+        }
+        let row = state
+            .record_run_retry(&parsed.instance_id, &parsed.step, &time::rfc3339_now())
+            .map_err(|err| (err.code, err.message))?;
+        Ok(crate::run_control::retry_doc(
+            &run,
+            &row,
+            &spine,
+            &parsed.step,
+            next_step.as_deref(),
+        ))
+    })();
+    match outcome {
+        Ok(doc) => finish_mutation(shared, request, &key, "run.retry", true, doc, None),
+        Err((code, message)) => finish_mutation(
+            shared,
+            request,
+            &key,
+            "run.retry",
+            false,
+            null(),
+            Some((code, message)),
+        ),
+    }
+}
+
+/// `run.status`: read the control state of exactly one run back read-only —
+/// `pause_requested` (the request is durable, in-flight work still runs)
+/// versus `paused` (the safe boundary has been reached) versus `active`,
+/// plus the exact target and the scope block. No claim, no journal write.
+fn method_run_status(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "run.status requires params.instance_id (run- + 16 hex)",
+        );
+    };
+    let instance_id = match crate::run_control::parse_status_target(params) {
+        Ok(instance_id) => instance_id,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    match shared.lock_state() {
+        Ok(state) => match state.instance_by_id(&instance_id) {
+            Ok(Some(row)) => {
+                let in_flight = match state.in_flight_run_step(&instance_id) {
+                    Ok(step) => step,
+                    Err(err) => return err_response(&request.id, err.code, err.message),
+                };
+                let digest = if row.paused || row.pause_requested {
+                    Some(row.resume_digest.clone())
+                } else {
+                    None
+                };
+                ok_response(
+                    &request.id,
+                    crate::run_control::control_doc(&row, in_flight.as_deref(), digest.as_deref()),
+                )
+            }
+            Ok(None) => err_response(
+                &request.id,
+                "state.not_found",
+                format!("no run {instance_id:?} exists"),
             ),
             Err(err) => err_response(&request.id, err.code, err.message),
         },
@@ -5929,6 +6442,13 @@ fn reconcile_claims(
                 {
                     reconcile_queue_submission(state, log, params)?;
                 }
+                // Issue #86: an interrupted run-control claim reconciles
+                // against its commit marker — the run's durable control
+                // rows. The readback says whether the control committed;
+                // nothing is ever repeated and nothing is ever signalled.
+                if claim.method.starts_with("run.") {
+                    reconcile_run_control(state, log, &claim)?;
+                }
             }
             Err(err) => {
                 return Err(daemon_error(
@@ -6571,6 +7091,87 @@ fn reconcile_queue_submission(
             "submission {submission_id} was committed before the interrupt ({admitted} admitted \
              / {waiting} waiting / {refused} refused); the durable readback is verified against \
              its digest binding and no effect is repeated"
+        ),
+    );
+    Ok(())
+}
+
+/// Read back one interrupted run-control claim (issue #86). The control's
+/// effect is a durable row on the run (`pause_requested`/`paused` for
+/// pause and resume, a `run_retries` row for retry), so the readback says
+/// whether the control committed — nothing is ever re-executed, repeated
+/// or signalled.
+fn reconcile_run_control(
+    state: &State,
+    log: &DaemonLog,
+    claim: &crate::state::ClaimRow,
+) -> Result<(), DaemonError> {
+    let doc = Val::parse_json(&claim.request_line).map_err(|message| {
+        daemon_error(
+            "daemon.reconcile",
+            format!(
+                "claim {} has an unreadable request line: {message}",
+                claim.key
+            ),
+        )
+    })?;
+    let params = doc.get("params").cloned().unwrap_or_else(null);
+    let instance_id = params
+        .get("instance_id")
+        .and_then(Val::as_str)
+        .unwrap_or("")
+        .to_string();
+    if instance_id.is_empty() {
+        log.write(
+            "warn",
+            "reconcile.run-control",
+            &format!(
+                "claim {} ({}) names no instance; the interrupted control committed nothing",
+                claim.key, claim.method
+            ),
+        );
+        return Ok(());
+    }
+    let run = state.instance_by_id(&instance_id).map_err(|err| {
+        daemon_error("daemon.reconcile", format!("{}: {}", err.code, err.message))
+    })?;
+    let Some(run) = run else {
+        log.write(
+            "warn",
+            "reconcile.run-control",
+            &format!(
+                "claim {} ({}) targeted run {instance_id}, which no longer exists; the \
+                 interrupted control committed nothing",
+                claim.key, claim.method
+            ),
+        );
+        return Ok(());
+    };
+    let committed = match claim.method.as_str() {
+        "run.pause" => run.paused || run.pause_requested,
+        "run.resume" => !run.paused && !run.pause_requested,
+        "run.retry" => state
+            .run_retries(&instance_id)
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(false),
+        _ => false,
+    };
+    log.write(
+        "warn",
+        "reconcile.run-control",
+        &format!(
+            "claim {} ({}) on run {instance_id}: {} (control state {}, paused {}, \
+             pause_requested {}); no control is ever repeated",
+            claim.key,
+            claim.method,
+            if committed {
+                "committed before the interrupt"
+            } else {
+                "never committed"
+            },
+            crate::run_control::control_state(&run),
+            run.paused,
+            run.pause_requested
         ),
     );
     Ok(())
