@@ -65,6 +65,11 @@ impl Val {
         }
     }
 
+    /// Whether this value is null (JSON `null` / absent TOML key).
+    pub fn is_null(&self) -> bool {
+        matches!(self, Val::Null)
+    }
+
     /// Borrow this value as a string, if it is one.
     pub fn as_str(&self) -> Option<&str> {
         match self {

@@ -18,6 +18,7 @@ pub mod daemon;
 pub mod dirs;
 pub mod engine;
 pub mod formats;
+pub mod handoff;
 pub mod lifecycle;
 pub mod lock;
 pub mod mutation;
@@ -30,6 +31,7 @@ pub mod schema;
 pub mod service;
 pub mod state;
 pub mod time;
+pub mod tui;
 pub mod value;
 
 /// The package name, taken from Cargo metadata at compile time.

@@ -130,6 +130,23 @@ through a workaround.
 Never present `plan` output as applied work — plans are read-only
 renderings until an authorized grant + daemon `apply` executes them.
 
+## Lane handoff (thin client, read-only preview/status + one authorized record)
+
+- `canter lane preview ...` renders the reviewable `hf-lane-handoff/v1`
+  plan for ONE lane (source identity, target profile plan via `--profile
+  KEY`, repository-relative worktree, effect boundaries, retained
+  workers/reviewers/gates, plan digest). Read-only; works without a daemon.
+- `canter lane request ...` records ONE durable replacement request. The
+  authorization binds the exact plan digest: `--confirm-digest <64-hex>`
+  (noninteractive) or `--confirm` (type the digest; prompt on stderr). A
+  digest that no longer matches the plan refuses `refusal.plan.stale`
+  before any daemon call. A blanket `--yes` is refused under a declared
+  policy overlay (`production_confirmation = "tty" | "deny"`).
+- `canter lane status --replacement rp_... | --lane ID --generation N`
+  reads phase/outcome/blocker, intended vs actual binding, the last
+  verified transition, the next supported action and guidance. Read-only.
+  Never prompts; `--json` is exactly one `hf-output/v1` document.
+
 ## Plan digest + grant flow (mutations, #8 semantics)
 
 - The digest binds the plan: same inputs → same canonical bytes → same

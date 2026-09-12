@@ -288,17 +288,27 @@ line here; the full runbook is [docs/OPERATIONS.md](docs/OPERATIONS.md).
 8. **Service install-plan** (Day 2): render the per-user systemd/launchd unit
    plan; a human executes the printed steps.
    `canter service install-plan --json` — see OPERATIONS §5.1.
+9. **Lane handoff** (thin client over the merged handoff path): preview one
+   exact lane's replacement plan read-only, authorize and record the request
+   with the reviewed plan digest, then inspect the record read-only.
+   `canter lane preview ...`, `canter lane request ... --confirm-digest <hex>`,
+   `canter lane status --replacement rp_...` — see OPERATIONS §11.
 
 ## Status and boundaries
 
 What exists today, in plain order:
 
-- **The CLI is read-only.** `config init|validate|show`, `doctor`, `status`,
-  `plan`, `capabilities`, and the `service *-plan` commands observe and render;
-  they never install/start/stop Herdr, mutate a repository, or store
-  credentials. Issue [#3](https://github.com/jirathip-dev/canter/issues/3)
-  (contracts) and [#4](https://github.com/jirathip-dev/canter/issues/4)
-  (read-only core).
+- **The CLI is read-only except for one authorized record.** `config
+  init|validate|show`, `doctor`, `status`, `plan`, `capabilities`, the
+  `service *-plan` commands and `lane preview` / `lane status` observe and
+  render; `lane request` records ONE durable lane-replacement request after
+  binding the exact plan digest (with no spawn, kill, Git, grant, or resume
+  effect). No CLI command installs/starts/stops Herdr, mutates a repository
+  or session, or stores credentials. Issue
+  [#3](https://github.com/jirathip-dev/canter/issues/3) (contracts),
+  [#4](https://github.com/jirathip-dev/canter/issues/4) (read-only core) and
+  [#78](https://github.com/jirathip-dev/canter/issues/78) (the lane
+  preview/request/status surface).
 - **The daemon is a single-writer local state server** (issue
   [#5](https://github.com/jirathip-dev/canter/issues/5)): per-user flock,
   migrated SQLite state, audit/event journals, backup/restore hooks, one Unix
@@ -311,7 +321,9 @@ What exists today, in plain order:
   path is the daemon `apply` RPC over the local socket — one typed,
   digest-bound, capability-gated plan step per request, executed against an
   authorized route grant + instance and journaled before the effect. The CLI
-  has no mutation command; `plan` renders only. Durable review evidence and
+  has no mutation command for these effects (`plan` renders only; the one
+  other record path is the explicitly authorized `lane request` request
+  record, OPERATIONS §11). Durable review evidence and
   recorded first-write approvals live in
   [spec-plans.md](docs/contracts/spec-plans.md) and
   [spec-daemon.md](docs/contracts/spec-daemon.md). This is a single-operator

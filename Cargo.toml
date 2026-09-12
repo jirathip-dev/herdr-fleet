@@ -34,6 +34,8 @@ toml = "0.8"
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 fs2 = "0.4.3"
 libc = "0.2"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = "0.29.0"
 
 [dev-dependencies]
 # Reference JSON parser used only to cross-check the crate's own strict

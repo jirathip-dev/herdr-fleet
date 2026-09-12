@@ -409,10 +409,14 @@ Failure → remedy:
 
 ## 6. Grant-gated mutations (daemon `apply` — RPC only)
 
-Boundary: the CLI surface is read-only. There is **no** CLI subcommand that
-mutates; the only mutation path is the daemon `apply` RPC over the local
-socket (issue #8 semantics, [spec-plans.md](contracts/spec-plans.md),
-[spec-daemon.md](contracts/spec-daemon.md)). The material below is the operator
+Boundary: the CLI surface is read-only for repository, session, and
+external effects. The only mutation paths are the daemon `apply` RPC over
+the local socket (issue #8 semantics, [spec-plans.md](contracts/spec-plans.md),
+[spec-daemon.md](contracts/spec-daemon.md)) and the explicitly authorized
+`canter lane request` record (section 11) — the latter records a durable
+request and has no spawn, kill, signal, Git, grant, or resume effect.
+There is **no** CLI subcommand that mutates repositories, sessions, or
+external state. The material below is the operator
 workflow in terms of the documented contract and is **synthetic guidance**:
 this repository never mutates real repositories, fleets, or external state,
 and its tests use disposable local repositories and fakes only.
@@ -607,6 +611,111 @@ single normative list is the
 
 ---
 
+## 11. Lane handoff for ONE explicit lane: preview / request / status
+
+Boundary: this surface is **thin and read-only except for one explicitly
+authorized request record**. `canter lane preview` and `canter lane status`
+perform no mutation at all — they may issue only the read-only
+`lane.replacement.status` / `lane.checkpoint.status` reads (a closed
+allowlist guard refuses any other method before a socket is opened), they
+never prompt, and they never advance a record. `canter lane request`
+records **one durable replacement request** at phase `requested`; it never
+spawns, kills, signals, touches Git, issues a grant, resumes a paused
+fleet, or performs any of the handoff's later effects (checkpoint,
+retirement, start, adoption — those remain the daemon RPCs documented in
+[spec-daemon.md](contracts/spec-daemon.md)).
+
+Workflow: **preview → authorize → request → inspect**, always for ONE
+exact lane (a `--lane` slug + `--generation`, or a `--replacement` id).
+
+1. **Preview** (read-only). Render the reviewable plan:
+
+       canter lane preview --lane lane-0001 --generation 1 \
+         --session sess-1 --process proc-1 --role implementer \
+         --worktree worktrees/issues/78 --reason 'rotate the implementer lane' \
+         --profile lane-harness --json
+
+   The `hf-lane-handoff/v1` plan shows: the source identity
+   (session/process/role/generation), the target profile plan
+   (`--profile KEY` derives the reviewed `hf-profile-binding/v1` document
+   from the configuration — the same plan `canter config show` previews,
+   revision included; a changed configuration or credential produces a new
+   revision), the repository-relative worktree, the closed effect-boundary
+   chain, the retained workers/reviewers/pending gates (captured at the
+   `checkpointed` boundary; the committed checkpoint's references are shown
+   when one exists), the authorization requirement derived from the policy
+   overlay, and the **plan digest** (sha256 over the plan inputs and the
+   bound profile document).
+
+2. **Authorize.** The authorization binds the exact plan digest. Either
+   path binds the SAME digest:
+   - noninteractive explicit: pass the digest from the preview,
+     `--confirm-digest <64-hex>`;
+   - human confirmation: `--confirm` prints the digest to stderr and the
+     human types it (an empty line or `abort` refuses; a different digest
+     refuses as a stale plan).
+
+   A blanket `--yes` authorizes without binding the content and is
+   **refused** whenever the policy overlay declares a
+   `production_confirmation` rule: `tty` requires the digest
+   (`refusal.confirmation.policy`), `deny` refuses every mode
+   (`refusal.policy.production`). The overlay can only tighten.
+
+3. **Request.**
+
+       canter lane request --lane lane-0001 --generation 1 \
+         --session sess-1 --process proc-1 --role implementer \
+         --worktree worktrees/issues/78 --reason 'rotate the implementer lane' \
+         --confirm-digest <64-hex> --profile lane-harness
+
+   Records the record at phase `requested` (daemon
+   `lane.replacement.request`). Automation that needs replay semantics
+   passes `--idempotency-key ik_...`; otherwise a fresh key is generated
+   per invocation. A second request for the same lane generation is the
+   daemon's typed `refusal.replacement.exists` — a record is never
+   silently overwritten.
+
+4. **Inspect** (read-only). `canter lane status` reads the record, its
+   exact transition history and the committed checkpoint:
+
+       canter lane status --replacement rp_0123456789abcdef --json
+       canter lane status --lane lane-0001 --generation 1
+
+   The output carries `phase`, `outcome`, `blocker` (the recorded
+   non-pending reason), `intended` (the bound profile revision and
+   provider/model), `actual` (the successor verification evidence; an
+   unsupported introspection stays `unknown` with a null pair — never a
+   copy of the intended), `last_transition`, `next` (the next allowed
+   transition and the daemon operation that performs it; this CLI slice
+   exposes preview/request/status only) and `guidance`.
+
+**Guidance for the four parked scenarios** (all read-only; nothing is
+signalled, killed, or resumed by the CLI):
+
+| Scenario | What status reports | Guidance names |
+| --- | --- | --- |
+| Ambiguous retirement | `outcome: ambiguous` + the recorded reconcile reason | external reconciliation is required before it can advance; re-inspect with `canter lane status` |
+| Capacity hold (record at `retired`) | `phase: retired`, `next.phase: starting` | the admission refusals (`refusal.admission.cap_global` / `cap_repository` / `cap_harness`) hold without a state change: free capacity and retry the same start; the bounded attempt counter refuses `refusal.successor.attempts` |
+| Failed adoption | `phase: adopting`, or `ambiguous` after a parked failure | a differing re-query refuses (`refusal.successor.differs`) and is never replayed as success; re-inspect with `canter lane status` |
+| Unknown model binding | `actual.status: unknown` with null provider/model | the bound profile declares no binding introspection; the actual is never copied from the intended — re-inspect, or start a new generation under a profile that declares introspection |
+
+**While the fleet is PAUSED** (its automation schedule durably disabled):
+`canter lane status` stays useful and `canter lane request` still records
+the request, but no CLI path enables a schedule, advances a record, starts
+a successor, or otherwise resumes anything — there is no hidden
+auto-resume.
+
+**JSON contract.** `--json` writes exactly one `hf-output/v1` document to
+stdout (diagnostics go to stderr) and never prompts: a missing
+authorization is the typed usage refusal `usage.confirmation_required`
+(exit 2); `--confirm` is refused with `--json`. Exit codes: 0 ok; 1
+daemon/transport error (`daemon.absent` / `daemon.stale` / `client.read`
+on the bounded 15s read deadline); 2 usage; 4 refusal (`refusal.plan.stale`,
+`refusal.confirmation.policy`, `refusal.policy.production`, the daemon's
+typed refusals, `state.not_found`); 5 config/policy error (e.g. `--profile`
+naming an unknown or unbound harness). The human rendering carries the
+same digest, phase, bindings, transition, next action and error code.
+
 ## Appendix: command/exit summary
 
 | Command | Read-only? | Typical exit |
@@ -618,5 +727,7 @@ single normative list is the
 | `capabilities` | yes | 0 |
 | `daemon run` | local state server (no fleet/external mutation) | foreground; 1 when another daemon holds the lock |
 | `daemon status` | yes | 0 live; 1 `daemon.absent`/`daemon.stale` |
+| `lane preview` / `lane status` | yes (read-only reads only; no mutation, no prompt) | 0; 1 daemon/transport (incl. bounded read timeout); 4 `state.not_found`/daemon refusals; 5 config errors |
+| `lane request` | records ONE authorized request (no spawn/kill/Git/grant; never resumes a paused fleet) | 0; 1 daemon/transport; 2 usage; 4 refusals (`refusal.plan.stale`, `refusal.confirmation.policy`, `refusal.policy.production`, daemon refusals); 5 config errors |
 | `service doctor` / `install-plan` / `status-plan` / `uninstall-plan` | yes (plans only) | 0 |
 | daemon `apply` RPC | **grant-gated mutation** (one digest-bound plan step per request, idempotency-keyed) | typed `hf-outcome/v1`; refusals are typed and never downgraded |
