@@ -664,3 +664,333 @@ fn no_other_key_authorizes_and_cancellation_writes_nothing() {
         "cancellation performs no write"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Real terminal: the operator path through a pseudo-terminal
+// ---------------------------------------------------------------------------
+
+/// Markers + paths the PTY child reads; set only for the re-executed child,
+/// so a normal test run is untouched.
+const CHILD_MARKER: &str = "CANTER_OPERATOR_PTY_CHILD";
+const CHILD_DB: &str = "CANTER_OPERATOR_PTY_DB";
+const CHILD_SOCKET: &str = "CANTER_OPERATOR_PTY_SOCKET";
+const CHILD_PLAN: &str = "CANTER_OPERATOR_PTY_PLAN";
+
+/// Child entry: re-executed under a real pseudo-terminal by the PTY test.
+///
+/// A no-op in a normal run (the marker is absent). The PTY test selects this
+/// test by name with `--exact`, so the child runs exactly one thing: the real
+/// operator session over the real daemon socket and the reviewed plan file.
+#[test]
+fn pty_child_operator_entry() {
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        return;
+    }
+    let db = std::env::var(CHILD_DB).expect("child state path");
+    let socket = std::env::var(CHILD_SOCKET).expect("child socket path");
+    let plan = std::env::var(CHILD_PLAN).expect("child plan path");
+    let state = State::open(Path::new(&db), Retention::default()).expect("child state store");
+    let bound = Val::parse_json(&std::fs::read_to_string(&plan).expect("child plan"))
+        .expect("reviewed plan document");
+    let mut run = PresentedRun::new("reviewed-run-plan", bound, caps());
+    run.host_available = Some(true);
+    run.harness_lanes = Some(0);
+    run.grants = vec![ItemGrant {
+        id: "5".to_string(),
+        grant_id: grant_id(),
+    }];
+    let mut console =
+        OperatorConsole::new(&state, PathBuf::from(socket), Some(config()), Some(run));
+    canter::tui::session::run_operator(&mut console).expect("the operator session runs");
+}
+
+#[test]
+fn a_real_terminal_selects_previews_authorizes_and_starts_a_daemon_owned_run() {
+    let fixture = Fixture::seeded("pty-run");
+    let daemon = fixture.spawn();
+    wait_ready(&fixture);
+    let state = fixture.open();
+    // The reviewed plan material is presented as a document (the shape
+    // `queue submit --request` reads): the child loads it, never rebuilds it.
+    let plan_path = fixture.dir.join("reviewed-plan.json");
+    std::fs::write(
+        &plan_path,
+        canter::canonical::canonical_text(&bound(&state)),
+    )
+    .expect("plan file");
+    let db = fixture.db().to_str().expect("utf-8 path").to_string();
+    let socket = fixture.socket.to_str().expect("utf-8 path").to_string();
+    let plan = plan_path.to_str().expect("utf-8 path").to_string();
+
+    let run = pty::run(
+        &[
+            (CHILD_MARKER, "1"),
+            (CHILD_DB, db.as_str()),
+            (CHILD_SOCKET, socket.as_str()),
+            (CHILD_PLAN, plan.as_str()),
+            ("TERM", "xterm-256color"),
+        ],
+        &[
+            "--nocapture",
+            "--test-threads",
+            "1",
+            "--exact",
+            "pty_child_operator_entry",
+        ],
+        // j (select the recorded run), p (exact preview), Enter (continue),
+        // Space (explicit authorization), Enter (authorize), q (quit).
+        b"jp\x0d \x0dq",
+    )
+    .expect("pty run");
+
+    let text = strip_ansi(&run.output);
+    for line in text.lines().take(24) {
+        println!("|{line}|");
+    }
+    assert_eq!(run.exit_code, 0, "captured frame:\n{text}");
+    assert!(
+        contains_content(&text, "Canter operator board"),
+        "the board frame: {text}"
+    );
+    assert!(
+        contains_content(&text, "PREVIEW"),
+        "the preview frame: {text}"
+    );
+    assert!(
+        contains_content(&text, "AUTHORIZATION SCOPE"),
+        "the authorization scope: {text}"
+    );
+    // The unchecked authorization box is in the emitted frame. The checked
+    // state ([x]) is a one-cell diff, so a real terminal receives only the
+    // changed cell — it is pinned by the fixed-size frame test above
+    // (`the_screens_render_the_exact_plan_the_scope_and_the_observed_facts`).
+    assert!(contains_content(&text, "[ ] authorize"), "{text}");
+
+    // The run the terminal authorized is daemon-owned and REAL: the daemon
+    // holds the submission, the admitted run and the single ownership row,
+    // and the id the terminal displayed is the id the durable row names.
+    let ownership = state.queue_ownership_rows().expect("ownership");
+    assert_eq!(ownership.len(), 1, "exactly one admitted owner");
+    let submission_id = ownership[0].submission_id.clone();
+    let displayed: Vec<String> = text
+        .split("qs_")
+        .skip(1)
+        .map(|tail| tail.chars().take(16).collect::<String>())
+        .collect();
+    assert!(
+        contains_content(&text, "admitted"),
+        "the observed admission: {text}"
+    );
+    let expected_id = submission_id.trim_start_matches("qs_").to_string();
+    assert!(
+        displayed.contains(&expected_id),
+        "the outcome frame must carry the committed submission id {submission_id}: {text}"
+    );
+    let doc = rpc_ok(
+        &fixture.socket,
+        "cccccccccccccccc",
+        "queue.status",
+        Some(object(vec![("submission_id", string(&submission_id))])),
+    );
+    let item = item_of(&doc, 5);
+    assert_eq!(item.get("status").and_then(Val::as_str), Some("admitted"));
+    assert_ne!(
+        item.get("instance_id").and_then(Val::as_str),
+        Some(SEEDED_RUN)
+    );
+    assert_eq!(state.list_instances().expect("instances").len(), 2);
+
+    shutdown(daemon);
+}
+
+/// Minimal real pseudo-terminal harness (the `tests/tui_live_wiring.rs`
+/// shape): `forkpty` gives the child a genuine controlling terminal, which is
+/// what Crossterm's raw-mode path needs; the parent captures every byte the
+/// terminal emits and writes the key bytes back once the first frame is
+/// drawn.
+mod pty {
+    use std::ffi::CString;
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::{Duration, Instant};
+
+    /// Wall-clock budget for one child (bounded; a live child is killed).
+    const DEADLINE: Duration = Duration::from_secs(45);
+    /// Budget for the first frame before the child is treated as wedged.
+    const FIRST_FRAME: Duration = Duration::from_secs(20);
+    const WIN_ROWS: u16 = 40;
+    const WIN_COLS: u16 = 120;
+    const TITLE: &[u8] = b"Canter operator board";
+
+    pub struct Run {
+        pub output: Vec<u8>,
+        pub exit_code: i32,
+    }
+
+    fn invalid(what: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, what.to_string())
+    }
+
+    pub fn run(env: &[(&str, &str)], argv_tail: &[&str], keys: &[u8]) -> io::Result<Run> {
+        let exe = std::env::current_exe()?;
+        let mut argv_strings =
+            vec![CString::new(exe.as_os_str().as_bytes()).map_err(|_| invalid("executable path"))?];
+        for arg in argv_tail {
+            argv_strings.push(CString::new(*arg).map_err(|_| invalid("argument"))?);
+        }
+        let mut env_strings = Vec::with_capacity(env.len());
+        for (key, value) in env {
+            env_strings
+                .push(CString::new(format!("{key}={value}")).map_err(|_| invalid("environment"))?);
+        }
+        let argv: Vec<*const libc::c_char> = argv_strings
+            .iter()
+            .map(|arg| arg.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        let envp: Vec<*const libc::c_char> = env_strings
+            .iter()
+            .map(|value| value.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+
+        let mut winsize = libc::winsize {
+            ws_row: WIN_ROWS,
+            ws_col: WIN_COLS,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // The libc signature takes `*mut winsize` on BSD/macOS and
+        // `*const winsize` on Linux; an explicit raw pointer satisfies both.
+        let winsize_ptr: *mut libc::winsize = &raw mut winsize;
+        let mut master: libc::c_int = -1;
+        // SAFETY: `forkpty` is the POSIX pseudo-terminal fork; the child only
+        // execve/_exit before replacing its image.
+        let pid = unsafe {
+            libc::forkpty(
+                &mut master,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                winsize_ptr,
+            )
+        };
+        if pid < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if pid == 0 {
+            // SAFETY: exec with the argv/envp built above; on failure the
+            // child must not run the test harness, so it exits immediately.
+            unsafe {
+                libc::execve(argv[0], argv.as_ptr(), envp.as_ptr());
+                libc::_exit(127);
+            }
+        }
+
+        let started = Instant::now();
+        let mut output: Vec<u8> = Vec::new();
+        let mut keys_sent = false;
+        let mut quiet = 0_u32;
+        let mut status: Option<libc::c_int> = None;
+        while started.elapsed() < DEADLINE {
+            let mut pollfd = libc::pollfd {
+                fd: master,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut pollfd, 1, 100) };
+            let mut read_bytes = 0_usize;
+            if ready > 0 && pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                let mut buffer = [0_u8; 8192];
+                let count = unsafe { libc::read(master, buffer.as_mut_ptr().cast(), buffer.len()) };
+                if count > 0 {
+                    read_bytes = count as usize;
+                    output.extend_from_slice(&buffer[..read_bytes]);
+                }
+            }
+            if !keys_sent && output.windows(TITLE.len()).any(|window| window == TITLE) {
+                // The first frame is drawn, so the session is already in raw
+                // mode: the keys arrive as keystrokes, without Enter.
+                let written = unsafe { libc::write(master, keys.as_ptr().cast(), keys.len()) };
+                if written < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                keys_sent = true;
+            }
+            if !keys_sent && started.elapsed() > FIRST_FRAME {
+                break;
+            }
+            quiet = if read_bytes > 0 { 0 } else { quiet + 1 };
+            if status.is_none() {
+                let mut raw: libc::c_int = 0;
+                if unsafe { libc::waitpid(pid, &mut raw, libc::WNOHANG) } == pid {
+                    status = Some(raw);
+                }
+            }
+            if status.is_some() && quiet >= 2 {
+                break;
+            }
+        }
+        if status.is_none() {
+            // Bounded: never leave a live child behind.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            let mut raw: libc::c_int = 0;
+            unsafe {
+                libc::waitpid(pid, &mut raw, 0);
+            }
+            status = Some(raw);
+        }
+        unsafe {
+            libc::close(master);
+        }
+        let raw = status.unwrap_or(-1);
+        let exit_code = if libc::WIFEXITED(raw) {
+            libc::WEXITSTATUS(raw)
+        } else {
+            -1
+        };
+        Ok(Run { output, exit_code })
+    }
+}
+
+/// Strip ANSI escape sequences from a captured terminal stream.
+fn strip_ansi(bytes: &[u8]) -> String {
+    let mut text: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != 0x1b {
+            text.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        match bytes.get(index) {
+            Some(b'[') => {
+                index += 1;
+                while index < bytes.len() && !(0x40..=0x7e).contains(&bytes[index]) {
+                    index += 1;
+                }
+                index += 1;
+            }
+            Some(b']') => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != 0x07 {
+                    index += 1;
+                }
+                index += 1;
+            }
+            Some(b'(') | Some(b')') => index += 2,
+            _ => index += 1,
+        }
+    }
+    String::from_utf8_lossy(&text).into_owned()
+}
+
+/// Whether a captured frame carries `needle`, ignoring whitespace: a real
+/// terminal legitimately receives fewer bytes than the cell grid (Ratatui's
+/// diff skips blank default cells), so PTY assertions compare content.
+fn contains_content(text: &str, needle: &str) -> bool {
+    let squash = |value: &str| -> String { value.chars().filter(|c| !c.is_whitespace()).collect() };
+    squash(text).contains(&squash(needle))
+}
