@@ -1708,6 +1708,26 @@ fn status_reports_phase_bindings_next_action_and_guidance() {
             .any(|line| line.as_str().unwrap_or_default().contains("UNKNOWN")),
         "the unknown-binding guidance is present"
     );
+    // The human rendering agrees with the JSON nulls: the unreported pair is
+    // never rendered as a value.
+    let human_adopting = fixture.lane(
+        "status",
+        "lane-cli-10",
+        "implementer",
+        &["--replacement", &replacement_id],
+        None,
+    );
+    assert_eq!(
+        exit_of(&human_adopting),
+        0,
+        "{}",
+        stderr_text(&human_adopting)
+    );
+    assert!(
+        stdout_text(&human_adopting).contains("actual: unknown (not reported/not reported)"),
+        "the unreported actual pair is explicit, never a value: {}",
+        stdout_text(&human_adopting)
+    );
 
     // The adoption completes at the same boundary (nothing here is the CLI's
     // doing — the CLI only reads).
@@ -1833,6 +1853,206 @@ fn ambiguous_retirement_is_reported_with_reconciliation_guidance() {
 
     // A failed adoption is the SAME durable park: the status contract
     // reports it identically.
+    shutdown(restarted);
+}
+
+// ---------------------------------------------------------------------------
+// Fix round #78-R1: the human status rendering carries the RECORDED blocker
+// exactly as the JSON document does (held / ambiguous / cancelled records)
+// ---------------------------------------------------------------------------
+
+fn hold_record(socket: &Path, id: &str, replacement_id: &str, reason: &str) {
+    rpc_ok(
+        socket,
+        id,
+        "lane.replacement.hold",
+        Some(object(vec![
+            ("idempotency_key", string(&format!("ik_hold-{id}"))),
+            ("replacement_id", string(replacement_id)),
+            ("reason", string(reason)),
+        ])),
+    );
+}
+
+fn cancel_record(socket: &Path, id: &str, replacement_id: &str, reason: &str) {
+    rpc_ok(
+        socket,
+        id,
+        "lane.replacement.cancel",
+        Some(object(vec![
+            ("idempotency_key", string(&format!("ik_cancel-{id}"))),
+            ("replacement_id", string(replacement_id)),
+            ("reason", string(reason)),
+        ])),
+    );
+}
+
+fn retire_request_params(id: &str, replacement_id: &str, digest: &str) -> Val {
+    object(vec![
+        ("idempotency_key", string(&format!("ik_retire-{id}"))),
+        ("replacement_id", string(replacement_id)),
+        (
+            "binding",
+            retirement_binding(1, SOURCE_SESSION, SOURCE_PROCESS, digest),
+        ),
+        (
+            "recheck",
+            retirement_recheck(SOURCE_SESSION, Some(SOURCE_PROCESS), &[], false),
+        ),
+        ("harness", harness_pi()),
+    ])
+}
+
+/// Assert that the human `lane status` rendering and the JSON document agree
+/// on the recorded blocker — exactly, with no `unknown` substitution.
+fn assert_blocker_agreement(fixture: &Fixture, replacement_id: &str, recorded: &str) {
+    let json = fixture.lane(
+        "status",
+        "lane-blocker-probe",
+        "implementer",
+        &["--replacement", replacement_id, "--json"],
+        None,
+    );
+    assert_eq!(exit_of(&json), 0, "{}", stderr_text(&json));
+    let doc = stdout_json(&json);
+    let blocker = data(&doc)
+        .get("blocker")
+        .and_then(Val::as_str)
+        .expect("a recorded blocker is carried as a string");
+    assert_eq!(blocker, recorded, "the JSON carries the recorded reason");
+
+    let human = fixture.lane(
+        "status",
+        "lane-blocker-probe",
+        "implementer",
+        &["--replacement", replacement_id],
+        None,
+    );
+    assert_eq!(exit_of(&human), 0, "{}", stderr_text(&human));
+    let rendered = stdout_text(&human);
+    assert!(
+        rendered.contains(&format!("blocker: {recorded}")),
+        "the human rendering carries the recorded blocker exactly: {rendered}"
+    );
+    assert!(
+        !rendered.contains("blocker: unknown"),
+        "a recorded blocker is never substituted with `unknown`: {rendered}"
+    );
+}
+
+#[test]
+fn human_and_json_agree_on_the_recorded_blocker() {
+    let mut fixture = Fixture::new("blocker-parity");
+    fixture.write_config(HARNESS_KEY, PROVIDER, MODEL, None);
+    fixture.write_fake_workspace();
+    fixture.set_source_mode("live");
+    let mut daemon = fixture.spawn(Some("lane-retire.after-stop"));
+    wait_ready(&fixture);
+
+    // A HELD record with a recorded reason (outcome `held`).
+    let held = request_replacement(
+        &fixture.socket,
+        60,
+        "lane-cli-held",
+        "implementer",
+        "ik_held-0001",
+    );
+    hold_record(
+        &fixture.socket,
+        &fresh_id(61),
+        &held,
+        "operator hold: capacity review",
+    );
+    // A CANCELLED record with a recorded reason (outcome `cancelled`).
+    let cancelled = request_replacement(
+        &fixture.socket,
+        62,
+        "lane-cli-cancelled",
+        "implementer",
+        "ik_cancelled-0001",
+    );
+    cancel_record(
+        &fixture.socket,
+        &fresh_id(63),
+        &cancelled,
+        "invalidated: the lane was re-scoped",
+    );
+    // An interrupted retirement: parked `ambiguous` by the restart
+    // reconciliation (the source session is still present).
+    let (ambiguous, digest) = checkpointed_record(
+        &fixture.socket,
+        64,
+        "lane-cli-amb",
+        "implementer",
+        None,
+        "cli-blocker",
+    );
+    let retire_params = retire_request_params(&fresh_id(65), &ambiguous, &digest);
+    let mut connection = Connection::open(&fixture.socket).expect("connect");
+    connection
+        .send_request(&fresh_id(65), "lane.retire", Some(&retire_params))
+        .expect("send retire");
+    wait_crash(&mut daemon);
+    let restarted = fixture.spawn(None);
+    wait_ready(&fixture);
+
+    // Held: the human rendering carries the recorded reason verbatim.
+    let held_status = status_of(&fixture.socket, 66, &held);
+    assert_eq!(
+        field_str(
+            held_status.get("replacement").expect("replacement"),
+            "outcome"
+        ),
+        "held"
+    );
+    assert_blocker_agreement(&fixture, &held, "operator hold: capacity review");
+
+    // Cancelled: likewise.
+    let cancelled_status = status_of(&fixture.socket, 67, &cancelled);
+    assert_eq!(
+        field_str(
+            cancelled_status.get("replacement").expect("replacement"),
+            "outcome"
+        ),
+        "cancelled"
+    );
+    assert_blocker_agreement(&fixture, &cancelled, "invalidated: the lane was re-scoped");
+
+    // Ambiguous retirement: the reconcile reason is the recorded blocker.
+    let ambiguous_status = status_of(&fixture.socket, 68, &ambiguous);
+    let ambiguous_reason = field_str(
+        ambiguous_status.get("replacement").expect("replacement"),
+        "outcome_reason",
+    )
+    .to_string();
+    assert!(
+        ambiguous_reason.contains("ambiguous"),
+        "the interrupted retirement is parked ambiguous: {ambiguous_reason}"
+    );
+    assert_blocker_agreement(&fixture, &ambiguous, &ambiguous_reason);
+
+    // The genuinely-absent case stays explicitly honest (no blanket
+    // `unknown`): a pending record renders `blocker: none`.
+    let pending = request_replacement(
+        &fixture.socket,
+        69,
+        "lane-cli-pending",
+        "implementer",
+        "ik_pending-0001",
+    );
+    let human = fixture.lane(
+        "status",
+        "lane-blocker-probe",
+        "implementer",
+        &["--replacement", &pending],
+        None,
+    );
+    assert_eq!(exit_of(&human), 0, "{}", stderr_text(&human));
+    assert!(
+        stdout_text(&human).contains("blocker: none"),
+        "an absent blocker stays an explicit none: {}",
+        stdout_text(&human)
+    );
     shutdown(restarted);
 }
 

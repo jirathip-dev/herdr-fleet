@@ -2474,6 +2474,16 @@ fn render_lane_request_human(data: &Val) -> String {
     lines.join("\n") + "\n"
 }
 
+/// The human text of one scalar document value: strings render verbatim;
+/// any other value renders as its canonical JSON text, so a recorded value is
+/// never silently replaced by a fallback word.
+fn human_value(value: &Val) -> String {
+    match value {
+        Val::Str(text) => text.clone(),
+        other => crate::canonical::canonical_text(other),
+    }
+}
+
 /// The human rendering of one status document.
 fn render_lane_status_human(document: &Val) -> String {
     let replacement = document.get("replacement").cloned().unwrap_or_else(null);
@@ -2504,12 +2514,18 @@ fn render_lane_status_human(document: &Val) -> String {
             text(document, "outcome")
         ),
     ];
-    lines.push(
-        match document.get("blocker").filter(|blocker| !blocker.is_null()) {
-            Some(blocker) => format!("blocker: {}", text(blocker, "blocker")),
-            None => "blocker: none".to_string(),
-        },
-    );
+    // The recorded blocker is a plain string in the status document (the
+    // exact `outcome_reason` JSON carries): render it verbatim, never
+    // through a key lookup with a fallback word. The genuinely-absent case
+    // stays an explicit, state-tied rendering.
+    let blocker = match document.get("blocker") {
+        Some(blocker) if !blocker.is_null() => human_value(blocker),
+        _ if document.get("outcome").and_then(Val::as_str) == Some("pending") => {
+            "none (outcome pending)".to_string()
+        }
+        _ => "none recorded".to_string(),
+    };
+    lines.push(format!("blocker: {blocker}"));
     lines.push(
         match document.get("intended").filter(|value| !value.is_null()) {
             Some(intended) => format!(
@@ -2523,18 +2539,24 @@ fn render_lane_status_human(document: &Val) -> String {
     );
     lines.push(
         match document.get("actual").filter(|value| !value.is_null()) {
-            Some(actual) => format!(
-                "actual: {} ({}/{})",
-                text(actual, "status"),
-                actual
-                    .get("provider")
-                    .and_then(Val::as_str)
-                    .unwrap_or("unknown"),
-                actual
-                    .get("model")
-                    .and_then(Val::as_str)
-                    .unwrap_or("unknown")
-            ),
+            Some(actual) => {
+                // A null pair means the read-back reported nothing — render
+                // it as unreported, never as a value.
+                let pair = |key: &str| -> String {
+                    actual
+                        .get(key)
+                        .and_then(Val::as_str)
+                        .filter(|text| !text.is_empty())
+                        .unwrap_or("not reported")
+                        .to_string()
+                };
+                format!(
+                    "actual: {} ({}/{})",
+                    text(actual, "status"),
+                    pair("provider"),
+                    pair("model")
+                )
+            }
             None => "actual: no successor verification recorded".to_string(),
         },
     );
