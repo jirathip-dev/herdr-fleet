@@ -159,6 +159,8 @@ fn seed_run(state: &State) -> String {
             resume_digest: None,
             verdict: SubmissionVerdict::Approved,
         }],
+        // Issue #95: no supervision authorization is presented here.
+        supervision: None,
         at: AT.to_string(),
     };
     let (_, items) = state.submit_queue_run(&plan).expect("submission commits");

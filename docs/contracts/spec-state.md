@@ -385,6 +385,42 @@ to journal fails closed — the mutation does not start.
   (`reconcile.run-control`); no control is ever repeated and nothing is
   ever signalled.
 
+## Supervision additions (issue #95)
+
+- **Tables (m0011/schema v11, purely additive)**: `supervisions` (one row
+  per explicitly authorized run: desired state, the owner/run generation,
+  the approved-plan binding, the bounded policy, the observed
+  meaningful-progress marker with its observation time and source, the
+  check counters/continuation report counters, and the last/next check with
+  their reasons), `supervision_triggers` (`instance_id` PRIMARY KEY — the ONE
+  pending wake slot per run that every semantic wake folds into, which is
+  what makes duplicate, out-of-order and concurrent timer/event wakes
+  coalesce into one reconciliation) and `supervision_runtime` (the single
+  driver-cursor row: the folded event cursor and the last tick time). No
+  existing table or row is touched.
+- **Disabled by default**: a run is supervised only when an explicit
+  `hf-supervision-authorization/v1` block was presented inside
+  `queue.submit` params AND the submission transaction committed it — the
+  authorization, the admitted `instances` rows and the ownership rows commit
+  in ONE transaction, and the authorization binds the approved preview
+  digest, so an unapproved/drifted plan is held (`supervision.unapproved_plan`)
+  and is never eligible. A re-authorization increments the owner generation
+  and re-derives the supervision id.
+- **Evaluation-only**: the driver classifies recorded evidence (run row,
+  ownership, committed submission and bound spine, recorded step attempts
+  with their typed outcome codes, review evidence, bounded retries,
+  in-flight claims) into the closed class set, and writes ONLY its own
+  `supervisions` check fields plus the consumed wake slot. It never spawns,
+  prompts, resumes, retries, mutates Git or clears a hold; the
+  meaningful-progress marker moves only when the observed evidence changed,
+  so reads, heartbeats and rendered status can never reset it.
+- **Restart and clock movement**: the boot pass reconciles every ARMED run
+  exactly once (a fresh snapshot), the next eligible check is re-anchored to
+  `now + interval` (missed windows are skipped, never replayed), and a
+  persisted event cursor that retention moved past (or a folded event whose
+  audit row was pruned) reports a loss and falls back to a fresh snapshot
+  wake for every armed run.
+
 ## Fixture map
 
 Accept: `migration.valid.json` (0→1, checksummed), `audit.valid.jsonl`

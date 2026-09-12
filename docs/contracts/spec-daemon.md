@@ -31,8 +31,8 @@ remain usable without it; SQLite owns state; no network control API).
   `lane.checkpoint.create`, `lane.checkpoint.status`, `lane.retire`,
   `lane.start`, `lane.adopt`, `lane.successor.consume`,
   `state.epoch`, `queue.submit`, `queue.status`, `run.pause`,
-  `run.resume`, `run.retry`, `run.status`, `backup.create`,
-  `restore.begin`, `journal.tail`,
+  `run.resume`, `run.retry`, `run.status`, `supervision.status`,
+  `backup.create`, `restore.begin`, `journal.tail`,
   `events.subscribe` (issue #77 adds no method: the target-profile plan
   travels as an optional `params.profile` on `lane.replacement.request` and
   `lane.start`, and returns on `lane.replacement.status` /
@@ -41,8 +41,8 @@ remain usable without it; SQLite owns state; no network control API).
   request-only lane replacement surface, the safe-boundary checkpoint
   surface, and the guarded single-session retirement over the socket;
   issues #85/#86 add the queue submission surface and the run-scoped
-  controls; the closed set above is mirrored by the Rust schema validator
-  and the fixture oracle).
+  controls, and issue #95 adds the supervision status read; the closed set
+  above is mirrored by the Rust schema validator and the fixture oracle).
 - `apply` **requires** `params.idempotency_key` (`ik_` format): an apply
   without a key is refused at parse time (`rpc/request.malformed.json`).
   Replaying the same request id + idempotency key returns the recorded
@@ -348,6 +348,46 @@ clears a repository/fleet-level hold or bypasses a gate.
 - Restart reconciliation reads each interrupted `run.*` claim's commit
   marker (the run's control rows) and logs whether the control committed
   (`reconcile.run-control`); no control is ever repeated.
+
+## Supervision method (issue #95)
+
+- Supervision is a daemon-owned reconciliation driver, NOT another agent
+  and NOT a scheduler: routine checks make no inference requests, and
+  nothing on this surface spawns, prompts, resumes, retries, mutates Git or
+  clears a hold. `supervision.status` is the only method it adds.
+- Arming is part of the run's submission, never a separate call:
+  `queue.submit` accepts an OPTIONAL `params.supervision`
+  (`hf-supervision-authorization/v1`: `desired` in the closed set
+  `armed` | `disabled`, plus an optional bounded `policy` with
+  `check_interval_secs` 5..=3600 and `progress_timeout_secs` 60..=86400,
+  which must not be smaller than the interval). Absent = supervision stays
+  disabled for every admitted run (the default). A present block commits in
+  the SAME transaction as the runs it names, binds the approved preview
+  digest, and is validated before any state is read
+  (`usage.supervision.*`).
+- The driver is woken by SEMANTIC events (the durable journal stream:
+  completion/review/CI/control wakes folded per run) plus a bounded timer
+  fallback; duplicate, out-of-order and concurrent timer/event wakes
+  coalesce into ONE run-scoped reconciliation, and a restart yields exactly
+  one fresh snapshot reconciliation per armed run (missed windows are
+  skipped, never replayed). A persisted event cursor that retention moved
+  past falls back to a fresh snapshot wake.
+- `supervision.status` requires `params.instance_id` (`run-` + 16 hex) and
+  renders `hf-supervision/v1` read-only: the recorded authorization and
+  policy, the closed classification (`healthy`, `waiting-workers`,
+  `waiting-CI`, `waiting-approval`, `blocked-capacity`,
+  `continuation-eligible`, `paused`, `completed`, `needs-attention`, or
+  `unknown` when evidence is missing/stale) with its stable reason and the
+  eligibility REPORT, the freshness of the last check, the last check
+  (time, class, reason, wake), the NEXT ELIGIBLE CHECK with its reason, the
+  observed meaningful-progress marker (time, age, source), the continuation
+  report count and the folded pending wake. No claim, no journal write and
+  no marker movement: a read, a heartbeat or a rendered status is never
+  progress. `state.not_found` when the run carries no authorization.
+- `continuation-eligible` is a REPORT for a later slice: supervision never
+  continues work, and an idle/done agent alone is neither completion (a
+  `done` run without passing review evidence stays unknown) nor permission
+  to resume (a paused run is never eligible).
 
 ## Responses: `hf-rpc-response/v1`
 

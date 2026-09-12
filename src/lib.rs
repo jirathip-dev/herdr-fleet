@@ -33,6 +33,7 @@ pub mod run_control;
 pub mod schema;
 pub mod service;
 pub mod state;
+pub mod supervision;
 pub mod time;
 pub mod tui;
 pub mod value;
