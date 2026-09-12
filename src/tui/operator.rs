@@ -516,6 +516,20 @@ impl<'a> OperatorConsole<'a> {
         }
     }
 
+    /// A terminal resize (the approved interaction contract): the selection
+    /// survives, the authorization box is cleared, and the operator is told
+    /// on the authorization screen — an approval is never carried across a
+    /// frame change the operator did not see.
+    pub fn on_resize(&mut self) {
+        self.checked = false;
+        if self.screen == Screen::Authorize {
+            self.notice = Some(Notice::new(
+                CODE_AUTHORIZATION,
+                "the terminal was resized; the authorization box is cleared — Space sets it again",
+            ));
+        }
+    }
+
     /// Continue the preview to the authorization screen. Held work never
     /// reaches it.
     pub fn begin_authorization(&mut self) {
@@ -797,12 +811,22 @@ impl<'a> OperatorConsole<'a> {
     /// The board screen renders through the board renderer, so it has no
     /// lines of its own here.
     pub fn lines(&self, width: usize) -> Vec<ScreenLine> {
-        match self.screen {
+        let mut lines = match self.screen {
             Screen::Board => Vec::new(),
             Screen::Preview => self.preview_lines(width),
             Screen::Authorize => self.authorize_lines(width),
             Screen::Outcome => self.outcome_lines(width),
+        };
+        // A typed notice (a hold, a refusal, a readback failure) is never
+        // invisible: on every screen it renders as the line after the
+        // heading, and on the board it replaces the footer row.
+        if self.screen != Screen::Board
+            && let Some(notice) = self.notice_line(width)
+        {
+            let position = if lines.is_empty() { 0 } else { 1 };
+            lines.insert(position, notice);
         }
+        lines
     }
 
     /// The notice line (also shown as a one-line strip over the board).
@@ -1710,6 +1734,40 @@ mod tests {
             notice.message.contains(&format!("epoch {shown}")),
             "{notice:?}"
         );
+        let text = console
+            .lines(200)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("refusal.state.epoch"),
+            "the staleness refusal must be visible on the authorization screen: {text}"
+        );
+    }
+
+    #[test]
+    fn a_resize_clears_the_authorization_but_keeps_the_selection() {
+        let fixture = Fixture::new("resize");
+        let mut console = console(&fixture);
+        authorize_screen(&mut console);
+        console.handle_key(key(KeyCode::Char(' ')));
+        assert!(console.authorized());
+        console.on_resize();
+        assert!(!console.authorized(), "a resize clears the authorization");
+        assert_eq!(console.screen(), Screen::Authorize, "the screen survives");
+        assert_eq!(
+            console.notice().expect("notice").code,
+            CODE_AUTHORIZATION,
+            "the operator is told why"
+        );
+        assert!(
+            console.ui_state().selected.is_some(),
+            "the selection survives"
+        );
+        // Space sets it again, and Enter then authorizes the same preview.
+        console.handle_key(key(KeyCode::Char(' ')));
+        assert!(console.authorized());
     }
 
     #[test]
@@ -1737,6 +1795,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("preview.occupancy_unknown"), "{text}");
+        assert!(
+            text.contains(CODE_HELD),
+            "the refusal must be visible on the preview screen: {text}"
+        );
     }
 
     #[test]

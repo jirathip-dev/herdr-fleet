@@ -71,6 +71,12 @@ pub fn run_operator_with_mode(
         loop {
             terminal.draw(|frame| operator::draw(console, mode, frame))?;
             let event = event::read()?;
+            // A resize clears the authorization box (the approved
+            // interaction contract): an approval never survives a frame the
+            // operator did not see.
+            if let Event::Resize(_, _) = &event {
+                console.on_resize();
+            }
             if let Event::Key(key) = event
                 && key.kind == KeyEventKind::Press
                 && matches!(console.handle_key(key), Some(Action::Quit))
