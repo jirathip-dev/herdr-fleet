@@ -307,6 +307,34 @@ to journal fails closed — the mutation does not start.
   reconciliation resolves it, so a restart never spawns twice and never
   silently writes off the boundary.
 
+## Queue submission additions (issue #85)
+
+- **Tables (m0009/schema v9, purely additive)**: `queue_submissions`
+  (the committed approval binding: digest, epoch, role key/revision,
+  workflow pin, boundary, canonical bound-input line), 
+  `queue_submission_items` (the persisted run membership: one row per
+  selected issue with its closed `admitted` | `waiting` | `refused`
+  status, stable reason code and bound run), and `queue_ownership`
+  (`PRIMARY KEY (repository, issue_number)` — the schema-level guarantee
+  that one live run owns one issue; a prior row whose run left the owned
+  status set is replaced inside the same transaction).
+- **One transaction**: the submission row, every membership item, the
+  admitted `instances` rows and the ownership rows commit together or not
+  at all. A crash before the commit leaves nothing (no partial
+  admission); a crash after the commit leaves exactly the committed rows.
+  State-derived facts (live ownership, grant status/epoch/expiry,
+  declared scope overlap, concurrency capacity) are re-verified under the
+  transaction guard, so concurrent submissions cannot duplicate an owner.
+- **Restart reconciliation**: an interrupted `queue.submit` claim is
+  reconciled against its commit marker — the submission row is
+  recomputed from the claim's `(digest, idempotency key)` pair, the
+  derived document is read back and its digest binding re-verified; the
+  claim itself resolves `ambiguous` (a retry needs a fresh key) and no
+  effect is ever repeated.
+- **Readback**: `queue.status` renders the same `hf-queue-submission/v1`
+  document from the committed rows, and the original submit response is
+  the same projection, so CLI/JSON and daemon readback agree.
+
 ## Fixture map
 
 Accept: `migration.valid.json` (0→1, checksummed), `audit.valid.jsonl`

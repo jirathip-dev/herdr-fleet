@@ -75,8 +75,8 @@ facts the binary was built against:
 ```console
 canter 0.1.0
 canter: typed, plan-first companion CLI for operating Herdr coding-agent fleets (read-only core; no daemon, no live fleet mutations)
-state schema version: 8
-migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4, m0005_lane_replacements_v5, m0006_lane_checkpoints_v6, m0007_lane_successors_v7, m0008_lane_replacement_profiles_v8
+state schema version: 9
+migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4, m0005_lane_replacements_v5, m0006_lane_checkpoints_v6, m0007_lane_successors_v7, m0008_lane_replacement_profiles_v8, m0009_queue_submissions_v9
 document schema families: hf-config/v1, hf-policy/v1, hf-output/v1, hf-error/v1, ...
 ```
 
@@ -242,7 +242,7 @@ $ canter daemon status --json   # from another terminal: exit 0
 {"command":"daemon status","data":{"daemon":{"pid":<pid>,
  "started_at":"<ts>","version":"0.1.0"},
  "freshness":"fresh","state":{"active_grants":0,"epoch":1,"event_seq":0,
- "journal_seq":0,"pending_claims":0,"poisoned":false,"schema_version":8}},
+ "journal_seq":0,"pending_claims":0,"poisoned":false,"schema_version":9}},
  "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
 ```
 
@@ -365,11 +365,11 @@ prints and the daemon speaks conforms to the versioned corpus in
 [docs/contracts/README.md](docs/contracts/README.md) — schema registry,
 spec-cli/config/plans/capabilities, spec-daemon/state/workflow, capability-map,
 compatibility, and benchmarks. `canter --version` prints the exact schema
-facts a build binds (`state schema version: 8`; migration chain m0001–m0008;
+facts a build binds (`state schema version: 9`; migration chain m0001–m0009;
 18 document schema families from `hf-config/v1` to `hf-board/v1`).
 
 **Command surface** — mirrors `canter --help` on the release binary
-exactly (one line per shipped command; 13 subcommands):
+exactly (one line per shipped command; 18 subcommands):
 
 | Command | Behavior (from `--help`) |
 | --- | --- |
@@ -382,6 +382,11 @@ exactly (one line per shipped command; 13 subcommands):
 | `capabilities [--json]` | Report the CLI's declared forge read capabilities. |
 | `daemon run [--socket PATH] [--config PATH]` | Run or probe the single-writer state daemon (foreground; flock + SQLite state + per-user Unix socket). |
 | `daemon status [--config PATH] [--json]` | Probe the daemon socket and report live state. |
+| `lane preview --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY] [--socket PATH] [--config PATH] [--json]` | Render the reviewable `hf-lane-handoff/v1` plan for one lane replacement (read-only; never mutates). |
+| `lane request ... [--confirm-digest HEX64 | --confirm | --yes] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]` | Record ONE durable lane replacement request after an explicit digest authorization (no spawn/kill/Git effect). |
+| `lane status (--replacement RP_ID | --lane ID --generation N) [--socket PATH] [--config PATH] [--json]` | Read one replacement record read-only (phase, binding, blocker, next action). |
+| `queue submit --request FILE --confirm-digest HEX64 --caps G/R/H [--epoch N] [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]... [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]` | Commit ONE approved selected-issue run after an exact preview-digest authorization: durable run membership with per-issue admitted/waiting/refused outcomes and unique work ownership. |
+| `queue status --submission QS_ID [--socket PATH] [--config PATH] [--json]` | Read one committed submission document back read-only. |
 | `service doctor [--config PATH] [--json]` | Check the daemon environment read-only (platform, config, socket state, unit placement). |
 | `service install-plan [--config PATH] [--json]` | Render the per-user launchd/systemd unit text + install steps (never installs). |
 | `service status-plan [--config PATH] [--json]` | Render the status/verification steps for the unit (never queries the service manager). |

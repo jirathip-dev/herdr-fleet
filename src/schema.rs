@@ -1188,7 +1188,7 @@ pub const SUPPORTED_FAMILIES: [Family; 18] = [
 /// transition: one generation/nonce owns the fresh successor, adapter-
 /// observed verification, a reconciliation-not-replay adoption re-query,
 /// and exactly-once completion consumption after adoption).
-pub const RPC_METHODS: [&str; 29] = [
+pub const RPC_METHODS: [&str; 31] = [
     "capabilities",
     "doctor",
     "status",
@@ -1214,6 +1214,8 @@ pub const RPC_METHODS: [&str; 29] = [
     "lane.adopt",
     "lane.successor.consume",
     "state.epoch",
+    "queue.submit",
+    "queue.status",
     "backup.create",
     "restore.begin",
     "journal.tail",

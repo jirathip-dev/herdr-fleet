@@ -60,6 +60,8 @@ USAGE:
     canter lane preview --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY] [--socket PATH] [--config PATH] [--json]
     canter lane request --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY] [--confirm-digest HEX64 | --confirm | --yes] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter lane status (--replacement RP_ID | --lane ID --generation N) [--socket PATH] [--config PATH] [--json]
+    canter queue submit --request FILE --confirm-digest HEX64 [--epoch N] [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]... [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter queue status --submission QS_ID [--socket PATH] [--config PATH] [--json]
     canter service doctor [--config PATH] [--json]
     canter service install-plan [--config PATH] [--json]
     canter service status-plan [--config PATH] [--json]
@@ -81,6 +83,8 @@ COMMANDS:
     daemon           Run or probe the single-writer state daemon.
     lane             Preview, request, or inspect ONE explicit lane handoff
                      (preview/status are read-only; request records intent).
+    queue            Submit one approved selected-issue run, or read one
+                     committed submission back (status is read-only).
     service          Render per-user launchd/systemd plans; doctor checks.
 
 EXIT CODES (with or without --json):
@@ -109,6 +113,54 @@ pub struct Invocation {
     pub service_action: Option<ServiceAction>,
     /// Lane handoff subcommand (preview/request/status).
     pub lane_action: Option<LaneAction>,
+    /// Queue executor subcommand (submit/status; issue #85).
+    pub queue_action: Option<QueueAction>,
+}
+
+/// Queue executor subcommands (issue #85): submit one approved selected-issue
+/// run through the daemon, or read one committed submission back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueueAction {
+    /// Commit the approved run: `queue submit`.
+    Submit(QueueSubmitArgs),
+    /// Read one committed submission (read-only): `queue status`.
+    Status(QueueStatusArgs),
+}
+
+/// `queue submit`: the presented submission material plus the explicit
+/// digest authorization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueSubmitArgs {
+    /// Path of the bound-input preview document (the reviewed material).
+    pub request_path: PathBuf,
+    /// `--confirm-digest HEX64`: the exact preview digest being approved.
+    pub confirm_digest: String,
+    /// The state epoch the approval was rendered against; `None` reads the
+    /// live epoch from the daemon (a pinned value refuses when it moved).
+    pub epoch: Option<i64>,
+    /// Presented per-issue grant bindings (`REF=GRANT_ID`).
+    pub grants: Vec<(String, String)>,
+    /// Presented resume authorizations (`INSTANCE=DIGEST`).
+    pub resume: Vec<(String, String)>,
+    /// Presented host availability; `None` = unknown.
+    pub host_available: Option<bool>,
+    /// Presented same-harness occupancy; `None` = unknown.
+    pub harness_lanes: Option<i64>,
+    /// Presented fan-out concurrency caps (the admission axes).
+    pub caps: crate::lifecycle::ConcurrencyCaps,
+    /// `--idempotency-key`: replay-safe automation key.
+    pub idempotency_key: Option<String>,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
+}
+
+/// `queue status`: one exact submission read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueStatusArgs {
+    /// Explicit submission id (`qs_` + 16 hex).
+    pub submission: String,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
 }
 
 /// Daemon subcommands (issue #5).
@@ -356,6 +408,7 @@ pub fn parse_invocation(args: &[String]) -> Result<Invocation, ParseError> {
         "daemon" => parse_daemon(&rest),
         "service" => parse_service(&rest),
         "lane" => parse_lane(&rest),
+        "queue" => parse_queue(&rest),
         other => Err(ParseError::Usage(format!("unknown command {other:?}"))),
     }
 }
@@ -394,6 +447,7 @@ fn parse_flag_command(name: &str, args: &[&String]) -> Result<Invocation, ParseE
         daemon_action: None,
         service_action: None,
         lane_action: None,
+        queue_action: None,
     })
 }
 
@@ -441,6 +495,9 @@ fn parse_board(args: &[&String]) -> Result<Invocation, ParseError> {
         daemon_action: None,
         service_action: None,
         lane_action: None,
+        // The board surface is not a queue submission (issue #85): the field
+        // exists on every initializer so the merged struct has one shape.
+        queue_action: None,
     })
 }
 
@@ -455,6 +512,7 @@ fn help_request(name: &str) -> String {
         "config" => CONFIG_USAGE.trim_end().to_string(),
         "daemon" => DAEMON_USAGE.trim_end().to_string(),
         "lane" => LANE_USAGE.trim_end().to_string(),
+        "queue" => QUEUE_USAGE.trim_end().to_string(),
         "service" => SERVICE_USAGE.trim_end().to_string(),
         _ => USAGE.to_string(),
     }
@@ -604,6 +662,7 @@ fn parse_config(args: &[&String]) -> Result<Invocation, ParseError> {
         daemon_action: None,
         service_action: None,
         lane_action: None,
+        queue_action: None,
     })
 }
 
@@ -695,6 +754,7 @@ fn parse_daemon(args: &[&String]) -> Result<Invocation, ParseError> {
         daemon_action: Some(action),
         service_action: None,
         lane_action: None,
+        queue_action: None,
     })
 }
 
@@ -752,6 +812,7 @@ fn parse_service(args: &[&String]) -> Result<Invocation, ParseError> {
         daemon_action: None,
         service_action: Some(action),
         lane_action: None,
+        queue_action: None,
     })
 }
 
@@ -934,6 +995,7 @@ fn parse_lane(args: &[&String]) -> Result<Invocation, ParseError> {
             daemon_action: None,
             service_action: None,
             lane_action: Some(LaneAction::Status(status)),
+            queue_action: None,
         });
     }
 
@@ -1003,6 +1065,287 @@ fn parse_lane(args: &[&String]) -> Result<Invocation, ParseError> {
         daemon_action: None,
         service_action: None,
         lane_action: Some(lane_action),
+        queue_action: None,
+    })
+}
+
+/// Parse `queue <submit|status>` (issue #85).
+fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
+    let action = args
+        .first()
+        .ok_or_else(|| ParseError::Help(help_request("queue")))?;
+    if action.as_str() == "-h" || action.as_str() == "--help" {
+        return Err(ParseError::Help(help_request("queue")));
+    }
+    let command = match action.as_str() {
+        "submit" => "queue submit",
+        "status" => "queue status",
+        other => {
+            return Err(ParseError::Usage(format!(
+                "queue: unknown subcommand {other:?}; run `canter queue --help`"
+            )));
+        }
+    };
+    let rest: Vec<&String> = args[1..].to_vec();
+    let mut json = false;
+    let mut config_path: Option<PathBuf> = None;
+    let mut socket: Option<String> = None;
+    let mut request_path: Option<PathBuf> = None;
+    let mut confirm_digest: Option<String> = None;
+    let mut epoch: Option<i64> = None;
+    let mut grants: Vec<(String, String)> = Vec::new();
+    let mut resume: Vec<(String, String)> = Vec::new();
+    let mut host_available: Option<bool> = None;
+    let mut host_available_set = false;
+    let mut harness_lanes: Option<i64> = None;
+    let mut harness_lanes_set = false;
+    let mut caps: Option<crate::lifecycle::ConcurrencyCaps> = None;
+    let mut idempotency_key: Option<String> = None;
+    let mut submission: Option<String> = None;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--json" => json = true,
+            "--config" => {
+                config_path = Some(PathBuf::from(flag_value(
+                    &rest, &mut index, "queue", "--config",
+                )?))
+            }
+            "--socket" => socket = Some(flag_value(&rest, &mut index, "queue", "--socket")?),
+            "--request" => {
+                request_path = Some(PathBuf::from(flag_value(
+                    &rest,
+                    &mut index,
+                    "queue",
+                    "--request",
+                )?))
+            }
+            "--confirm-digest" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--confirm-digest")?;
+                if !crate::formats::is_hex64(&raw) {
+                    return Err(ParseError::Usage(format!(
+                        "queue submit: --confirm-digest must be 64 lowercase hex (the approved \
+                         preview digest), got {raw:?}"
+                    )));
+                }
+                confirm_digest = Some(raw);
+            }
+            "--epoch" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--epoch")?;
+                let parsed = raw.parse::<i64>().map_err(|_| {
+                    ParseError::Usage(format!(
+                        "queue submit: --epoch must be a positive integer, got {raw:?}"
+                    ))
+                })?;
+                if parsed < 1 {
+                    return Err(ParseError::Usage(format!(
+                        "queue submit: --epoch must be a positive integer, got {raw:?}"
+                    )));
+                }
+                epoch = Some(parsed);
+            }
+            "--grant" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--grant")?;
+                let Some((reference, grant_id)) = raw.split_once('=') else {
+                    return Err(ParseError::Usage(format!(
+                        "queue submit: --grant takes REF=GRANT_ID, got {raw:?}"
+                    )));
+                };
+                let reference = reference.trim();
+                if reference.is_empty() {
+                    return Err(ParseError::Usage(format!(
+                        "queue submit: --grant requires a non-empty issue reference, got {raw:?}"
+                    )));
+                }
+                if !crate::formats::is_grant_id(grant_id) {
+                    return Err(ParseError::Usage(format!(
+                        "queue submit: --grant grant ids are `gr_` + 16 lowercase hex, got \
+                         {grant_id:?}"
+                    )));
+                }
+                grants.push((reference.to_string(), grant_id.to_string()));
+            }
+            "--resume" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--resume")?;
+                let Some((instance_id, digest)) = raw.split_once('=') else {
+                    return Err(ParseError::Usage(format!(
+                        "queue submit: --resume takes INSTANCE=DIGEST, got {raw:?}"
+                    )));
+                };
+                if instance_id.is_empty() || instance_id.len() > 64 {
+                    return Err(ParseError::Usage(format!(
+                        "queue submit: --resume requires a bounded instance id, got {raw:?}"
+                    )));
+                }
+                if !crate::formats::is_hex64(digest) {
+                    return Err(ParseError::Usage(format!(
+                        "queue submit: --resume digests are the engine-minted 64-hex digests, got \
+                         {digest:?}"
+                    )));
+                }
+                resume.push((instance_id.to_string(), digest.to_string()));
+            }
+            "--host-available" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--host-available")?;
+                host_available_set = true;
+                host_available = match raw.as_str() {
+                    "yes" => Some(true),
+                    "no" => Some(false),
+                    "unknown" => None,
+                    other => {
+                        return Err(ParseError::Usage(format!(
+                            "queue submit: --host-available takes yes|no|unknown, got {other:?}"
+                        )));
+                    }
+                };
+            }
+            "--harness-lanes" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--harness-lanes")?;
+                harness_lanes_set = true;
+                if raw == "unknown" {
+                    harness_lanes = None;
+                } else {
+                    let parsed = raw.parse::<i64>().map_err(|_| {
+                        ParseError::Usage(format!(
+                            "queue submit: --harness-lanes takes a non-negative lane count or \
+                             unknown, got {raw:?}"
+                        ))
+                    })?;
+                    if parsed < 0 {
+                        return Err(ParseError::Usage(format!(
+                            "queue submit: --harness-lanes takes a non-negative lane count or \
+                             unknown, got {raw:?}"
+                        )));
+                    }
+                    harness_lanes = Some(parsed);
+                }
+            }
+            "--caps" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--caps")?;
+                let parts: Vec<&str> = raw.split('/').collect();
+                let parse = |text: &str| -> Option<usize> {
+                    text.parse::<usize>()
+                        .ok()
+                        .filter(|value| *value <= crate::queue_executor::CAP_MAX)
+                };
+                if parts.len() != 3 {
+                    return Err(ParseError::Usage(format!(
+                        "queue submit: --caps takes GLOBAL/REPOSITORY/HARNESS (integers 0..={}), \
+                         got {raw:?}",
+                        crate::queue_executor::CAP_MAX
+                    )));
+                }
+                let (Some(global), Some(per_repository), Some(per_harness)) =
+                    (parse(parts[0]), parse(parts[1]), parse(parts[2]))
+                else {
+                    return Err(ParseError::Usage(format!(
+                        "queue submit: --caps takes GLOBAL/REPOSITORY/HARNESS (integers 0..={}), \
+                         got {raw:?}",
+                        crate::queue_executor::CAP_MAX
+                    )));
+                };
+                caps = Some(crate::lifecycle::ConcurrencyCaps {
+                    global,
+                    per_repository,
+                    per_harness,
+                });
+            }
+            "--idempotency-key" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--idempotency-key")?;
+                if !crate::formats::is_idempotency_key(&raw) {
+                    return Err(ParseError::Usage(format!(
+                        "queue submit: --idempotency-key must match `ik_` + 8-64 of [a-z0-9-], got \
+                         {raw:?}"
+                    )));
+                }
+                idempotency_key = Some(raw);
+            }
+            "--submission" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--submission")?;
+                if !crate::formats::is_submission_id(&raw) {
+                    return Err(ParseError::Usage(format!(
+                        "queue status: --submission must be `qs_` + 16 lowercase hex, got {raw:?}"
+                    )));
+                }
+                submission = Some(raw);
+            }
+            "-h" | "--help" => return Err(ParseError::Help(help_request("queue"))),
+            flag => {
+                return Err(ParseError::Usage(format!(
+                    "queue: unknown flag {flag:?}; run `canter queue --help`"
+                )));
+            }
+        }
+        index += 1;
+    }
+    let queue_action = if command == "queue submit" {
+        if submission.is_some() {
+            return Err(ParseError::Usage(
+                "queue submit: --submission is only valid for `canter queue status`".to_string(),
+            ));
+        }
+        let request_path = request_path.ok_or_else(|| {
+            ParseError::Usage(
+                "queue submit: --request FILE is required (the bound-input preview document)"
+                    .to_string(),
+            )
+        })?;
+        let confirm_digest = confirm_digest.ok_or_else(|| {
+            ParseError::Usage(
+                "queue submit: --confirm-digest HEX64 is required (the approved preview digest)"
+                    .to_string(),
+            )
+        })?;
+        let caps = caps.ok_or_else(|| {
+            ParseError::Usage(
+                "queue submit: --caps GLOBAL/REPOSITORY/HARNESS is required (the presented \
+                 admission axes; unknown capacity is never assumed)"
+                    .to_string(),
+            )
+        })?;
+        QueueAction::Submit(QueueSubmitArgs {
+            request_path,
+            confirm_digest,
+            epoch,
+            grants,
+            resume,
+            host_available,
+            harness_lanes,
+            caps,
+            idempotency_key,
+            socket,
+        })
+    } else {
+        if request_path.is_some()
+            || confirm_digest.is_some()
+            || epoch.is_some()
+            || !grants.is_empty()
+            || !resume.is_empty()
+            || host_available_set
+            || harness_lanes_set
+            || caps.is_some()
+            || idempotency_key.is_some()
+        {
+            return Err(ParseError::Usage(
+                "queue status: submission flags are not valid for a read-only status read"
+                    .to_string(),
+            ));
+        }
+        let submission = submission.ok_or_else(|| {
+            ParseError::Usage("queue status: --submission QS_ID is required".to_string())
+        })?;
+        QueueAction::Status(QueueStatusArgs { submission, socket })
+    };
+    Ok(Invocation {
+        command: command.to_string(),
+        json,
+        config_path,
+        plan: None,
+        config_action: None,
+        daemon_action: None,
+        service_action: None,
+        lane_action: None,
+        queue_action: Some(queue_action),
     })
 }
 
@@ -1096,6 +1439,7 @@ fn parse_plan(args: &[&String]) -> Result<Invocation, ParseError> {
         }),
         config_action: None,
         lane_action: None,
+        queue_action: None,
     })
 }
 
@@ -1183,6 +1527,9 @@ pub fn render_envelope(command: &str, result: &CmdResult) -> String {
 
 /// Execute one parsed invocation.
 pub fn execute(invocation: &Invocation) -> CmdResult {
+    if let Some(action) = invocation.queue_action.clone() {
+        return execute_queue(action, invocation);
+    }
     if let Some(action) = invocation.lane_action.clone() {
         return execute_lane(action, invocation);
     }
@@ -2017,12 +2364,18 @@ fn lane_error(code: &str, message: String, retryable: bool) -> CmdResult {
     result
 }
 
-/// The closed read-only method allowlist of the lane surface: preview and
-/// status may issue ONLY these methods. Every read-only lane call goes
-/// through [`read_only_call`], which fails closed (typed) on anything else —
-/// the guard that keeps the read-only commands free of mutations even if a
-/// call site is ever edited.
-const READ_ONLY_METHODS: [&str; 2] = ["lane.replacement.status", "lane.checkpoint.status"];
+/// The closed read-only method allowlist of the lane/queue surface: lane
+/// preview/status and queue status may issue ONLY these methods (plus the
+/// live-epoch read `queue submit` needs to present the state epoch). Every
+/// read-only call goes through [`read_only_call`], which fails closed
+/// (typed) on anything else — the guard that keeps the read-only commands
+/// free of mutations even if a call site is ever edited.
+const READ_ONLY_METHODS: [&str; 4] = [
+    "lane.replacement.status",
+    "lane.checkpoint.status",
+    "queue.status",
+    "state.epoch",
+];
 
 /// One read-only lane RPC: refuses any method outside the read-only
 /// allowlist BEFORE a socket is even opened.
@@ -2463,6 +2816,233 @@ fn execute_lane(action: LaneAction, invocation: &Invocation) -> CmdResult {
     }
 }
 
+// ---------------------------------------------------------------------------
+// queue (issue #85): the durable selected-run submission path
+// ---------------------------------------------------------------------------
+
+/// Execute one queue subcommand.
+fn execute_queue(action: QueueAction, invocation: &Invocation) -> CmdResult {
+    match action {
+        QueueAction::Submit(args) => execute_queue_submit(&args, invocation),
+        QueueAction::Status(args) => execute_queue_status(&args, invocation),
+    }
+}
+
+/// The reviewed role-configuration binding re-observed from the CURRENT
+/// configuration (never a value from argv): the fresh `hf-profile-binding/v1`
+/// document plus its revision. A missing config, unknown harness or
+/// unbound harness refuses before any daemon call — the daemon compares the
+/// re-observed revision against the approval binding.
+fn fresh_role_binding(
+    config: Option<&Config>,
+    harness_key: &str,
+) -> Result<(Val, String), Box<CmdResult>> {
+    let Some(config) = config else {
+        return Err(Box::new(error_result(
+            5,
+            "config.not_found",
+            format!(
+                "queue submit needs the profile configuration to re-observe the reviewed role \
+                 revision for {harness_key:?}; run `canter config init` and save the template, or \
+                 pass --config PATH"
+            ),
+            false,
+        )));
+    };
+    let Some(harness) = config
+        .harnesses
+        .iter()
+        .find(|harness| harness.key == *harness_key)
+    else {
+        return Err(Box::new(error_result(
+            5,
+            "config.harness",
+            format!(
+                "no configured harness {harness_key:?}; the reviewed role configuration names a \
+                 configured harness key (see `canter config show --json`)"
+            ),
+            false,
+        )));
+    };
+    let env = crate::config::credential_environment(harness);
+    match crate::config::ProfileBinding::from_config(config, harness_key, &env) {
+        Some(binding) => Ok((binding.to_doc(), binding.revision)),
+        None => Err(Box::new(error_result(
+            5,
+            "config.harness",
+            format!(
+                "harness {harness_key:?} declares no provider/model binding; there is no \
+                 re-observed role configuration to submit against"
+            ),
+            false,
+        ))),
+    }
+}
+
+/// `queue submit`: authorize and commit ONE approved selected-issue run.
+/// The local preflight is exactly the digest check plus the config
+/// re-observation; every durable fact is the daemon's to revalidate.
+fn execute_queue_submit(args: &QueueSubmitArgs, invocation: &Invocation) -> CmdResult {
+    let text = match std::fs::read_to_string(&args.request_path) {
+        Ok(text) => text,
+        Err(err) => {
+            return error_result(
+                2,
+                "usage.queue_request",
+                format!(
+                    "queue submit: cannot read {} ({err}); --request names the bound-input preview \
+                     document",
+                    args.request_path.display()
+                ),
+                false,
+            );
+        }
+    };
+    let bound = match Val::parse_json(&text) {
+        Ok(bound @ Val::Obj(_)) => bound,
+        _ => {
+            return error_result(
+                2,
+                "usage.queue_request",
+                format!(
+                    "queue submit: {} must carry one bound-input preview document (JSON object)",
+                    args.request_path.display()
+                ),
+                false,
+            );
+        }
+    };
+    let computed = match crate::queue_executor::bound_digest(&bound) {
+        Ok(digest) => digest,
+        Err(err) => return lane_error(err.code, err.message, false),
+    };
+    if computed != args.confirm_digest {
+        return lane_error(
+            "refusal.plan.stale",
+            format!(
+                "the presented --confirm-digest {} is not the digest of {} ({computed}); the \
+                 approval must bind the exact reviewed bound-input document",
+                args.confirm_digest,
+                args.request_path.display()
+            ),
+            false,
+        );
+    }
+    let harness_key = bound
+        .get("role_config")
+        .and_then(|role| role.get("key"))
+        .and_then(Val::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let config = match load_optional_config(invocation) {
+        Ok(config) => config,
+        Err(result) => return result,
+    };
+    let (binding, role_revision) = match fresh_role_binding(config.as_ref(), &harness_key) {
+        Ok(pair) => pair,
+        Err(result) => return *result,
+    };
+    let socket = effective_socket(args.socket.as_deref(), config.as_ref());
+    let paths = match derive_paths(socket) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    if let Err(result) = require_live_daemon(&paths) {
+        return *result;
+    }
+    let epoch = match args.epoch {
+        Some(epoch) => epoch,
+        None => {
+            let params = object(vec![]);
+            match read_only_call(&paths.socket_path, "state.epoch", Some(&params)) {
+                Ok(result) => result
+                    .get("epoch")
+                    .and_then(|epoch| epoch.get("epoch"))
+                    .and_then(Val::as_int)
+                    .unwrap_or(0),
+                Err(RpcError { code, message }) => {
+                    return lane_error(&code, format!("queue submit: {message}"), false);
+                }
+            }
+        }
+    };
+    let key = args.idempotency_key.clone().unwrap_or_else(|| {
+        // A fresh per-invocation key: a re-run is a fresh claim, and the
+        // daemon's record-level refusals keep one owner per issue.
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        format!("ik_queue-{secs}-{}", client::fresh_id())
+    });
+    let grants: Vec<crate::queue_executor::ItemGrant> = args
+        .grants
+        .iter()
+        .map(|(id, grant_id)| crate::queue_executor::ItemGrant {
+            id: id.clone(),
+            grant_id: grant_id.clone(),
+        })
+        .collect();
+    let resume: Vec<crate::queue_executor::ResumeAuthorization> = args
+        .resume
+        .iter()
+        .map(
+            |(instance_id, digest)| crate::queue_executor::ResumeAuthorization {
+                instance_id: instance_id.clone(),
+                digest: digest.clone(),
+            },
+        )
+        .collect();
+    let params = crate::queue_executor::submit_params(
+        &key,
+        &args.confirm_digest,
+        epoch,
+        &bound,
+        &binding,
+        &role_revision,
+        args.caps,
+        args.host_available,
+        args.harness_lanes,
+        &grants,
+        &resume,
+    );
+    match client::call(&paths.socket_path, "queue.submit", Some(&params)) {
+        Ok(result) => {
+            let human = crate::queue_executor::render_human(&result);
+            ok_result(result, human)
+        }
+        Err(RpcError { code, message }) => {
+            lane_error(&code, format!("queue submit: {message}"), false)
+        }
+    }
+}
+
+/// `queue status`: read one committed submission document back read-only.
+fn execute_queue_status(args: &QueueStatusArgs, invocation: &Invocation) -> CmdResult {
+    let config = match load_optional_config(invocation) {
+        Ok(config) => config,
+        Err(result) => return result,
+    };
+    let socket = effective_socket(args.socket.as_deref(), config.as_ref());
+    let paths = match derive_paths(socket) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    if let Err(result) = require_live_daemon(&paths) {
+        return *result;
+    }
+    let params = object(vec![("submission_id", string(&args.submission))]);
+    match read_only_call(&paths.socket_path, "queue.status", Some(&params)) {
+        Ok(result) => {
+            let human = crate::queue_executor::render_human(&result);
+            ok_result(result, human)
+        }
+        Err(RpcError { code, message }) => {
+            lane_error(&code, format!("queue status: {message}"), false)
+        }
+    }
+}
+
 /// The human rendering of one preview document (a rendering of the same
 /// data, never a second contradicting contract).
 fn render_lane_preview_human(document: &Val) -> String {
@@ -2838,6 +3418,50 @@ EXAMPLES:
 --reason 'rotate the implementer lane' --confirm-digest <64-hex>
     canter lane status --lane lane-0001 --generation 1 --json
     canter lane status --replacement rp_0123456789abcdef --json
+";
+
+const QUEUE_USAGE: &str = "\
+canter queue <submit|status> — the durable selected-run submission path
+
+USAGE:
+    canter queue submit --request FILE --confirm-digest HEX64 [--epoch N] \
+[--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]... \
+[--host-available yes|no|unknown] [--harness-lanes N|unknown] \
+[--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter queue status --submission QS_ID [--socket PATH] [--config PATH] \
+[--json]
+
+submit commits ONE approved selected-issue run (daemon `queue.submit`),
+consuming the reviewed queue preview: --request names the exact bound-input
+document a preview rendered (its sha256 IS the preview digest) and
+--confirm-digest presents the approved digest — a mismatch is refused
+locally as a stale plan before any daemon call. The reviewed role
+configuration is re-observed from the config and must be unchanged: a
+configuration or credential change is refused (refusal.profile.revision)
+before any effect. --epoch pins the state epoch the approval was rendered
+against (omit it to read the live epoch from the daemon; a pinned value that
+moved is refused before any effect).
+
+The submission persists the run membership: per selected issue the outcome
+is explicit — admitted (a run record with unique work ownership), waiting
+(capacity/attestation), or refused (dependency/ownership/grant) — and it is
+NEVER a claim of completed implementation: no workflow step is executed by
+this command. Unsupported or unresolved steps refuse the whole flow,
+labelled, never stubbed. A paused run stays paused unless a separate
+explicit engine-minted resume authorization is presented with --resume.
+--grant binds each issue to its presented route grant (REF=GRANT_ID). The
+scope stays exactly the approved selected set: no implicit backlog
+expansion, and main/release work is a human-only boundary this surface
+cannot authorize.
+
+status reads one committed submission document back read-only (daemon
+`queue.status`): the exact same projection the submit response carried. It
+never mutates.
+
+EXIT CODES: 0 ok · 1 daemon/transport error · 2 usage · 4 refusal
+(refusal.plan.stale, refusal.profile.revision, refusal.state.epoch,
+refusal.grant.*, preview.*, submission.*, daemon refusals,
+state.not_found) · 5 config error.
 ";
 
 /// Resolve the daemon socket override: the CLI flag wins over
@@ -3281,6 +3905,9 @@ fn per_command_usage(command: &str) -> &'static str {
         }
         "lane" => {
             "usage: canter lane preview|request --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY]\n       canter lane status --replacement RP_ID | --lane ID --generation N"
+        }
+        "queue" => {
+            "usage: canter queue submit --request FILE --confirm-digest HEX64 --caps G/R/H [--epoch N]\n       canter queue status --submission QS_ID"
         }
         _ => "usage: canter [--help] [--version] | canter <command> [options]",
     }

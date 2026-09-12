@@ -30,7 +30,7 @@ use crate::time;
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The schema version this binary understands (also `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Bounded-retention defaults (rows kept besides the chain genesis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,6 +295,278 @@ pub struct ApprovalRow {
     pub interactive: bool,
     /// Recorded at (RFC3339 UTC).
     pub recorded_at: String,
+}
+
+/// One durable queue submission (issue #85): the committed approval binding
+/// of one selected-issue run against the exact preview digest. The row, its
+/// membership items and every admitted run/ownership row commit in ONE
+/// transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueSubmissionRow {
+    /// Submission id (`qs_` + 16 hex, derived from the approved digest and
+    /// the idempotency key).
+    pub submission_id: String,
+    /// Normalized repository identity (`owner/name`).
+    pub repository: String,
+    /// State epoch the submission committed under.
+    pub state_epoch: i64,
+    /// The approved preview digest (64-hex).
+    pub digest: String,
+    /// Bound role-configuration key (the harness key).
+    pub role_key: String,
+    /// Bound role-configuration revision (64-hex).
+    pub role_revision: String,
+    /// Bound workflow id.
+    pub workflow_id: String,
+    /// Bound workflow content hash (64-hex).
+    pub workflow_hash: String,
+    /// Allowed completion boundary phase (closed grant phase).
+    pub boundary_phase: String,
+    /// Integration branch of the boundary.
+    pub integration_branch: String,
+    /// Completion branch of the boundary.
+    pub completion_branch: String,
+    /// Boundary capability subset (closed set), JSON array text.
+    pub boundary_caps: String,
+    /// Canonical bound-input document (the exact digest document).
+    pub request_line: String,
+    /// Committed at (RFC3339 UTC).
+    pub created_at: String,
+}
+
+/// One persisted membership item of a queue submission (issue #85): the
+/// per-issue admission outcome (`admitted` | `waiting` | `refused`) with its
+/// stable reason code and the bound run when one was started.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueSubmissionItemRow {
+    /// Owning submission id.
+    pub submission_id: String,
+    /// Deterministic membership order (the preview's classified order).
+    pub ordinal: i64,
+    /// Stable work-item id (`wi_` + 16 hex).
+    pub work_item: String,
+    /// Issue number within the submission's repository.
+    pub issue_number: i64,
+    /// Selected acceptance revision (40-hex).
+    pub issue_revision: String,
+    /// Admission status (`admitted` | `waiting` | `refused`).
+    pub status: String,
+    /// Stable reason code when not admitted.
+    pub reason: Option<String>,
+    /// Bounded human message for the reason.
+    pub message: Option<String>,
+    /// The bound run when the item was admitted (started or explicitly
+    /// resumed); `None` for waiting/refused items.
+    pub instance_id: Option<String>,
+}
+
+/// One unique work-ownership row (issue #85): the live owner of one
+/// repository issue. `PRIMARY KEY (repository, issue_number)` is the
+/// schema-level uniqueness guarantee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueOwnershipRow {
+    /// Repository identity (`owner/name`).
+    pub repository: String,
+    /// Issue number.
+    pub issue_number: i64,
+    /// Stable work-item id (`wi_` + 16 hex).
+    pub work_item: String,
+    /// The submission that created the owning run.
+    pub submission_id: String,
+    /// The owning run.
+    pub instance_id: String,
+    /// Created at (RFC3339 UTC).
+    pub created_at: String,
+}
+
+/// The presented verdict of one membership item (issue #85). The daemon
+/// derives it from the freshly re-rendered preview; the transaction
+/// re-verifies every state-derived fact before it commits, so the verdict is
+/// a fail-closed hint, never the authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubmissionVerdict {
+    /// Eligible: the transaction decides admit-or-wait (live ownership,
+    /// grant status, scope overlap and concurrency capacity are re-verified
+    /// first).
+    Approved,
+    /// Waiting on an environment/attestation prerequisite; the transaction
+    /// persists the label and consumes no capacity slot.
+    Waiting {
+        /// Stable reason code.
+        code: &'static str,
+        /// Bounded human message.
+        message: String,
+    },
+    /// Refused before the transaction: a dependency, ownership or grant fact
+    /// this submission cannot settle.
+    Refused {
+        /// Stable reason code.
+        code: &'static str,
+        /// Bounded human message.
+        message: String,
+    },
+}
+
+/// One membership item of a presented queue submission (issue #85).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueSubmissionItemPlan {
+    /// Deterministic membership order (the preview's classified order).
+    pub ordinal: i64,
+    /// Stable work-item id (`wi_` + 16 hex).
+    pub work_item: String,
+    /// Issue number within the submission's repository.
+    pub issue_number: i64,
+    /// Selected acceptance revision (40-hex).
+    pub issue_revision: String,
+    /// The presented active grant bound to this issue (required to admit).
+    pub grant_id: Option<String>,
+    /// The explicit resume authorization presented for this item's paused
+    /// run, when one is (64-hex engine-minted digest).
+    pub resume_digest: Option<String>,
+    /// The presented verdict.
+    pub verdict: SubmissionVerdict,
+}
+
+/// The presented plan of one durable queue submission (issue #85). Purely
+/// typed: every field has been validated by the caller; the transaction
+/// re-verifies the state-derived facts that can move (epoch, ownership,
+/// grant status/expiry, overlap, capacity) before writing anything.
+#[derive(Clone, Debug)]
+pub struct QueueSubmissionPlan {
+    /// Deterministic submission id (`qs_` + 16 hex).
+    pub submission_id: String,
+    /// Normalized repository identity.
+    pub repository: String,
+    /// The approved state epoch.
+    pub state_epoch: i64,
+    /// The approved preview digest.
+    pub digest: String,
+    /// Bound role-configuration key.
+    pub role_key: String,
+    /// Bound role-configuration revision.
+    pub role_revision: String,
+    /// Bound workflow id.
+    pub workflow_id: String,
+    /// Bound workflow content hash.
+    pub workflow_hash: String,
+    /// Allowed completion boundary phase.
+    pub boundary_phase: String,
+    /// Boundary integration branch.
+    pub integration_branch: String,
+    /// Boundary completion branch.
+    pub completion_branch: String,
+    /// Boundary capability subset (closed set).
+    pub boundary_caps: Vec<String>,
+    /// Canonical bound-input document (the exact digest document).
+    pub request_line: String,
+    /// Presented fan-out concurrency caps (the admission axes).
+    pub admission_caps: crate::lifecycle::ConcurrencyCaps,
+    /// Attested same-harness occupancy; `None` = unknown (never admitted).
+    pub harness_lanes: Option<i64>,
+    /// Presented membership items in classified order.
+    pub items: Vec<QueueSubmissionItemPlan>,
+    /// Committed at (RFC3339 UTC).
+    pub at: String,
+}
+
+/// One live grant binding read inside the submission transaction (the
+/// volatile facts — status, epoch, expiry — are re-verified there).
+struct GrantBinding {
+    repository: String,
+    issue_number: i64,
+    issue_revision: String,
+    workflow_hash: String,
+    phase: String,
+    scope: String,
+    caps: String,
+    expires_at: String,
+    state_epoch: i64,
+    policy_hash: String,
+    status: String,
+}
+
+/// Running fan-out slot accounting for one submission transaction: the
+/// counted lanes (read under the guard) plus the runs admitted so far, in
+/// the preview's axis order.
+struct FanoutSlots<'a> {
+    caps: &'a crate::lifecycle::ConcurrencyCaps,
+    counted_global: i64,
+    counted_repository: i64,
+    harness_lanes: Option<i64>,
+    admitted_global: i64,
+    admitted_repository: i64,
+    admitted_harness: i64,
+}
+
+impl FanoutSlots<'_> {
+    /// The hold that parks the next eligible item, if one applies: capacity
+    /// first (the preview's axis order), then the attestation gap.
+    fn hold(&self) -> Option<(&'static str, String)> {
+        if self.counted_global + self.admitted_global >= self.caps.global as i64 {
+            return Some((
+                crate::lifecycle::code::CAP_GLOBAL,
+                format!(
+                    "the global concurrency cap ({}) is reached ({} active lanes); the item \
+                     waits",
+                    self.caps.global, self.counted_global
+                ),
+            ));
+        }
+        if self.counted_repository + self.admitted_repository >= self.caps.per_repository as i64 {
+            return Some((
+                crate::lifecycle::code::CAP_REPOSITORY,
+                format!(
+                    "the per-repository concurrency cap ({}) is reached ({} active lanes); the \
+                     item waits",
+                    self.caps.per_repository, self.counted_repository
+                ),
+            ));
+        }
+        match self.harness_lanes {
+            Some(lanes) if lanes + self.admitted_harness < self.caps.per_harness as i64 => None,
+            Some(lanes) => Some((
+                crate::lifecycle::code::CAP_HARNESS,
+                format!(
+                    "the per-harness concurrency cap ({}) is reached ({lanes} attested lanes); \
+                     the item waits",
+                    self.caps.per_harness
+                ),
+            )),
+            None => Some((
+                crate::queue_preview::holds::OCCUPANCY_UNKNOWN,
+                "the same-harness occupancy is not attested; missing occupancy is never treated \
+                 as spare capacity"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// One admitted run consumes one slot on every axis.
+    fn consume(&mut self) {
+        self.admitted_global += 1;
+        self.admitted_repository += 1;
+        self.admitted_harness += 1;
+    }
+}
+
+/// The admission decision of one membership item, decided inside the
+/// submission transaction.
+enum AdmissionDecision {
+    /// A run row was created (or an explicitly authorized paused run was
+    /// resumed) inside the transaction.
+    Admitted { instance_id: String },
+    /// Persisted as waiting (capacity/attestation); no slot is consumed.
+    Waiting { code: &'static str, message: String },
+    /// Persisted as refused; no effect exists.
+    Refused { code: &'static str, message: String },
+}
+
+/// One owned-status run snapshot read inside the submission transaction.
+struct OwnedRunSnapshot {
+    instance_id: String,
+    issue_revision: String,
+    paused: bool,
+    resume_digest: String,
 }
 
 /// One durable schedule row (lifecycle slice, issue #9): the recurring
@@ -725,6 +997,10 @@ impl State {
             run_m0008(&mut conn)?;
             user_version = M0008_APPLIES_TO;
         }
+        if user_version == M0009_APPLIES_FROM {
+            run_m0009(&mut conn)?;
+            user_version = M0009_APPLIES_TO;
+        }
         match user_version {
             v if v == SCHEMA_VERSION => {
                 for (migration_id, _, _) in MIGRATIONS {
@@ -961,7 +1237,18 @@ impl State {
             .optional()
             .map_err(|err| StateError::from_sqlite("journal_intent: read", err))?;
         if let Some((owner_request_id, status, outcome, response, existing_line)) = existing {
-            if owner_request_id == request_id && status != "claimed" {
+            if owner_request_id == request_id {
+                if status == "claimed" {
+                    // A concurrent retry of the SAME request while the first
+                    // attempt is still in flight: no response is recorded yet
+                    // and re-claiming the key would violate its uniqueness —
+                    // refuse typed (never a raw SQLite constraint error) and
+                    // let the caller retry for the recorded replay.
+                    return Err(state_error(
+                        "state.claim_incomplete",
+                        format!("claim {key:?} is still in flight (request {owner_request_id})"),
+                    ));
+                }
                 if let Some(response) = response.filter(|response| !response.is_empty()) {
                     return Ok((ClaimAttempt::Replay { response }, None));
                 }
@@ -981,14 +1268,10 @@ impl State {
                     format!("claim {key:?} is still in flight (request {owner_request_id})"),
                 ));
             }
-            if owner_request_id != request_id {
-                return Err(state_error(
-                    "state.claim_reused",
-                    format!(
-                        "idempotency key {key:?} already belongs to request {owner_request_id}"
-                    ),
-                ));
-            }
+            return Err(state_error(
+                "state.claim_reused",
+                format!("idempotency key {key:?} already belongs to request {owner_request_id}"),
+            ));
         }
         let audit = self.append_audit_locked(&tx, action, target, key, plan_hash, grant_id)?;
         tx.execute(
@@ -1541,6 +1824,646 @@ impl State {
             out.push(row.map_err(|err| StateError::from_sqlite("list_instances: row", err))?);
         }
         Ok(out)
+    }
+
+    // ---------------------------------------------------------------------
+    // Queue executor (issue #85): durable submissions, membership and
+    // unique work ownership
+    // ---------------------------------------------------------------------
+
+    /// One durable queue submission with its membership items (issue #85),
+    /// or `None` when no submission with that id exists. Read-only.
+    pub fn queue_submission_by_id(
+        &self,
+        submission_id: &str,
+    ) -> Result<Option<(QueueSubmissionRow, Vec<QueueSubmissionItemRow>)>, StateError> {
+        let conn = self.lock("queue_submission_by_id")?;
+        let row = conn
+            .query_row(
+                "SELECT submission_id, repository, state_epoch, digest, role_key,
+                        role_revision, workflow_id, workflow_hash, boundary_phase,
+                        integration_branch, completion_branch, boundary_caps,
+                        request_line, created_at
+                   FROM queue_submissions WHERE submission_id = ?1",
+                params![submission_id],
+                |row| {
+                    Ok(QueueSubmissionRow {
+                        submission_id: row.get(0)?,
+                        repository: row.get(1)?,
+                        state_epoch: row.get(2)?,
+                        digest: row.get(3)?,
+                        role_key: row.get(4)?,
+                        role_revision: row.get(5)?,
+                        workflow_id: row.get(6)?,
+                        workflow_hash: row.get(7)?,
+                        boundary_phase: row.get(8)?,
+                        integration_branch: row.get(9)?,
+                        completion_branch: row.get(10)?,
+                        boundary_caps: row.get(11)?,
+                        request_line: row.get(12)?,
+                        created_at: row.get(13)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("queue_submission_by_id: query", err))?;
+        let Some(submission) = row else {
+            return Ok(None);
+        };
+        let mut statement = conn
+            .prepare(
+                "SELECT submission_id, ordinal, work_item, issue_number, issue_revision,
+                        status, reason, message, instance_id
+                   FROM queue_submission_items WHERE submission_id = ?1 ORDER BY ordinal",
+            )
+            .map_err(|err| StateError::from_sqlite("queue_submission_by_id: prepare", err))?;
+        let rows = statement
+            .query_map(params![submission_id], |row| {
+                Ok(QueueSubmissionItemRow {
+                    submission_id: row.get(0)?,
+                    ordinal: row.get(1)?,
+                    work_item: row.get(2)?,
+                    issue_number: row.get(3)?,
+                    issue_revision: row.get(4)?,
+                    status: row.get(5)?,
+                    reason: row.get(6)?,
+                    message: row.get(7)?,
+                    instance_id: row.get(8)?,
+                })
+            })
+            .map_err(|err| StateError::from_sqlite("queue_submission_by_id: query_map", err))?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(
+                row.map_err(|err| StateError::from_sqlite("queue_submission_by_id: row", err))?,
+            );
+        }
+        Ok(Some((submission, items)))
+    }
+
+    /// Every unique work-ownership row, oldest first (read-only; the
+    /// ownership readback AC6 and the focused tests read this).
+    pub fn queue_ownership_rows(&self) -> Result<Vec<QueueOwnershipRow>, StateError> {
+        let conn = self.lock("queue_ownership_rows")?;
+        let mut statement = conn
+            .prepare(
+                "SELECT repository, issue_number, work_item, submission_id, instance_id,
+                        created_at
+                   FROM queue_ownership ORDER BY created_at, repository, issue_number",
+            )
+            .map_err(|err| StateError::from_sqlite("queue_ownership_rows: prepare", err))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(QueueOwnershipRow {
+                    repository: row.get(0)?,
+                    issue_number: row.get(1)?,
+                    work_item: row.get(2)?,
+                    submission_id: row.get(3)?,
+                    instance_id: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })
+            .map_err(|err| StateError::from_sqlite("queue_ownership_rows: query_map", err))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|err| StateError::from_sqlite("queue_ownership_rows: row", err))?);
+        }
+        Ok(out)
+    }
+
+    /// Commit ONE durable queue submission in a single transaction (issue
+    /// #85 AC2/AC3). Every state-derived decision — live ownership, grant
+    /// status/expiry, scope overlap, concurrency capacity — is re-verified
+    /// HERE, under the one state guard, before a row is written: the
+    /// submission, its membership items, the admitted run rows and the
+    /// unique work-ownership rows commit together or not at all, so a
+    /// double click, a retry or a restart can never duplicate an owner or
+    /// leave a partially admitted run.
+    pub fn submit_queue_run(
+        &self,
+        plan: &QueueSubmissionPlan,
+    ) -> Result<(QueueSubmissionRow, Vec<QueueSubmissionItemRow>), StateError> {
+        let outcome = self.submit_queue_run_inner(plan);
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn submit_queue_run_inner(
+        &self,
+        plan: &QueueSubmissionPlan,
+    ) -> Result<(QueueSubmissionRow, Vec<QueueSubmissionItemRow>), StateError> {
+        self.ensure_writable()?;
+        let mut conn = self.lock("submit_queue_run")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("submit_queue_run: begin", err))?;
+        let epoch = current_epoch_locked(&tx)?;
+        if epoch != plan.state_epoch {
+            return Err(state_error(
+                "state.epoch_mismatch",
+                format!(
+                    "submission epoch {} != current epoch {epoch}; an approval dies with its epoch \
+                     (render a fresh preview)",
+                    plan.state_epoch
+                ),
+            ));
+        }
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM queue_submissions WHERE submission_id = ?1",
+                params![plan.submission_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("submit_queue_run: existing", err))?;
+        if existing.is_some() {
+            return Err(state_error(
+                "state.submission_exists",
+                format!(
+                    "submission {} already exists; the same approval material was already \
+                     committed",
+                    plan.submission_id
+                ),
+            ));
+        }
+        // Live ownership: every owned-status run of this repository, keyed by
+        // issue number. An issue already owned here can never gain a second
+        // owner in this transaction.
+        let owned: BTreeMap<i64, OwnedRunSnapshot> = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT issue_number, instance_id, issue_revision, paused, resume_digest
+                       FROM instances
+                      WHERE repository = ?1
+                        AND status IN ('new', 'running', 'paused', 'human_queue', 'blocked')",
+                )
+                .map_err(|err| StateError::from_sqlite("submit_queue_run: owned", err))?;
+            let rows = statement
+                .query_map(params![plan.repository], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        OwnedRunSnapshot {
+                            instance_id: row.get(1)?,
+                            issue_revision: row.get(2)?,
+                            paused: row.get::<_, i64>(3)? != 0,
+                            resume_digest: row.get(4)?,
+                        },
+                    ))
+                })
+                .map_err(|err| StateError::from_sqlite("submit_queue_run: owned query", err))?;
+            let mut owned = BTreeMap::new();
+            for row in rows {
+                let (issue_number, run) =
+                    row.map_err(|err| StateError::from_sqlite("submit_queue_run: owned row", err))?;
+                owned.entry(issue_number).or_insert(run);
+            }
+            owned
+        };
+        // Counted lanes: the fan-out capacity axes plus the same-repository
+        // declared scopes for the overlap re-check.
+        let counted_global: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM instances
+                  WHERE status IN ('new', 'running', 'human_queue', 'blocked')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| StateError::from_sqlite("submit_queue_run: counted", err))?;
+        let repository_lanes: Vec<(i64, String)> = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT issue_number, scope FROM instances
+                      WHERE repository = ?1
+                        AND status IN ('new', 'running', 'human_queue', 'blocked')",
+                )
+                .map_err(|err| StateError::from_sqlite("submit_queue_run: lanes", err))?;
+            let rows = statement
+                .query_map(params![plan.repository], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|err| StateError::from_sqlite("submit_queue_run: lanes query", err))?;
+            let mut lanes = Vec::new();
+            for row in rows {
+                lanes.push(
+                    row.map_err(|err| StateError::from_sqlite("submit_queue_run: lanes row", err))?,
+                );
+            }
+            lanes
+        };
+        let counted_repository = repository_lanes.len() as i64;
+        let mut slots = FanoutSlots {
+            caps: &plan.admission_caps,
+            counted_global,
+            counted_repository,
+            harness_lanes: plan.harness_lanes,
+            admitted_global: 0,
+            admitted_repository: 0,
+            admitted_harness: 0,
+        };
+        let mut items: Vec<QueueSubmissionItemRow> = Vec::new();
+        for item in &plan.items {
+            let scope = format!("worktrees/issues/{}", item.issue_number);
+            // Decide the item under the guard. The presented verdict is a
+            // fail-closed hint; ownership, grant status/expiry, overlap and
+            // capacity are re-derived from live rows here, before any write.
+            let decision: AdmissionDecision = 'decide: {
+                match &item.verdict {
+                    SubmissionVerdict::Refused { code, message } => {
+                        break 'decide AdmissionDecision::Refused {
+                            code,
+                            message: message.clone(),
+                        };
+                    }
+                    SubmissionVerdict::Waiting { code, message } => {
+                        break 'decide AdmissionDecision::Waiting {
+                            code,
+                            message: message.clone(),
+                        };
+                    }
+                    SubmissionVerdict::Approved => {}
+                }
+                if let Some(run) = owned.get(&item.issue_number) {
+                    // An owner that appeared after the preview moved the
+                    // verdict: only an explicit engine-authorized resume of a
+                    // still-paused run admits an owned item; every other
+                    // owned item is refused without any effect.
+                    let authorized = match (&item.resume_digest, run.paused) {
+                        (Some(presented), true) => {
+                            crate::engine::authorize_resume(&run.resume_digest, presented).is_ok()
+                        }
+                        _ => false,
+                    };
+                    if authorized {
+                        let affected = tx
+                            .execute(
+                                "UPDATE instances SET paused = 0, resume_digest = '',
+                                        status = 'running', updated_at = ?2
+                                  WHERE instance_id = ?1 AND paused = 1",
+                                params![run.instance_id, plan.at],
+                            )
+                            .map_err(|err| {
+                                StateError::from_sqlite("submit_queue_run: resume", err)
+                            })?;
+                        if affected == 1 {
+                            break 'decide AdmissionDecision::Admitted {
+                                instance_id: run.instance_id.clone(),
+                            };
+                        }
+                        break 'decide AdmissionDecision::Refused {
+                            code: crate::queue_executor::codes::PAUSED,
+                            message:
+                                "the run left its paused state while the submission committed; \
+                                      no implicit state change is applied"
+                                    .to_string(),
+                        };
+                    }
+                    if run.paused {
+                        break 'decide AdmissionDecision::Refused {
+                            code: crate::queue_executor::codes::PAUSED,
+                            message: format!(
+                                "run {} is paused and stays paused: a paused fleet is resumed only \
+                                 with a separate explicit engine-minted resume authorization",
+                                run.instance_id
+                            ),
+                        };
+                    }
+                    if run.issue_revision != item.issue_revision {
+                        break 'decide AdmissionDecision::Refused {
+                            code: crate::queue_preview::holds::REVISION_STALE,
+                            message: format!(
+                                "run {} recorded revision {}; the selected revision {} is not the \
+                                 bound spec revision",
+                                run.instance_id, run.issue_revision, item.issue_revision
+                            ),
+                        };
+                    }
+                    break 'decide AdmissionDecision::Refused {
+                        code: crate::queue_executor::codes::ALREADY_OWNED,
+                        message: format!(
+                            "run {} already owns this issue; a duplicate submission never \
+                             creates a second owner",
+                            run.instance_id
+                        ),
+                    };
+                }
+                // No live owner: re-verify the presented grant under the
+                // guard (status, epoch and expiry are the volatile facts).
+                let grant_id = item.grant_id.as_deref().unwrap_or_default();
+                let grant: Option<GrantBinding> = tx
+                    .query_row(
+                        "SELECT repository, issue_number, issue_revision, workflow_hash, phase,
+                                scope, caps, expires_at, state_epoch, policy_hash, status
+                           FROM grants WHERE grant_id = ?1",
+                        params![grant_id],
+                        |row| {
+                            Ok(GrantBinding {
+                                repository: row.get(0)?,
+                                issue_number: row.get(1)?,
+                                issue_revision: row.get(2)?,
+                                workflow_hash: row.get(3)?,
+                                phase: row.get(4)?,
+                                scope: row.get(5)?,
+                                caps: row.get(6)?,
+                                expires_at: row.get(7)?,
+                                state_epoch: row.get(8)?,
+                                policy_hash: row.get(9)?,
+                                status: row.get(10)?,
+                            })
+                        },
+                    )
+                    .optional()
+                    .map_err(|err| StateError::from_sqlite("submit_queue_run: grant", err))?;
+                let Some(grant) = grant else {
+                    break 'decide AdmissionDecision::Refused {
+                        code: crate::mutation::code::GRANT_INACTIVE,
+                        message: format!(
+                            "no grant {grant_id:?} exists; the presented grant is refused before \
+                             any effect"
+                        ),
+                    };
+                };
+                if grant.status != "active" {
+                    break 'decide AdmissionDecision::Refused {
+                        code: crate::mutation::code::GRANT_INACTIVE,
+                        message: format!(
+                            "grant {grant_id} is {}; a revoked or invalidated grant refuses this \
+                             item before any effect",
+                            grant.status
+                        ),
+                    };
+                }
+                if grant.state_epoch != epoch {
+                    break 'decide AdmissionDecision::Refused {
+                        code: crate::mutation::code::EPOCH_STALE,
+                        message: format!(
+                            "grant {grant_id} was issued under epoch {}; grants die with their \
+                             epoch",
+                            grant.state_epoch
+                        ),
+                    };
+                }
+                if crate::mutation::is_expired(&grant.expires_at, &plan.at) {
+                    break 'decide AdmissionDecision::Refused {
+                        code: crate::mutation::code::GRANT_EXPIRED,
+                        message: format!("grant {grant_id} expired at {}", grant.expires_at),
+                    };
+                }
+                if grant.repository != plan.repository
+                    || grant.issue_number != item.issue_number
+                    || grant.issue_revision != item.issue_revision
+                {
+                    break 'decide AdmissionDecision::Refused {
+                        code: crate::queue_executor::codes::GRANT,
+                        message: format!(
+                            "grant {grant_id} binds {}#{}@{}, not the selected {scope}",
+                            grant.repository, grant.issue_number, grant.issue_revision
+                        ),
+                    };
+                }
+                if grant.workflow_hash != plan.workflow_hash {
+                    break 'decide AdmissionDecision::Refused {
+                        code: crate::mutation::code::WORKFLOW_CHANGED,
+                        message: format!(
+                            "grant {grant_id} binds workflow {}; the submission binds {}",
+                            grant.workflow_hash, plan.workflow_hash
+                        ),
+                    };
+                }
+                if grant.scope != scope {
+                    break 'decide AdmissionDecision::Refused {
+                        code: crate::queue_executor::codes::GRANT,
+                        message: format!(
+                            "grant {grant_id} declares scope {:?}; the reviewed planned scope is \
+                             {scope:?}",
+                            grant.scope
+                        ),
+                    };
+                }
+                if let Some((code, message)) = slots.hold() {
+                    break 'decide AdmissionDecision::Waiting { code, message };
+                }
+                if repository_lanes.iter().any(|(lane_issue, lane_scope)| {
+                    *lane_issue != item.issue_number
+                        && crate::lifecycle::paths_overlap(&scope, lane_scope)
+                }) {
+                    break 'decide AdmissionDecision::Waiting {
+                        code: crate::lifecycle::code::MONOREPO_OVERLAP,
+                        message: format!(
+                            "the planned scope {scope:?} overlaps a concurrent lane scope in {:?}; \
+                             the item waits",
+                            plan.repository
+                        ),
+                    };
+                }
+                // Admitted: one run row plus one unique ownership row, both
+                // inside this transaction.
+                let derived = format!("hf-queue-run/v1|{}|{}", plan.submission_id, item.work_item);
+                let run_id = format!(
+                    "run-{}",
+                    &crate::canonical::sha256_hex(derived.as_bytes())[..16]
+                );
+                tx.execute(
+                    "INSERT INTO instances (instance_id, repository, state_epoch, status,
+                            workflow_id, workflow_hash, policy_hash, grant_id, issue_number,
+                            issue_revision, phase, scope, caps, current_node, normal_rounds,
+                            recovery_rounds, human_queue, terminal_blockers, paused,
+                            resume_digest, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'new', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, '', 0, 0,
+                             0, 0, 0, '', ?13, ?13)",
+                    params![
+                        run_id,
+                        plan.repository,
+                        epoch,
+                        plan.workflow_id,
+                        grant.workflow_hash,
+                        grant.policy_hash,
+                        grant_id,
+                        item.issue_number,
+                        item.issue_revision,
+                        grant.phase,
+                        grant.scope,
+                        grant.caps,
+                        plan.at
+                    ],
+                )
+                .map_err(|err| StateError::from_sqlite("submit_queue_run: instance", err))?;
+                let prior: Option<String> = tx
+                    .query_row(
+                        "SELECT instance_id FROM queue_ownership
+                          WHERE repository = ?1 AND issue_number = ?2",
+                        params![plan.repository, item.issue_number],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|err| {
+                        StateError::from_sqlite("submit_queue_run: ownership read", err)
+                    })?;
+                match prior {
+                    None => {
+                        tx.execute(
+                            "INSERT INTO queue_ownership (repository, issue_number, work_item,
+                                    submission_id, instance_id, created_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![
+                                plan.repository,
+                                item.issue_number,
+                                item.work_item,
+                                plan.submission_id,
+                                run_id,
+                                plan.at
+                            ],
+                        )
+                        .map_err(|err| {
+                            StateError::from_sqlite("submit_queue_run: ownership insert", err)
+                        })?;
+                    }
+                    Some(prior_instance) => {
+                        // A prior owner that left the owned set is historical
+                        // (the row is replaced); a live one is a hard
+                        // conflict that rolls the whole submission back.
+                        let still_owned: Option<i64> = tx
+                            .query_row(
+                                "SELECT 1 FROM instances
+                                  WHERE instance_id = ?1
+                                    AND status IN ('new', 'running', 'paused', 'human_queue',
+                                                   'blocked')",
+                                params![prior_instance],
+                                |row| row.get(0),
+                            )
+                            .optional()
+                            .map_err(|err| {
+                                StateError::from_sqlite("submit_queue_run: ownership recheck", err)
+                            })?;
+                        if still_owned.is_some() {
+                            return Err(state_error(
+                                "state.ownership_conflict",
+                                format!(
+                                    "issue {} of {} already has a live owner ({prior_instance}); \
+                                     a duplicate owner is refused",
+                                    item.issue_number, plan.repository
+                                ),
+                            ));
+                        }
+                        tx.execute(
+                            "UPDATE queue_ownership SET work_item = ?3, submission_id = ?4,
+                                    instance_id = ?5, created_at = ?6
+                              WHERE repository = ?1 AND issue_number = ?2",
+                            params![
+                                plan.repository,
+                                item.issue_number,
+                                item.work_item,
+                                plan.submission_id,
+                                run_id,
+                                plan.at
+                            ],
+                        )
+                        .map_err(|err| {
+                            StateError::from_sqlite("submit_queue_run: ownership update", err)
+                        })?;
+                    }
+                }
+                slots.consume();
+                break 'decide AdmissionDecision::Admitted {
+                    instance_id: run_id,
+                };
+            };
+            let (status, reason, message, instance_id) = match decision {
+                AdmissionDecision::Admitted { instance_id } => {
+                    ("admitted".to_string(), None, None, Some(instance_id))
+                }
+                AdmissionDecision::Waiting { code, message } => (
+                    "waiting".to_string(),
+                    Some(code.to_string()),
+                    Some(message),
+                    None,
+                ),
+                AdmissionDecision::Refused { code, message } => (
+                    "refused".to_string(),
+                    Some(code.to_string()),
+                    Some(message),
+                    None,
+                ),
+            };
+            items.push(QueueSubmissionItemRow {
+                submission_id: plan.submission_id.clone(),
+                ordinal: item.ordinal,
+                work_item: item.work_item.clone(),
+                issue_number: item.issue_number,
+                issue_revision: item.issue_revision.clone(),
+                status,
+                reason,
+                message,
+                instance_id,
+            });
+        }
+        tx.execute(
+            "INSERT INTO queue_submissions (submission_id, repository, state_epoch, digest,
+                    role_key, role_revision, workflow_id, workflow_hash, boundary_phase,
+                    integration_branch, completion_branch, boundary_caps, request_line,
+                    created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                plan.submission_id,
+                plan.repository,
+                plan.state_epoch,
+                plan.digest,
+                plan.role_key,
+                plan.role_revision,
+                plan.workflow_id,
+                plan.workflow_hash,
+                plan.boundary_phase,
+                plan.integration_branch,
+                plan.completion_branch,
+                canonical_text(&Val::Arr(
+                    plan.boundary_caps.iter().map(|cap| string(cap)).collect()
+                )),
+                plan.request_line,
+                plan.at
+            ],
+        )
+        .map_err(|err| StateError::from_sqlite("submit_queue_run: submission", err))?;
+        for item in &items {
+            tx.execute(
+                "INSERT INTO queue_submission_items (submission_id, ordinal, work_item,
+                        issue_number, issue_revision, status, reason, message, instance_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    item.submission_id,
+                    item.ordinal,
+                    item.work_item,
+                    item.issue_number,
+                    item.issue_revision,
+                    item.status,
+                    item.reason,
+                    item.message,
+                    item.instance_id
+                ],
+            )
+            .map_err(|err| StateError::from_sqlite("submit_queue_run: item", err))?;
+        }
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("submit_queue_run: commit", err))?;
+        let submission = QueueSubmissionRow {
+            submission_id: plan.submission_id.clone(),
+            repository: plan.repository.clone(),
+            state_epoch: plan.state_epoch,
+            digest: plan.digest.clone(),
+            role_key: plan.role_key.clone(),
+            role_revision: plan.role_revision.clone(),
+            workflow_id: plan.workflow_id.clone(),
+            workflow_hash: plan.workflow_hash.clone(),
+            boundary_phase: plan.boundary_phase.clone(),
+            integration_branch: plan.integration_branch.clone(),
+            completion_branch: plan.completion_branch.clone(),
+            boundary_caps: canonical_text(&Val::Arr(
+                plan.boundary_caps.iter().map(|cap| string(cap)).collect(),
+            )),
+            request_line: plan.request_line.clone(),
+            created_at: plan.at.clone(),
+        };
+        Ok((submission, items))
     }
 
     // ---------------------------------------------------------------------
@@ -7258,9 +8181,19 @@ const M0008_ID: &str = "m0008_lane_replacement_profiles_v8";
 const M0008_APPLIES_FROM: i64 = 7;
 const M0008_APPLIES_TO: i64 = 8;
 
+/// Migration m0009 (issue #85: the queue executor). Purely additive: the
+/// durable queue-submission tables (the committed approval binding, the
+/// persisted run membership with per-issue admitted/waiting/refused
+/// outcomes, and the unique work-ownership rows). No existing table or row
+/// is touched, so stored grants, instances and lane records are never
+/// reinterpreted by the upgrade.
+const M0009_ID: &str = "m0009_queue_submissions_v9";
+const M0009_APPLIES_FROM: i64 = 8;
+const M0009_APPLIES_TO: i64 = 9;
+
 /// Ordered migration chain (id, applies_from, applies_to). The runner in
 /// [`State::open`] applies every pending migration before serving.
-const MIGRATIONS: [(&str, i64, i64); 8] = [
+const MIGRATIONS: [(&str, i64, i64); 9] = [
     (M0001_ID, M0001_APPLIES_FROM, M0001_APPLIES_TO),
     (M0002_ID, M0002_APPLIES_FROM, M0002_APPLIES_TO),
     (M0003_ID, M0003_APPLIES_FROM, M0003_APPLIES_TO),
@@ -7269,15 +8202,16 @@ const MIGRATIONS: [(&str, i64, i64); 8] = [
     (M0006_ID, M0006_APPLIES_FROM, M0006_APPLIES_TO),
     (M0007_ID, M0007_APPLIES_FROM, M0007_APPLIES_TO),
     (M0008_ID, M0008_APPLIES_FROM, M0008_APPLIES_TO),
+    (M0009_ID, M0009_APPLIES_FROM, M0009_APPLIES_TO),
 ];
 
-/// Ordered migration-chain identifiers (`m0001`..`m0008`), exposed for the
+/// Ordered migration-chain identifiers (`m0001`..`m0009`), exposed for the
 /// release provenance chain (issue #10): `canter --version` prints
 /// them so a release archive's provenance record can bind the exact
 /// state-schema migration chain of the binary it ships.
 pub fn migration_chain_ids() -> &'static [&'static str] {
     const IDS: [&str; MIGRATIONS.len()] = [
-        M0001_ID, M0002_ID, M0003_ID, M0004_ID, M0005_ID, M0006_ID, M0007_ID, M0008_ID,
+        M0001_ID, M0002_ID, M0003_ID, M0004_ID, M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID,
     ];
     &IDS
 }
@@ -7412,6 +8346,51 @@ CREATE TABLE lane_replacement_profiles (
     profile TEXT NOT NULL,
     revision TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+";
+
+/// Queue-executor tables added by m0009 (issue #85): the committed
+/// submission binding, the persisted run membership (one row per selected
+/// issue with its admitted/waiting/refused outcome), and the unique
+/// work-ownership rows (`PRIMARY KEY (repository, issue_number)`: the
+/// schema-level guarantee that one live run owns one issue).
+const M0009_SQL: &str = "\
+CREATE TABLE queue_submissions (
+    submission_id TEXT PRIMARY KEY,
+    repository TEXT NOT NULL,
+    state_epoch INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    role_key TEXT NOT NULL,
+    role_revision TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    workflow_hash TEXT NOT NULL,
+    boundary_phase TEXT NOT NULL,
+    integration_branch TEXT NOT NULL,
+    completion_branch TEXT NOT NULL,
+    boundary_caps TEXT NOT NULL,
+    request_line TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE queue_submission_items (
+    submission_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    work_item TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    issue_revision TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    message TEXT,
+    instance_id TEXT,
+    PRIMARY KEY (submission_id, ordinal)
+);
+CREATE TABLE queue_ownership (
+    repository TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    work_item TEXT NOT NULL,
+    submission_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (repository, issue_number)
 );
 ";
 
@@ -8489,6 +9468,37 @@ fn run_m0008(conn: &mut Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+/// Run migration m0009 in one transaction: the queue-executor tables
+/// (issue #85 — durable submissions, persisted run membership, unique work
+/// ownership). Purely additive — no existing table or row is touched, so
+/// stored grants, instances and lane records are never reinterpreted by the
+/// upgrade.
+fn run_m0009(conn: &mut Connection) -> Result<(), StateError> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| StateError::from_sqlite("migrate m0009: begin", err))?;
+    let checksum = sha256_hex(M0009_SQL.as_bytes());
+    tx.execute_batch(M0009_SQL)
+        .map_err(|err| StateError::from_sqlite("migrate m0009", err))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (migration_id, applies_from, applies_to, checksum, applied_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            M0009_ID,
+            M0009_APPLIES_FROM,
+            M0009_APPLIES_TO,
+            checksum,
+            time::rfc3339_now()
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("migrate m0009: bookkeeping", err))?;
+    tx.pragma_update(None, "user_version", M0009_APPLIES_TO)
+        .map_err(|err| StateError::from_sqlite("migrate m0009: user_version", err))?;
+    tx.commit()
+        .map_err(|err| StateError::from_sqlite("migrate m0009: commit", err))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9347,12 +10357,12 @@ mod tests {
         assert_eq!(grant.status, "active");
         assert_eq!(grant.state_epoch, 1);
         assert_eq!(state.current_epoch().expect("epoch"), 1);
-        assert_eq!(SCHEMA_VERSION, 8);
+        assert_eq!(SCHEMA_VERSION, 9);
         {
             let conn = state
-                .lock("test: m0005/m0006/m0007/m0008 bookkeeping")
+                .lock("test: m0005/m0006/m0007/m0008/m0009 bookkeeping")
                 .expect("lock");
-            for migration_id in [M0005_ID, M0006_ID, M0007_ID, M0008_ID] {
+            for migration_id in [M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID] {
                 let recorded: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
@@ -9738,9 +10748,9 @@ mod tests {
         );
         {
             let conn = state
-                .lock("test: m0006/m0007/m0008 bookkeeping")
+                .lock("test: m0006/m0007/m0008/m0009 bookkeeping")
                 .expect("lock");
-            for migration_id in [M0006_ID, M0007_ID, M0008_ID] {
+            for migration_id in [M0006_ID, M0007_ID, M0008_ID, M0009_ID] {
                 let recorded: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
@@ -9882,8 +10892,10 @@ mod tests {
             .expect("the stored retirement boundary admits a start after the upgrade");
         assert_eq!(plan.record.phase, "retired");
         {
-            let conn = state.lock("test: m0007/m0008 bookkeeping").expect("lock");
-            for migration_id in [M0007_ID, M0008_ID] {
+            let conn = state
+                .lock("test: m0007/m0008/m0009 bookkeeping")
+                .expect("lock");
+            for migration_id in [M0007_ID, M0008_ID, M0009_ID] {
                 let recorded: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",

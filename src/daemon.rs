@@ -541,6 +541,8 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "doctor" => method_doctor(shared, request),
         "status" => method_status(shared, request),
         "state.epoch" => method_state_epoch(shared, request),
+        "queue.submit" => method_queue_submit(shared, request),
+        "queue.status" => method_queue_status(shared, request),
         "schedules.list" => method_schedules(shared, request),
         "schedules.create" => method_schedule_create(shared, request),
         "schedules.pause" => method_schedule_pause(shared, request),
@@ -2291,6 +2293,170 @@ fn method_grants_list(shared: &Arc<Shared>, request: &Request) -> String {
                 let grants: Vec<Val> = rows.iter().map(grant_doc).collect();
                 ok_response(&request.id, object(vec![("grants", Val::Arr(grants))]))
             }
+            Err(err) => err_response(&request.id, err.code, err.message),
+        },
+        Err(message) => err_response(&request.id, "state.unavailable", message),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Queue executor (issue #85): the durable selected-run submission path
+// ---------------------------------------------------------------------------
+
+/// `queue.submit`: commit ONE approved selected-issue run — the executor
+/// slice that consumes the #84 preview digest.
+///
+/// Every refusal happens BEFORE the claim (nothing is journaled and no
+/// effect exists): malformed params, a digest that does not match the
+/// freshly re-rendered preview, a stale epoch, a moved profile
+/// configuration revision, an unsupported/unresolved step spine, a
+/// production-class or protected completion boundary. After the claim, the
+/// whole submission — the durable binding, the persisted membership with
+/// per-issue admitted/waiting/refused outcomes, and every admitted run with
+/// its unique ownership row — commits in ONE transaction that re-verifies
+/// ownership, grant status/expiry, overlap and capacity under the guard.
+/// The transaction NEVER spawns a process or executes a step: step
+/// execution stays with the merged `apply` machinery.
+fn method_queue_submit(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "queue.submit requires params: digest, epoch, preview, binding, role_revision, caps, \
+             observations[, grants, resume]",
+        );
+    };
+    let material = match crate::queue_executor::parse_params(params) {
+        Ok(material) => material,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let submission_id =
+        crate::queue_executor::submission_id(&material.digest, &material.idempotency_key);
+    let revalidated = {
+        let state = match shared.lock_state() {
+            Ok(state) => state,
+            Err(message) => return err_response(&request.id, "state.unavailable", message),
+        };
+        crate::queue_executor::revalidate(&state, &material)
+    };
+    let revalidated = match revalidated {
+        Ok(revalidated) => revalidated,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let target = format!("queue:{submission_id}");
+    let key = match journal_mutation(shared, request, "mutate.queue.submit", &target) {
+        Intent::Claimed { key } => key,
+        Intent::Replay { response } => return replay(shared, &response),
+        Intent::Refused { code, message } => return err_response(&request.id, code, &message),
+    };
+    crash_point("queue.after-intent");
+    let request_line = canonical_text(
+        &revalidated
+            .preview
+            .doc
+            .get("request")
+            .cloned()
+            .unwrap_or_else(|| material.preview.clone()),
+    );
+    let plan = crate::state::QueueSubmissionPlan {
+        submission_id: submission_id.clone(),
+        repository: revalidated.request.repository.clone(),
+        state_epoch: material.epoch,
+        digest: material.digest.clone(),
+        role_key: revalidated.request.harness_key.clone(),
+        role_revision: material.role_revision.clone(),
+        workflow_id: revalidated.request.workflow_id.clone(),
+        workflow_hash: revalidated.request.workflow_hash.clone(),
+        boundary_phase: revalidated.request.boundary.phase.clone(),
+        integration_branch: revalidated.request.boundary.integration_branch.clone(),
+        completion_branch: revalidated.request.boundary.completion_branch.clone(),
+        boundary_caps: revalidated.request.boundary.caps.clone(),
+        request_line,
+        admission_caps: material.caps,
+        harness_lanes: material.harness_lanes,
+        items: revalidated
+            .items
+            .iter()
+            .enumerate()
+            .map(|(ordinal, item)| crate::state::QueueSubmissionItemPlan {
+                ordinal: ordinal as i64,
+                work_item: item.work_item.clone(),
+                issue_number: item.issue_number,
+                issue_revision: item.revision.clone(),
+                grant_id: item.grant_id.clone(),
+                resume_digest: item.resume_digest.clone(),
+                verdict: item.verdict.clone(),
+            })
+            .collect(),
+        at: time::rfc3339_now(),
+    };
+    let guard = match shared.lock_state() {
+        Ok(guard) => guard,
+        Err(message) => return err_response(&request.id, "state.unavailable", message),
+    };
+    let response = match guard.submit_queue_run(&plan) {
+        Ok((row, items)) => {
+            // The submission committed: an interrupt from here on is the
+            // "committed, unresolved" restart window (reconciled from the
+            // commit marker, never re-executed).
+            crash_point("queue.after-commit");
+            let doc = crate::queue_executor::submission_doc(&row, &items);
+            resolve_mutation_on(
+                &guard,
+                &shared.log,
+                request,
+                &key,
+                "queue.submit",
+                true,
+                doc,
+                None,
+            )
+        }
+        Err(err) => resolve_mutation_on(
+            &guard,
+            &shared.log,
+            request,
+            &key,
+            "queue.submit",
+            false,
+            null(),
+            Some((err.code, err.message)),
+        ),
+    };
+    drop(guard);
+    publish_after_state_change(shared, None);
+    response
+}
+
+/// `queue.status`: read one committed submission back. The document is the
+/// same pure projection of the committed rows the original submission
+/// response carried, so the CLI/JSON readback and the daemon readback agree
+/// by construction.
+fn method_queue_status(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(submission_id) = request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("submission_id"))
+        .and_then(Val::as_str)
+        .filter(|text| crate::formats::is_submission_id(text))
+    else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "queue.status requires params.submission_id (qs_ + 16 hex)",
+        );
+    };
+    match shared.lock_state() {
+        Ok(state) => match state.queue_submission_by_id(submission_id) {
+            Ok(Some((row, items))) => ok_response(
+                &request.id,
+                crate::queue_executor::submission_doc(&row, &items),
+            ),
+            Ok(None) => err_response(
+                &request.id,
+                "state.not_found",
+                format!("no submission {submission_id:?} exists"),
+            ),
             Err(err) => err_response(&request.id, err.code, err.message),
         },
         Err(message) => err_response(&request.id, "state.unavailable", message),
@@ -5751,6 +5917,18 @@ fn reconcile_claims(
                 {
                     reconcile_lane_successor(state, log, params)?;
                 }
+                // Issue #85: an interrupted `queue.submit` claim reconciles
+                // against its commit marker (the committed submission row).
+                // The row, the membership items, the admitted runs and the
+                // ownership rows commit in ONE transaction, so a present row
+                // means exactly the committed effects exist and a missing
+                // row means none do: nothing is ever re-executed.
+                if claim.method == "queue.submit"
+                    && let Ok(doc) = Val::parse_json(&claim.request_line)
+                    && let Some(params) = doc.get("params")
+                {
+                    reconcile_queue_submission(state, log, params)?;
+                }
             }
             Err(err) => {
                 return Err(daemon_error(
@@ -6295,6 +6473,107 @@ fn reconcile_lane_successor(
             err.code, err.message
         )),
     }
+}
+
+/// Restart reconciliation for one interrupted `queue.submit` claim (issue
+/// #85 AC6). The committed submission row is the commit marker: the row,
+/// the membership items, the admitted run rows and the ownership rows
+/// commit in ONE transaction, so re-reading the marker is enough to know
+/// exactly which effects exist.
+///
+/// - Row present: the submission committed; the derived document is read
+///   back from the durable rows and its digest binding is re-verified
+///   against the persisted bound-input line. Nothing is re-executed and no
+///   owner is created (the claim stays ambiguous: a retry needs a fresh
+///   key).
+/// - Row absent: the submission transaction never committed (all-or-
+///   nothing), so no run and no ownership row exists; the claim stays
+///   ambiguous with the generic reconciliation outcome, and a retry with a
+///   fresh key re-evaluates live state.
+fn reconcile_queue_submission(
+    state: &State,
+    log: &DaemonLog,
+    params: &Val,
+) -> Result<(), DaemonError> {
+    let digest = params
+        .get("digest")
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    let key = params
+        .get("idempotency_key")
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    if digest.is_empty() || key.is_empty() {
+        log.write(
+            "warn",
+            "reconcile.queue.submit",
+            "interrupted submission claim carries no digest/key; there is no commit marker to \
+             read back",
+        );
+        return Ok(());
+    }
+    let submission_id = crate::queue_executor::submission_id(digest, key);
+    let read = state
+        .queue_submission_by_id(&submission_id)
+        .map_err(|err| {
+            daemon_error(
+                "daemon.reconcile",
+                format!(
+                    "queue submission reconciliation: {}: {}",
+                    err.code, err.message
+                ),
+            )
+        })?;
+    let Some((row, items)) = read else {
+        log.write(
+            "info",
+            "reconcile.queue.submit",
+            &format!(
+                "interrupted submission {submission_id} never committed; the submission \
+                 transaction is all-or-nothing, so no owner or run exists and a retry needs a \
+                 fresh idempotency key"
+            ),
+        );
+        return Ok(());
+    };
+    let recomputed = Val::parse_json(&row.request_line)
+        .map(|bound| crate::queue_executor::bound_digest(&bound).unwrap_or_default())
+        .unwrap_or_default();
+    if recomputed != row.digest {
+        log.write(
+            "warn",
+            "reconcile.queue.submit",
+            &format!(
+                "committed submission {submission_id} carries a bound-input line that does not \
+                 recompute to its recorded digest; the durable rows stay untouched (the \
+                 submission is a read-only record, nothing to repair in place)"
+            ),
+        );
+        return Ok(());
+    }
+    let doc = crate::queue_executor::submission_doc(&row, &items);
+    let mut admitted = 0i64;
+    let mut waiting = 0i64;
+    let mut refused = 0i64;
+    if let Some(Val::Arr(items)) = doc.get("items") {
+        for item in items {
+            match item.get("status").and_then(Val::as_str) {
+                Some("admitted") => admitted += 1,
+                Some("waiting") => waiting += 1,
+                _ => refused += 1,
+            }
+        }
+    }
+    log.write(
+        "info",
+        "reconcile.queue.submit",
+        &format!(
+            "submission {submission_id} was committed before the interrupt ({admitted} admitted \
+             / {waiting} waiting / {refused} refused); the durable readback is verified against \
+             its digest binding and no effect is repeated"
+        ),
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
