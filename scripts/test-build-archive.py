@@ -5,19 +5,23 @@ Proves the issue #10 release-archive chain end-to-end on the current host:
 builder failure modes BITE (wrong source ref, dirty tree, version mismatch,
 unknown platform) and a real archive maps back to source + binary-reported
 schema facts + checksums + SBOM digest, deterministically (two builds with
-the same inputs produce byte-identical metadata and archive).
+the same inputs produce byte-identical metadata and archive). Issue #106
+review-fix round: the archive must also ship the pre-rename alias member
+with its own executable framing, SHA256SUMS entry and provenance record
+(docs/contracts/compatibility.md).
 
 Stdlib only. Run from the repository root:
     python3 scripts/test-build-archive.py
-Requirements: git, a release binary (builds one with
-`cargo build --release --locked` if absent), and a clean tracked worktree at
-a fixed HEAD. Never touches the network.
+Requirements: git, the release binaries (canter plus the pre-rename alias,
+built with `cargo build --release --locked` when absent), and a clean
+tracked worktree at a fixed HEAD. Never touches the network.
 """
 
 from __future__ import annotations
 
 import gzip
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -28,6 +32,23 @@ import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDER = os.path.join(REPO, "scripts", "build-archive.py")
+
+# The pre-rename alias binary member every release archive must ship next to
+# `canter` (docs/contracts/compatibility.md, "Product rename (issue #106)").
+# This single occurrence is a deliberate legacy mention pinned by
+# tests/rename_sweep.rs.
+LEGACY_ALIAS = "herdr-fleet"
+
+
+def _load_builder():
+    """Import the builder under test — single source for its member list."""
+    spec = importlib.util.spec_from_file_location("hf_build_archive", BUILDER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+builder = _load_builder()
 
 
 def run(argv, cwd=None, check=True):
@@ -43,10 +64,11 @@ def run(argv, cwd=None, check=True):
 
 def ensure_release_binary():
     binary = os.path.join(REPO, "target", "release", "canter")
-    if not os.path.isfile(binary):
+    alias = os.path.join(REPO, "target", "release", LEGACY_ALIAS)
+    if not os.path.isfile(binary) or not os.path.isfile(alias):
         proc = run(["cargo", "build", "--release", "--locked"], cwd=REPO)
         if proc.returncode != 0:
-            raise AssertionError("could not build the release binary")
+            raise AssertionError("could not build the release binaries")
     return binary
 
 
@@ -102,8 +124,12 @@ def checks():
         # layout but whose paths escape the extraction directory must be
         # refused by verify (tarfile extractall runs with filter='data').
         malicious = os.path.join(tmp, "canter-0.1.0-linux-x86_64.tar.gz")
-        benign_names = ("LICENSE-APACHE", "LICENSE-MIT", "SBOM.spdx.json",
-                        "SHA256SUMS", "provenance.json")
+        # The fixture must pass the layout check so the refusal provably comes
+        # from the traversal path, not from a missing member: take every
+        # documented member except `canter` (which the traversal member
+        # reports as its basename) off the builder's own member list.
+        benign_names = [name for name in builder.ARCHIVE_MEMBERS
+                        if name != "canter"]
         with open(malicious, "wb") as raw:
             with gzip.GzipFile(filename="", mode="wb", fileobj=raw,
                                mtime=0) as gz:
@@ -152,6 +178,34 @@ def checks():
         print("PASS: archive verifies against its provenance record "
               "(6 checks)")
 
+        # --- the pre-rename alias ships as a wired, executable member ----------
+        # The compatibility contract promises the alias binary is shipped next
+        # to `canter`; these witnesses fail if the member is missing, loses
+        # its executable framing, or drops out of SHA256SUMS/provenance.files.
+        with tarfile.open(archive, "r:gz") as tar:
+            members = {os.path.basename(member.name): member
+                       for member in tar.getmembers() if member.isfile()}
+            expected = sorted(builder.ARCHIVE_MEMBERS)
+            assert sorted(members) == expected, sorted(members)
+            assert LEGACY_ALIAS in members, sorted(members)
+            alias_member = members[LEGACY_ALIAS]
+            assert alias_member.mode == 0o755, oct(alias_member.mode)
+            alias_digest = hashlib.sha256(
+                tar.extractfile(alias_member).read()).hexdigest()
+            sums_text = tar.extractfile(members["SHA256SUMS"]).read().decode()
+            provenance_text = tar.extractfile(
+                members["provenance.json"]).read().decode()
+        sums = {}
+        for line in sums_text.splitlines():
+            digest, _, name = line.partition("  ")
+            sums[name] = digest
+        provenance_files = json.loads(provenance_text)["files"]
+        assert sums.get(LEGACY_ALIAS) == alias_digest, sums
+        assert provenance_files.get(LEGACY_ALIAS) == alias_digest, (
+            provenance_files)
+        print(f"PASS: archive ships the {LEGACY_ALIAS} alias member (755) "
+              "wired into SHA256SUMS and provenance.files")
+
         # --- provenance maps to source + schema facts ---------------------------
         with tarfile.open(archive, "r:gz") as tar:
             provenance_data = None
@@ -182,11 +236,6 @@ def checks():
         assert sbom_data is not None, "SBOM missing"
         assert sbom_data["spdxVersion"] == "SPDX-2.3"
         # Reuse the builder's own Cargo.lock parser (single source of truth).
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "hf_build_archive", BUILDER)
-        builder = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(builder)
         lock_text = open(os.path.join(REPO, "Cargo.lock"),
                          encoding="utf-8").read()
         packages = {p["name"]: p.get("version", "")

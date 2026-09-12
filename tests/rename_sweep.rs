@@ -94,6 +94,16 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         "pre-rename config fallback pointer",
     ),
     (
+        "scripts/build-archive.py",
+        1,
+        "the release archive ships the pre-rename alias binary member next to canter",
+    ),
+    (
+        "scripts/test-build-archive.py",
+        1,
+        "the self-test pins the contract name of the shipped alias member",
+    ),
+    (
         "skills/canter/SKILL.md",
         1,
         "product-name/pre-rename compatibility pointer",

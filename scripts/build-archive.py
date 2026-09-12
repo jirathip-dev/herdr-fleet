@@ -54,8 +54,13 @@ _MIGRATION_LINE_RE = re.compile(r"^migration chain: (?P<chain>.*)$",
 _FAMILIES_LINE_RE = re.compile(r"^document schema families: (?P<families>.*)$",
                                re.MULTILINE)
 
+# The pre-rename product-name alias (docs/contracts/compatibility.md,
+# "Product rename (issue #106)"): every archive ships it next to `canter`.
+LEGACY_ALIAS = "herdr-fleet"
+
 ARCHIVE_MEMBERS = (
     "canter",
+    LEGACY_ALIAS,
     "LICENSE-APACHE",
     "LICENSE-MIT",
     "SBOM.spdx.json",
@@ -291,6 +296,16 @@ def cmd_build(args: argparse.Namespace) -> int:
         sys.stderr.write(f"error: --binary {binary} is not an executable file "
                          "(run `cargo build --release --locked` first)\n")
         return 1
+    # The pre-rename alias must sit next to the canonical binary: it is a
+    # shipped member of every archive (docs/contracts/compatibility.md).
+    alias = os.path.join(os.path.dirname(binary), LEGACY_ALIAS)
+    if not os.path.isfile(alias) or not os.access(alias, os.X_OK):
+        sys.stderr.write(
+            f"error: the pre-rename alias {alias} is not an executable file; "
+            "`cargo build --release --locked` must produce it next to "
+            "--binary and every archive must ship it "
+            "(docs/contracts/compatibility.md)\n")
+        return 1
     if args.platform not in PLATFORMS:
         sys.stderr.write("error: --platform must be one of: "
                          + ", ".join(PLATFORMS) + "\n")
@@ -324,8 +339,9 @@ def cmd_build(args: argparse.Namespace) -> int:
     try:
         inner_dir = os.path.join(staging, inner)
         os.makedirs(inner_dir, mode=0o755, exist_ok=True)
-        shutil.copy2(binary, os.path.join(inner_dir, "canter"))
-        os.chmod(os.path.join(inner_dir, "canter"), 0o755)
+        for name, source in (("canter", binary), (LEGACY_ALIAS, alias)):
+            shutil.copy2(source, os.path.join(inner_dir, name))
+            os.chmod(os.path.join(inner_dir, name), 0o755)
         for license_name in ("LICENSE-APACHE", "LICENSE-MIT"):
             shutil.copy2(os.path.join(repo, license_name),
                          os.path.join(inner_dir, license_name))
@@ -335,8 +351,8 @@ def cmd_build(args: argparse.Namespace) -> int:
 
         # Per-file checksums (deterministic content manifest).
         manifest: dict[str, str] = {}
-        for member in ("canter", "LICENSE-APACHE", "LICENSE-MIT",
-                       "SBOM.spdx.json"):
+        for member in ("canter", LEGACY_ALIAS, "LICENSE-APACHE",
+                       "LICENSE-MIT", "SBOM.spdx.json"):
             manifest[member] = sha256_file(
                 os.path.join(inner_dir, member))
         sha_lines = "".join(
@@ -383,7 +399,8 @@ def cmd_build(args: argparse.Namespace) -> int:
                         info = tarfile.TarInfo(os.path.join(inner, name))
                         info.size = os.path.getsize(member_path)
                         info.mtime = commit_ts
-                        info.mode = 0o755 if name == "canter" else 0o644
+                        info.mode = (0o755 if name in ("canter", LEGACY_ALIAS)
+                                     else 0o644)
                         info.uid = 0
                         info.gid = 0
                         info.uname = ""
