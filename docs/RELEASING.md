@@ -7,7 +7,7 @@ checksums/SBOM/provenance, verification instructions, clean-host
 verification scripts, and a committed baseline — but it performs **no**
 release by itself. Every release remains a separate human decision
 (promotion, tag, upload, attestation, soak), exactly as the roadmap
-umbrella (https://github.com/jirathip-dev/herdr-fleet/issues/1) requires.
+umbrella (https://github.com/jirathip-dev/canter/issues/1) requires.
 Nothing in this file authorizes an agent or CI run to tag, publish,
 promote, or upload.
 
@@ -47,7 +47,7 @@ explicit and separate (see [schema-registry.md](contracts/schema-registry.md)):
 - Every stable serialized surface carries a versioned identifier
   (`hf-<family>/v<version>`; 17 families today) plus the SQLite state schema
   version (`SCHEMA_VERSION`, currently 7, applied by the migration chain
-  `m0001`..`m0007` — queryable from any binary via `herdr-fleet --version`).
+  `m0001`..`m0007` — queryable from any binary via `canter --version`).
 - **Breaking a stable schema requires a migration and a MAJOR release.** A
   migration that changes serialized state or document semantics is
   additive and versioned (`m000N`); unknown-version documents are refused
@@ -71,16 +71,16 @@ Every release ships four archives, one per platform token
 (`linux-x86_64`, `linux-aarch64`, `darwin-x86_64`, `darwin-aarch64`):
 
 ```text
-herdr-fleet-<version>-<platform>.tar.gz
-herdr-fleet-<version>-<platform>.tar.gz.sha256   (adjacent archive checksum)
+canter-<version>-<platform>.tar.gz
+canter-<version>-<platform>.tar.gz.sha256   (adjacent archive checksum)
 ```
 
 Archive layout (deterministic; documented by
 [`scripts/build-archive.py`](../scripts/build-archive.py)):
 
 ```text
-herdr-fleet-<version>/
-  herdr-fleet            platform-correct executable (755)
+canter-<version>/
+  canter            platform-correct executable (755)
   LICENSE-APACHE
   LICENSE-MIT
   SBOM.spdx.json         SPDX 2.3, derived OFFLINE from Cargo.lock
@@ -114,7 +114,7 @@ $ python3 scripts/build-archive.py build \
     --repo . \
     --source-ref "$(git rev-parse HEAD)" \
     --version <version> \
-    --binary target/release/herdr-fleet \
+    --binary target/release/canter \
     --platform linux-x86_64 \
     --out-dir target/release-archives
 ```
@@ -122,7 +122,7 @@ $ python3 scripts/build-archive.py build \
 Verify (any host, against the downloaded archive + adjacent `.sha256`):
 
 ```console
-$ python3 scripts/build-archive.py verify --archive herdr-fleet-<version>-<platform>.tar.gz
+$ python3 scripts/build-archive.py verify --archive canter-<version>-<platform>.tar.gz
 ```
 
 The verify step re-runs the archived binary's `--version` and checks it
@@ -141,7 +141,7 @@ Linux maintainer hosts**, from a checkout of the exact release commit with
 the downloaded archive binary:
 
 ```console
-$ scripts/clean-host-verify.sh --bin /path/to/extracted/herdr-fleet --repo /path/to/release-tree
+$ scripts/clean-host-verify.sh --bin /path/to/extracted/canter --repo /path/to/release-tree
 ```
 
 It runs, with no private repositories and no service-manager activation:
@@ -162,9 +162,9 @@ $ python3 scripts/test-clean-host-probe.py
 Baselines (AC5; see [benchmarks.md](contracts/benchmarks.md)):
 
 ```console
-$ python3 scripts/measure-baseline.py measure --binary target/release/herdr-fleet \
+$ python3 scripts/measure-baseline.py measure --binary target/release/canter \
     --out baseline-<platform>.csv
-$ python3 scripts/measure-baseline.py check --binary target/release/herdr-fleet \
+$ python3 scripts/measure-baseline.py check --binary target/release/canter \
     --baseline baseline-<platform>.csv
 ```
 

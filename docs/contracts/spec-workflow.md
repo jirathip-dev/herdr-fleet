@@ -129,5 +129,5 @@ implementation -> exact-head review -> hosted CI -> integration merge ->
 post-merge verification -> closure, with production separate (no
 production/destructive authority is embedded anywhere). Running instances
 pin the exact version/hash they started with; upgrades affect only new runs
-unless an explicit migration plan is approved. `skills/herdr-fleet/SKILL.md`
+unless an explicit migration plan is approved. `skills/canter/SKILL.md`
 links to this canonical source rather than duplicating it.

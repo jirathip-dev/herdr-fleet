@@ -12,7 +12,7 @@ capability-level decomposition.
   dependency graph, implemented by a later slice).
 - **MERGE** — folded into another RETAIN capability as one surface (never
   two owners for one behavior).
-- **SEPARATE** — behavior belongs to another product/owner; herdr-fleet only
+- **SEPARATE** — behavior belongs to another product/owner; canter only
   interoperates through a versioned contract if at all.
 - **RETIRE** — deliberately omitted in 1.0, with the locked-spec reason.
 
@@ -38,7 +38,7 @@ position-less capability survives this table.
 | C11 | Herdr CLI/socket adapter (workspace/terminal/process execution substrate) | RETAIN | Adapter: herdr | C4, C18 compat | Locked spec: Herdr-first; external commands argv-only, bounded, scrubbed |
 | C12 | Git/GitHub read-back + read-only status adapters | RETAIN | Adapter: git/forge | C18 compat | Locked spec: live Git/GitHub read-back owns observed reality |
 | C13 | Official harness adapters: Hermes, Claude Code, Codex, Pi, Jcode (+ constrained declarative argv adapter) | RETAIN | Adapter: harness | C3, C20 | Locked spec: first official adapters; others after 1.0; no shell templates |
-| C14 | Agent-side skill packaging (`skills/herdr-fleet`) | RETAIN | Skill (docs) | C1 | Locked spec: generic skill installable from the repo, no machine-local policy |
+| C14 | Agent-side skill packaging (`skills/canter`) | RETAIN | Skill (docs) | C1 | Locked spec: generic skill installable from the repo, no machine-local policy |
 | C15 | Bounded schedules (scoped, expiring, single-flight, coalesced ticks) | RETAIN | Daemon scheduler | C4, C5 | Locked spec runtime section; never schedules production/destructive (risk model) |
 | C16 | SSH remote operation to a per-host daemon (system SSH only, no federation) | RETAIN | Daemon remote | C4 | Locked spec runtime section; optional after 1.0 core |
 | C17 | Machine-readable output contract: JSON/JSONL, exit codes, human-vs-JSON, freshness/partial, redaction | RETAIN | CLI/daemon wire (schemas) | C1 | Issue #3 deliverable; stable surface list in locked spec |
@@ -47,7 +47,7 @@ position-less capability survives this table.
 | C20 | Harness/forge capability negotiation with typed refusal | RETAIN | Adapter contract (core) | C13 | ADR-0003: unsupported capabilities return typed refusal, never shell guessing |
 | C21 | Fleet Doctrine: judgment guidance (public) + machine-enforceable rules (CLI invariants/tests) | RETAIN | Doctrine (docs/domain) | C9 | ADR-0003: one canonical public home before the old Doctrine repo is archived |
 | C22 | Corral visual board / notifications (optional human observability) | SEPARATE | Corral product | C18 (read contract only) | ADR-0003: Corral is a separate optional read-only product; no runtime dependency in either direction |
-| C23 | iOS/notifications surface for fleet state | SEPARATE | Corral product | — | Same boundary as C22; owned downstream, not by herdr-fleet |
+| C23 | iOS/notifications surface for fleet state | SEPARATE | Corral product | — | Same boundary as C22; owned downstream, not by canter |
 | C24 | Device-key registry, step-up approvals, signed-drive HTTP API (Corral-style remote control plane) | RETIRE | — | — | Locked spec: no network control API; same-user local trust + route grants replace it; SSH is the only remote path |
 | C25 | Configless sidecar plugin engine / plugin cards | RETIRE | — | — | Locked spec: no dynamic plugin SDK in 1.0; native Herdr plugin optional and late, thin, never policy owner |
 | C26 | TUI/web UI, hosted service, MCP server, notification provider, auto-update, Windows support | RETIRE | — | — | Locked spec product boundary non-goals |

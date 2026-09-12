@@ -1,4 +1,4 @@
-# Security and supply-chain gates for herdr-fleet (public repository).
+# Security and supply-chain gates for canter (public repository).
 # Job names are STABLE contract: they become required-check contexts later.
 
 name: security

@@ -11,7 +11,7 @@
 #
 # Usage (from a checkout of the exact release commit, with the downloaded
 # release binary next to it):
-#   scripts/clean-host-verify.sh --bin /path/to/herdr-fleet
+#   scripts/clean-host-verify.sh --bin /path/to/canter
 #
 # Public-data rule: this script contains no host paths, distro/user
 # identity, credentials, or private repository names; every runtime path is
@@ -25,7 +25,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 usage() {
     cat <<'EOF'
-usage: clean-host-verify.sh --bin /path/to/herdr-fleet [--repo /path/to/release-tree]
+usage: clean-host-verify.sh --bin /path/to/canter [--repo /path/to/release-tree]
 EOF
     exit 2
 }
@@ -88,7 +88,7 @@ fi
 VERSION_EXIT=$?
 VERSION_FIRST_LINE="$(head -n 1 "$TMP_ROOT/version.txt")"
 case "$VERSION_FIRST_LINE" in
-    herdr-fleet\ [0-9]*)
+    canter\ [0-9]*)
         echo "PASS: --version prints package identity ($VERSION_FIRST_LINE)"
         ;;
     *)

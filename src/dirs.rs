@@ -94,11 +94,34 @@ fn runtime_home_for(xdg_runtime_dir: Option<std::ffi::OsString>) -> Result<PathB
     }
 }
 
+/// Directory name the daemon-owned tree lives under, relative to
+/// `$XDG_STATE_HOME` and `$XDG_RUNTIME_DIR` (product rename, issue #106).
+pub const DIR_NAME: &str = "canter";
+
+/// Pre-rename directory name. A user whose state/runtime tree already
+/// exists under this name keeps using it: the directory is adopted **in
+/// place** (never copied, moved, migrated, or deleted), and the new name is
+/// used only when no pre-rename tree exists. Normative rule:
+/// docs/contracts/compatibility.md, "Product rename (issue #106)".
+pub const LEGACY_DIR_NAME: &str = "herdr-fleet";
+
+/// Choose this user's directory name: [`DIR_NAME`], except when a
+/// pre-rename tree exists and the new one does not (adopt in place).
+fn adopted_dir_name(state_home: &std::path::Path) -> &'static str {
+    if state_home.join(DIR_NAME).exists() || !state_home.join(LEGACY_DIR_NAME).exists() {
+        DIR_NAME
+    } else {
+        LEGACY_DIR_NAME
+    }
+}
+
 /// All per-user paths for one daemon instance. Values are derived per call
 /// (never cached) so tests and the daemon observe the same environment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DaemonPaths {
-    /// State root for this user (`herdr-fleet` under the state home).
+    /// State root for this user ([`DIR_NAME`] under the state home; a
+    /// pre-rename ([`LEGACY_DIR_NAME`]) tree is adopted in place when it
+    /// exists and the new one does not).
     pub state_dir: PathBuf,
     /// Runtime root for this user (socket parent; 0700 by convention).
     pub runtime_dir: PathBuf,
@@ -141,18 +164,22 @@ impl DaemonPaths {
         home: Option<std::ffi::OsString>,
         socket_override: Option<&str>,
     ) -> Result<DaemonPaths, PathError> {
-        let state_root = state_home_for(xdg_state_home, home)?.join("herdr-fleet");
+        let state_home = state_home_for(xdg_state_home, home)?;
+        let dir_name = adopted_dir_name(&state_home);
+        let state_root = state_home.join(dir_name);
         let socket_override = socket_override.filter(|path| !path.is_empty());
         // An explicit socket override removes the XDG_RUNTIME_DIR
         // requirement: the socket moves into the override's directory
         // (the lock stays with the state dir). Without one the XDG
-        // runtime root applies for the socket.
+        // runtime root applies for the socket, under the SAME directory
+        // name the state tree uses (adoption keeps socket and state
+        // together).
         let runtime_root: PathBuf = match &socket_override {
             Some(path) => PathBuf::from(path)
                 .parent()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/")),
-            None => runtime_home_for(xdg_runtime_dir)?.join("herdr-fleet"),
+            None => runtime_home_for(xdg_runtime_dir)?.join(dir_name),
         };
         let socket_path = match &socket_override {
             Some(path) => PathBuf::from(path),
@@ -281,16 +308,79 @@ mod tests {
         let run = base.join("run");
         let home = base.join("home");
         let paths = derive_with(Some(&state), Some(&run), Some(&home), None).expect("derive");
-        assert_eq!(paths.state_dir, state.join("herdr-fleet"));
-        assert_eq!(paths.runtime_dir, run.join("herdr-fleet"));
-        assert_eq!(paths.socket_path, run.join("herdr-fleet/daemon.sock"));
+        assert_eq!(paths.state_dir, state.join("canter"));
+        assert_eq!(paths.runtime_dir, run.join("canter"));
+        assert_eq!(paths.socket_path, run.join("canter/daemon.sock"));
         // The single-writer lock belongs to the STATE dir (AC1: one writer
         // per state dir regardless of socket path).
-        assert_eq!(paths.lock_path, state.join("herdr-fleet/daemon.lock"));
-        assert_eq!(paths.db_path, state.join("herdr-fleet/state.db"));
+        assert_eq!(paths.lock_path, state.join("canter/daemon.lock"));
+        assert_eq!(paths.db_path, state.join("canter/state.db"));
         assert_eq!(
             paths.audit_mirror_path,
-            state.join("herdr-fleet/journal/audit.jsonl")
+            state.join("canter/journal/audit.jsonl")
+        );
+    }
+
+    #[test]
+    fn fresh_user_derives_the_new_directory() {
+        // Neither tree exists: the canonical name applies everywhere.
+        let base = fixture_base("fresh-106");
+        let _ = std::fs::remove_dir_all(&base);
+        let state = base.join("st");
+        let run = base.join("run");
+        let home = base.join("home");
+        let paths = derive_with(Some(&state), Some(&run), Some(&home), None).expect("derive");
+        assert_eq!(paths.state_dir, state.join(DIR_NAME));
+        assert_eq!(paths.runtime_dir, run.join(DIR_NAME));
+        assert_eq!(paths.socket_path, run.join(DIR_NAME).join("daemon.sock"));
+    }
+
+    #[test]
+    fn pre_rename_tree_is_adopted_in_place() {
+        // A pre-rename state/runtime tree keeps being used, byte-for-byte:
+        // derivation must select the legacy directory and must NOT create,
+        // copy, or touch the new one (state continuity, issue #106).
+        let base = fixture_base("legacy-106");
+        let _ = std::fs::remove_dir_all(&base);
+        let state = base.join("st");
+        let run = base.join("run");
+        let home = base.join("home");
+        std::fs::create_dir_all(state.join(LEGACY_DIR_NAME)).expect("legacy state dir");
+        let paths = derive_with(Some(&state), Some(&run), Some(&home), None).expect("derive");
+        assert_eq!(paths.state_dir, state.join(LEGACY_DIR_NAME));
+        assert_eq!(paths.db_path, state.join(LEGACY_DIR_NAME).join("state.db"));
+        assert_eq!(
+            paths.lock_path,
+            state.join(LEGACY_DIR_NAME).join("daemon.lock")
+        );
+        assert_eq!(paths.runtime_dir, run.join(LEGACY_DIR_NAME));
+        assert_eq!(
+            paths.socket_path,
+            run.join(LEGACY_DIR_NAME).join("daemon.sock")
+        );
+        assert!(
+            !state.join(DIR_NAME).exists(),
+            "derivation must not create the new directory"
+        );
+    }
+
+    #[test]
+    fn new_tree_wins_when_both_exist() {
+        // Once a new-name tree exists it is authoritative; the legacy tree
+        // is left untouched (never merged, never deleted).
+        let base = fixture_base("both-106");
+        let _ = std::fs::remove_dir_all(&base);
+        let state = base.join("st");
+        let run = base.join("run");
+        let home = base.join("home");
+        std::fs::create_dir_all(state.join(DIR_NAME)).expect("new state dir");
+        std::fs::create_dir_all(state.join(LEGACY_DIR_NAME)).expect("legacy state dir");
+        let paths = derive_with(Some(&state), Some(&run), Some(&home), None).expect("derive");
+        assert_eq!(paths.state_dir, state.join(DIR_NAME));
+        assert_eq!(paths.socket_path, run.join(DIR_NAME).join("daemon.sock"));
+        assert!(
+            state.join(LEGACY_DIR_NAME).is_dir(),
+            "the legacy tree is not removed"
         );
     }
 
@@ -331,7 +421,7 @@ mod tests {
         assert_eq!(paths.socket_path, base.join("custom").join("daemon.sock"));
         assert_eq!(
             paths.lock_path,
-            state.join("herdr-fleet/daemon.lock"),
+            state.join("canter/daemon.lock"),
             "the writer lock stays with the state dir, not the socket"
         );
     }
@@ -357,7 +447,7 @@ mod tests {
         )
         .expect("derive");
         assert_eq!(paths.socket_path, base.join("custom").join("daemon.sock"));
-        assert_eq!(paths.lock_path, state.join("herdr-fleet/daemon.lock"));
+        assert_eq!(paths.lock_path, state.join("canter/daemon.lock"));
     }
 
     #[cfg(unix)]

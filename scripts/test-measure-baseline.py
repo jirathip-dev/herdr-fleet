@@ -25,7 +25,7 @@ import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MEASURER = os.path.join(REPO, "scripts", "measure-baseline.py")
-BINARY = os.path.join(REPO, "target", "release", "herdr-fleet")
+BINARY = os.path.join(REPO, "target", "release", "canter")
 
 
 def run(argv):

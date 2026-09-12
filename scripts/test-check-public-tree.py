@@ -200,7 +200,7 @@ class CleanFixtureTests(ScannerFixtureTest):
     def test_clean_tree_with_public_urls_passes(self) -> None:
         self.commit_files(
             {
-                "README.md": "# demo\nSee https://github.com/jirathip-dev/herdr-fleet for info.\n",
+                "README.md": "# demo\nSee https://github.com/jirathip-dev/canter for info.\n",
                 "src/lib.rs": "pub fn hello() -> &'static str { \"world\" }\n",
             }
         )

@@ -10,9 +10,9 @@
 use std::path::{Path, PathBuf};
 
 /// LaunchAgent label (one per user; synthetic and stable).
-pub const LAUNCHD_LABEL: &str = "com.herdr-fleet.daemon";
+pub const LAUNCHD_LABEL: &str = "com.canter.daemon";
 /// systemd user unit file name.
-pub const SYSTEMD_UNIT_NAME: &str = "herdr-fleet.service";
+pub const SYSTEMD_UNIT_NAME: &str = "canter.service";
 
 /// The service-manager platform this binary targets.
 pub fn detect_platform() -> &'static str {
@@ -79,9 +79,9 @@ pub fn launchd_unit(bin: &Path, socket: &Path) -> String {
 /// Render the per-user systemd unit for `bin` serving `socket`.
 pub fn systemd_unit(bin: &Path, socket: &Path) -> String {
     format!(
-        "# herdr-fleet per-user daemon unit (issue #5; rendered, not activated)\n\
+        "# canter per-user daemon unit (issue #5; rendered, not activated)\n\
 [Unit]\n\
-Description=herdr-fleet state daemon (single writer per user)\n\
+Description=canter state daemon (single writer per user)\n\
 After=default.target\n\
 \n\
 [Service]\n\
@@ -131,12 +131,12 @@ pub fn install_plan_steps(
                     unit.display()
                 ),
                 "run: systemctl --user daemon-reload".to_string(),
-                "run: systemctl --user enable --now herdr-fleet.service".to_string(),
-                "verify: systemctl --user --no-pager status herdr-fleet.service".to_string(),
+                "run: systemctl --user enable --now canter.service".to_string(),
+                "verify: systemctl --user --no-pager status canter.service".to_string(),
             ]
         }
         other => vec![format!(
-            "no first-party unit exists for platform {other:?}; run the daemon directly with `herdr-fleet daemon run`"
+            "no first-party unit exists for platform {other:?}; run the daemon directly with `canter daemon run`"
         )],
     }
 }
@@ -146,11 +146,11 @@ pub fn status_plan_steps(platform: &str) -> Vec<String> {
     match platform {
         "launchd" => vec![
             format!("launchctl print gui/$(id -u)/{LAUNCHD_LABEL}"),
-            "herdr-fleet daemon status --json".to_string(),
+            "canter daemon status --json".to_string(),
         ],
         "systemd" => vec![
-            "systemctl --user --no-pager status herdr-fleet.service".to_string(),
-            "herdr-fleet daemon status --json".to_string(),
+            "systemctl --user --no-pager status canter.service".to_string(),
+            "canter daemon status --json".to_string(),
         ],
         other => vec![format!(
             "no first-party service exists for platform {other:?}"
@@ -166,7 +166,7 @@ pub fn uninstall_plan_steps(platform: &str, home: &Path, config_home: &Path) -> 
             format!("rm -f {}", launchd_plist_path(home).display()),
         ],
         "systemd" => vec![
-            "systemctl --user --no-pager disable --now herdr-fleet.service".to_string(),
+            "systemctl --user --no-pager disable --now canter.service".to_string(),
             format!("rm -f {}", systemd_unit_path(config_home).display()),
             "systemctl --user daemon-reload".to_string(),
         ],
@@ -190,7 +190,7 @@ mod tests {
             base.join("fixture-user")
                 .join(".local")
                 .join("bin")
-                .join("herdr-fleet"),
+                .join("canter"),
             base.join("run-user-1000").join("daemon.sock"),
         )
     }
@@ -242,7 +242,7 @@ mod tests {
             config_home
                 .join("systemd")
                 .join("user")
-                .join("herdr-fleet.service")
+                .join("canter.service")
         );
     }
 

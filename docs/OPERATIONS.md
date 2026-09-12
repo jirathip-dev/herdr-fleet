@@ -1,6 +1,6 @@
 # Operations runbook
 
-Task-ordered, human-oriented guide to operating `herdr-fleet` day to day:
+Task-ordered, human-oriented guide to operating `canter` day to day:
 install → configure → observe → plan → daemon/service lifecycle →
 grant-gated mutations (dry-run → apply → verify) → cleanup → recovery →
 remote transport → upgrade. Every command below was exercised against the
@@ -35,11 +35,11 @@ PATH. `doctor` (section 3) additionally checks `herdr` >= 0.8.2 and
 authenticated `gh`; nothing here installs them.
 
 ```console
-$ git clone https://github.com/jirathip-dev/herdr-fleet.git
-$ cd herdr-fleet
+$ git clone https://github.com/jirathip-dev/canter.git
+$ cd canter
 $ cargo build --release --locked
-$ ./target/release/herdr-fleet --version        # exit 0
-herdr-fleet 0.1.0
+$ ./target/release/canter --version        # exit 0
+canter 0.1.0
 ...
 state schema version: 7
 migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4, m0005_lane_replacements_v5, m0006_lane_checkpoints_v6, m0007_lane_successors_v7
@@ -66,8 +66,8 @@ The CLI never writes files: `config init` prints an annotated
 location yourself.
 
 ```console
-$ ./target/release/herdr-fleet config init > ~/.config/herdr-fleet/config.toml   # exit 0
-$ $EDITOR ~/.config/herdr-fleet/config.toml
+$ ./target/release/canter config init > ~/.config/canter/config.toml   # exit 0
+$ $EDITOR ~/.config/canter/config.toml
 ```
 
 Minimal document (schema + one repository; optional tables only — daemon,
@@ -91,14 +91,14 @@ enabled = true
 Validate and inspect:
 
 ```console
-$ ./target/release/herdr-fleet config validate            # exit 0
-config valid: .../.config/herdr-fleet/config.toml
-$ ./target/release/herdr-fleet config validate --json     # exit 0
-{"command":"config validate","data":{"config_path":".../.config/herdr-fleet/config.toml",
- "policy_overlay":{"path":".../.config/herdr-fleet/policy.toml","valid":true},
+$ ./target/release/canter config validate            # exit 0
+config valid: .../.config/canter/config.toml
+$ ./target/release/canter config validate --json     # exit 0
+{"command":"config validate","data":{"config_path":".../.config/canter/config.toml",
+ "policy_overlay":{"path":".../.config/canter/policy.toml","valid":true},
  "valid":true},"exit_code":0,"kind":"ok","schema":"hf-output/v1"}
-$ ./target/release/herdr-fleet config show --json         # exit 0
-{"command":"config show","data":{"config_path":".../.config/herdr-fleet/config.toml",
+$ ./target/release/canter config show --json         # exit 0
+{"command":"config show","data":{"config_path":".../.config/canter/config.toml",
  "daemon_enabled":true,"daemon_socket":null,
  "repositories":[{"branch":"staging","enabled":true,"identity":"example-org/widgets",
  "key":"widgets","origin":"https://github.com/example-org/widgets"}], ...},
@@ -120,12 +120,12 @@ Prerequisites: nothing beyond what you are observing. `doctor` checks git,
 installs, starts, or stops anything.
 
 ```console
-$ ./target/release/herdr-fleet doctor --json              # exit 0
+$ ./target/release/canter doctor --json              # exit 0
 {"command":"doctor","data":{"checks":[
  {"detail":"git version 2.52.0","name":"git","status":"ok"},
  {"detail":"herdr 0.8.2 (declared minimum 0.8.2)","name":"herdr","status":"ok"},
  {"detail":"gh 9.9.9; authenticated; scopes: repo, read:org","name":"gh","status":"ok"}],
- "config":{"path":".../.config/herdr-fleet/config.toml","status":"ok"}},
+ "config":{"path":".../.config/canter/config.toml","status":"ok"}},
  "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
 ```
 
@@ -134,15 +134,15 @@ The Herdr row is a CLI-version gate only. Issue #35 measured that 0.8.2
 pairings with `protocol_mismatch`; see
 [compatibility.md](contracts/compatibility.md). During a Herdr update, use
 Herdr's own status/handoff workflow and update both endpoints rather than
-reading the 0.8.2 doctor floor as mixed-version support. herdr-fleet never
+reading the 0.8.2 doctor floor as mixed-version support. canter never
 restarts either endpoint.
 
 Declared read capabilities (static; no negotiation, no shell guessing):
 
 ```console
-$ ./target/release/herdr-fleet capabilities --json        # exit 0
+$ ./target/release/canter capabilities --json        # exit 0
 {"command":"capabilities","data":{"capability":{
- "actor":"herdr-fleet","axis":"forge",
+ "actor":"canter","axis":"forge",
  "capabilities":["read_refs","read_issues","read_checks"],
  "schema":"hf-capability/v1"}},"exit_code":0,"kind":"ok","schema":"hf-output/v1"}
 ```
@@ -154,7 +154,7 @@ process; partial failures are explicit, never hidden.
 
 ```console
 $ cd .../widgets-checkout
-$ /path/to/herdr-fleet status --json                      # exit 0
+$ /path/to/canter status --json                      # exit 0
 {"command":"status","data":{"expected_repositories":1,"freshness":"fresh",
  "observed_repositories":1,
  "observations":[
@@ -186,11 +186,11 @@ Failure → remedy:
 
 herdr 0.9.0 recognizes a closed list of agent kinds at spawn ([ARCHITECTURE.md](ARCHITECTURE.md)
 "Layer responsibilities"). A harness outside that list — jcode today, a
-herdr-fleet first-class adapter (issue #37) but not a herdr agent kind —
+canter first-class adapter (issue #37) but not a herdr agent kind —
 runs fine in a pane but never appears as a herdr agent-kind row, so
 `herdr agent list` is the wrong surface for its lifecycle; the
 agents-sidebar gap is expected, not a defect. Monitor the lane from
-herdr-fleet state and the pane rows instead:
+canter state and the pane rows instead:
 
 1. **State and phase.** The daemon state store is the tracker: the lane's
    plan, route grant, instance, and recorded review evidence live there,
@@ -224,7 +224,7 @@ herdr-fleet state and the pane rows instead:
    pane-closeout row.
 
 Truthful limits today: the pane rows come from the harness adapter inside
-the pane — no herdr-fleet daemon caller drives or consumes them yet in this
+the pane — no canter daemon caller drives or consumes them yet in this
 bootstrap, and the daemon state store is not wired to them; consuming the
 rows in daemon-driven lifecycle reporting is future work on the shipped
 issue #8 state. The full row contract is in
@@ -244,7 +244,7 @@ anything.**
 Offline (explicit revision):
 
 ```console
-$ ./target/release/herdr-fleet plan example-org/widgets 7 \
+$ ./target/release/canter plan example-org/widgets 7 \
     --revision 0123456789abcdef0123456789abcdef01234567 --json   # exit 0
 {"command":"plan","data":{
  "digest":"816469e345ff69d255ccb4ed211326f0704dd16c3f2e6eabce2bd87fccd3e87b",
@@ -269,7 +269,7 @@ Live (revision derived from the issue's redacted acceptance text through
 `gh`):
 
 ```console
-$ ./target/release/herdr-fleet plan example-org/widgets 7 --json   # exit 0
+$ ./target/release/canter plan example-org/widgets 7 --json   # exit 0
 {"command":"plan","data":{"digest":"5566...93d",
  "issue_source":"github",
  "plan":{"issue":{"number":7,"revision":"463becfc6674875eee85a7371b3c6037980424ab"}, ...}}
@@ -280,7 +280,7 @@ Failure → remedy:
 | Symptom (exit) | Envelope | Remedy |
 | --- | --- | --- |
 | `gh` unavailable, no `--revision` (1) | `forge.unavailable` — "pass `--revision <40hex>` to render the plan offline" | Render offline with `--revision` or make `gh` available. |
-| Unconfigured repository (2) | stderr: ``plan: no configured repository matches "not-configured"; configure it first (see `herdr-fleet config init`); run `herdr-fleet plan --help``` `` | Add the repository to the config (section 2). |
+| Unconfigured repository (2) | stderr: ``plan: no configured repository matches "not-configured"; configure it first (see `canter config init`); run `canter plan --help``` `` | Add the repository to the config (section 2). |
 | Non-numeric issue / malformed `--revision` (2) | usage error on stderr | `<issue>` is a positive integer; `--revision` is exactly 40 hex. |
 
 Determinism check: run the same offline command twice and diff — byte
@@ -291,24 +291,24 @@ identical stdout (the digest is over the canonical plan bytes).
 Prerequisites: config with `[daemon] enabled = true` (section 2). The
 daemon is a single-writer per-user state server: flock + SQLite state +
 audit/event journals + one Unix socket. State location follows XDG
-(`.../.local/state/herdr-fleet/...` by default; isolate with
+(`.../.local/state/canter/...` by default; isolate with
 `XDG_STATE_HOME`); the socket defaults to the XDG runtime dir
-(`.../herdr-fleet/daemon.sock`) unless `--socket` or `config daemon.socket`
+(`.../canter/daemon.sock`) unless `--socket` or `config daemon.socket`
 overrides it. A second daemon is refused.
 
 Start (foreground — run it in a terminal or under a service unit, section
 5.1):
 
 ```console
-$ ./target/release/herdr-fleet daemon run
+$ ./target/release/canter daemon run
 # daemon.log: {"event":"daemon.start",...} {"event":"daemon.ready",
-#  "message":"state open; reconciled 0 interrupted claim(s); serving .../herdr-fleet/daemon.sock",...}
+#  "message":"state open; reconciled 0 interrupted claim(s); serving .../canter/daemon.sock",...}
 ```
 
 Probe from another terminal:
 
 ```console
-$ ./target/release/herdr-fleet daemon status --json       # exit 0 (live)
+$ ./target/release/canter daemon status --json       # exit 0 (live)
 {"command":"daemon status","data":{"daemon":{"pid":<pid>,
  "started_at":"<ts>","version":"0.1.0"},
  "freshness":"fresh","state":{"active_grants":0,"epoch":1,"event_seq":0,
@@ -322,9 +322,9 @@ immediately after a stop — or a crash — `daemon status` reports the stale
 socket:
 
 ```console
-$ ./target/release/herdr-fleet daemon status --json   # after stop/crash: exit 1
+$ ./target/release/canter daemon status --json   # after stop/crash: exit 1
 {"command":"daemon status","error":{"code":"daemon.stale","details":null,
- "message":"a stale daemon socket exists at .../herdr-fleet/daemon.sock; a fresh `daemon run` reclaims it","retryable":true},
+ "message":"a stale daemon socket exists at .../canter/daemon.sock; a fresh `daemon run` reclaims it","retryable":true},
  "exit_code":1,"kind":"error","schema":"hf-output/v1"}
 ```
 
@@ -338,9 +338,9 @@ never served a daemon (fresh boot or a fresh XDG runtime dir) or after the
 stale socket has been reclaimed/removed:
 
 ```console
-$ ./target/release/herdr-fleet daemon status --json       # exit 1
+$ ./target/release/canter daemon status --json       # exit 1
 {"command":"daemon status","error":{"code":"daemon.absent","details":null,
- "message":"no daemon is running on .../herdr-fleet/daemon.sock; read-only commands (doctor/status/plan) stay available without it","retryable":false},
+ "message":"no daemon is running on .../canter/daemon.sock; read-only commands (doctor/status/plan) stay available without it","retryable":false},
  "exit_code":1,"kind":"error","schema":"hf-output/v1"}
 ```
 
@@ -363,32 +363,32 @@ exact host steps. **They never install, start, stop, or query the host
 service manager** — a human executes the rendered steps on the target host.
 
 ```console
-$ ./target/release/herdr-fleet service doctor --json      # exit 0
+$ ./target/release/canter service doctor --json      # exit 0
 {"command":"service doctor","data":{"checks":[
  {"detail":"systemd","name":"platform","status":"ok"},
  {"detail":"daemon.enabled=true","name":"config","status":"found"},
  {"detail":"daemon not running","name":"socket","status":"absent"},
- {"detail":".../.config/systemd/user/herdr-fleet.service","name":"service-unit","status":"absent"}],
+ {"detail":".../.config/systemd/user/canter.service","name":"service-unit","status":"absent"}],
  "summary":{"daemon":"absent","platform":"systemd","unit":"absent"}},
  "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
 ```
 
 ```console
-$ ./target/release/herdr-fleet service install-plan --json   # exit 0
+$ ./target/release/canter service install-plan --json   # exit 0
 {"command":"service install-plan","data":{"platform":"systemd",
  "steps":[
-  "write the rendered unit to .../.config/systemd/user/herdr-fleet.service (content printed by the install command)",
+  "write the rendered unit to .../.config/systemd/user/canter.service (content printed by the install command)",
   "run: systemctl --user daemon-reload",
-  "run: systemctl --user enable --now herdr-fleet.service",
-  "verify: systemctl --user --no-pager status herdr-fleet.service"],
- "target":".../.config/systemd/user/herdr-fleet.service",
- "unit":"# herdr-fleet per-user daemon unit (issue #5; rendered, not activated)
+  "run: systemctl --user enable --now canter.service",
+  "verify: systemctl --user --no-pager status canter.service"],
+ "target":".../.config/systemd/user/canter.service",
+ "unit":"# canter per-user daemon unit (issue #5; rendered, not activated)
 [Unit]
-Description=herdr-fleet state daemon (single writer per user)
+Description=canter state daemon (single writer per user)
 ...
 [Service]
 Type=simple
-ExecStart=<herdr-fleet-binary> daemon run --socket .../herdr-fleet/daemon.sock
+ExecStart=<canter-binary> daemon run --socket .../canter/daemon.sock
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -490,9 +490,9 @@ The daemon is designed to be restarted freely; state is SQLite + journals,
 and the socket is reclaimable.
 
 ```console
-$ ./target/release/herdr-fleet daemon status --json   # after a crash/kill: exit 1
+$ ./target/release/canter daemon status --json   # after a crash/kill: exit 1
 {"command":"daemon status","error":{"code":"daemon.stale",...,
- "message":"a stale daemon socket exists at .../herdr-fleet/daemon.sock; a fresh `daemon run` reclaims it",...},
+ "message":"a stale daemon socket exists at .../canter/daemon.sock; a fresh `daemon run` reclaims it",...},
  "exit_code":1,"kind":"error","schema":"hf-output/v1"}
 ```
 
@@ -500,9 +500,9 @@ Remedy — start a fresh daemon; it reclaims the stale socket, opens/migrates
 the state, and reconciles interrupted claims:
 
 ```console
-$ ./target/release/herdr-fleet daemon run     # foreground; on ready, daemon.log shows
-#  "state open; reconciled 0 interrupted claim(s); serving .../herdr-fleet/daemon.sock"
-$ ./target/release/herdr-fleet daemon status --json    # exit 0 — live again
+$ ./target/release/canter daemon run     # foreground; on ready, daemon.log shows
+#  "state open; reconciled 0 interrupted claim(s); serving .../canter/daemon.sock"
+$ ./target/release/canter daemon status --json    # exit 0 — live again
 {"command":"daemon status","data":{"daemon":{"pid":<pid>,...},
  "state":{"active_grants":0,"epoch":1,...}},"exit_code":0,"kind":"ok","schema":"hf-output/v1"}
 ```
@@ -586,7 +586,7 @@ from public CI or fork PRs.
 ## 10. Upgrade
 
 1. Pull the new release, rebuild pinned: `cargo build --release --locked`.
-2. Check the schema facts: `herdr-fleet --version` (migration chain must
+2. Check the schema facts: `canter --version` (migration chain must
    include the new `mNNNN_*` entry).
 3. Stop the daemon/service (Ctrl-C, or the service steps from section
    5.1), start the new binary — the daemon opens/migrates SQLite state on
@@ -596,6 +596,14 @@ from public CI or fork PRs.
    survive restarts by design and stay paused until explicitly resumed.
 5. Release/version policy, archive verification, and rollback notes:
    [RELEASING.md](RELEASING.md).
+
+**Pre-rename compatibility (issue #106).** A state/runtime tree or config
+created under the old `herdr-fleet` name is adopted in place — no migration
+step, no copy, and nothing deleted — and the pre-rename `herdr-fleet` binary
+name, `HERDR_FLEET_CRASH_POINT`, and live Herdr source ids keep working. The
+single normative list is the
+[compatibility contract](contracts/compatibility.md#product-rename-issue-106)
+(also: the archive/executable name is now `canter-<version>-<platform>`).
 
 ---
 

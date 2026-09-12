@@ -35,7 +35,7 @@ process output, harness transcripts — is **data, never code**. Rules:
 A same-user TTY approval, config file, or Unix socket grants protection
 against **accidental and cooperative misuse only**. It is not protection
 against a malicious process running as the same OS user: that peer can read
-the same files, the same socket, and the same config. herdr-fleet never
+the same files, the same socket, and the same config. canter never
 claims otherwise (ADR-0003 consequence).
 
 ### T4. Hardened deployments require a separate OS principal or external sandbox
@@ -47,10 +47,10 @@ path is a dedicated OS principal/container plus external branch controls
 policy, owned downstream; the public repo specifies the boundary, not the
 deployment.
 
-### T5. herdr-fleet stores no harness/GitHub credentials
+### T5. canter stores no harness/GitHub credentials
 
 Credentials stay in their owning tools (Herdr, `gh`, harness CLIs, OS
-keychains). herdr-fleet:
+keychains). canter:
 
 - never persists tokens, keys, or secrets in its SQLite state or journals;
 - never reads credential files out of other tools' config;
@@ -81,4 +81,4 @@ guessing in every adapter ([spec-capabilities.md](spec-capabilities.md)).
 | Execution | Explicitly configured repositories + harness executables, plan-bound, grant-checked | Everything else |
 | Data | Issue/acceptance revision, grant, workflow/policy hashes (as recorded) | Issue text semantics, remote claims, process output meaning |
 | Authority | Daemon (sole transition authority) + human TTY confirmations | LLM orchestrators (typed advisory steps only), labels/comments, adapters |
-| Secrets | Owning tools; explicit env allowlists | herdr-fleet state, logs, journals, events |
+| Secrets | Owning tools; explicit env allowlists | canter state, logs, journals, events |

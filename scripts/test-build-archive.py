@@ -42,7 +42,7 @@ def run(argv, cwd=None, check=True):
 
 
 def ensure_release_binary():
-    binary = os.path.join(REPO, "target", "release", "herdr-fleet")
+    binary = os.path.join(REPO, "target", "release", "canter")
     if not os.path.isfile(binary):
         proc = run(["cargo", "build", "--release", "--locked"], cwd=REPO)
         if proc.returncode != 0:
@@ -101,7 +101,7 @@ def checks():
         # A malicious archive whose member basenames match the documented
         # layout but whose paths escape the extraction directory must be
         # refused by verify (tarfile extractall runs with filter='data').
-        malicious = os.path.join(tmp, "herdr-fleet-0.1.0-linux-x86_64.tar.gz")
+        malicious = os.path.join(tmp, "canter-0.1.0-linux-x86_64.tar.gz")
         benign_names = ("LICENSE-APACHE", "LICENSE-MIT", "SBOM.spdx.json",
                         "SHA256SUMS", "provenance.json")
         with open(malicious, "wb") as raw:
@@ -110,7 +110,7 @@ def checks():
                 with tarfile.open(fileobj=gz, mode="w",
                                   format=tarfile.GNU_FORMAT) as tar:
                     for name in benign_names:
-                        info = tarfile.TarInfo("herdr-fleet-0.1.0/" + name)
+                        info = tarfile.TarInfo("canter-0.1.0/" + name)
                         info.size = 0
                         info.mtime = 0
                         info.uid = 0
@@ -119,7 +119,7 @@ def checks():
                     # Traversal member: same basename as the documented
                     # executable, path escapes the extraction directory.
                     evil = tarfile.TarInfo(
-                        "herdr-fleet-0.1.0/../../../herdr-fleet")
+                        "canter-0.1.0/../../../canter")
                     evil.size = 0
                     evil.mtime = 0
                     evil.uid = 0
@@ -140,7 +140,7 @@ def checks():
                       "--out-dir", out_dir]
         first = run(build_args)
         assert first.returncode == 0, first.stderr.decode()
-        archive = os.path.join(out_dir, "herdr-fleet-0.1.0-linux-x86_64.tar.gz")
+        archive = os.path.join(out_dir, "canter-0.1.0-linux-x86_64.tar.gz")
         assert os.path.isfile(archive)
         assert os.path.isfile(archive + ".sha256")
 
@@ -193,16 +193,16 @@ def checks():
                     for p in builder.parse_lockfile_packages(lock_text)}
         sbom_names = {p["name"]: p.get("versionInfo")
                       for p in sbom_data["packages"]}
-        assert "herdr-fleet" in sbom_names and sbom_names["herdr-fleet"] == "0.1.0"
+        assert "canter" in sbom_names and sbom_names["canter"] == "0.1.0"
         # Every dependency in Cargo.lock appears once with its version; the
         # SBOM's root package entry corresponds to Cargo.lock's own
-        # herdr-fleet entry (same name/version), so counts are equal.
+        # canter entry (same name/version), so counts are equal.
         for name, version in packages.items():
             assert sbom_names.get(name) == version, (
                 f"SBOM must mirror Cargo.lock for {name}@{version}")
         assert len(sbom_names) == len(packages), (
             "SBOM package count must equal Cargo.lock packages "
-            "(root entry covers Cargo.lock's own herdr-fleet row)")
+            "(root entry covers Cargo.lock's own canter row)")
         print(f"PASS: SBOM mirrors Cargo.lock offline ({len(packages)} "
               "packages incl. root)")
 
@@ -211,7 +211,7 @@ def checks():
         os.makedirs(second_out)
         second = run(build_args + ["--out-dir", second_out])
         assert second.returncode == 0, second.stderr.decode()
-        archive2 = os.path.join(second_out, "herdr-fleet-0.1.0-linux-x86_64.tar.gz")
+        archive2 = os.path.join(second_out, "canter-0.1.0-linux-x86_64.tar.gz")
 
         def file_sha(path):
             digest = hashlib.sha256()

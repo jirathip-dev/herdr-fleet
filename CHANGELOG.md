@@ -8,8 +8,8 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ### Added (bootstrap)
 
-- Public repository foundation for herdr-fleet (issue #2):
-  - Single-package Rust scaffold: `herdr-fleet` library + binary with
+- Public repository foundation for canter (issue #2):
+  - Single-package Rust scaffold: `canter` library + binary with
     truthful `--help`/`--version` only; edition 2024, pinned toolchain
     1.97.1, committed `Cargo.lock`, zero external dependencies.
   - Real-binary CLI smoke tests (`tests/cli_smoke.rs`).
@@ -24,7 +24,7 @@ release process activates (docs/RELEASING.md), then semver applies.
     Dependabot grouped weekly updates targeting `staging`.
   - Public docs: README, ARCHITECTURE, DEVELOPMENT, WORKFLOW, RELEASING,
     three ADRs, SECURITY, CONTRIBUTING, AGENTS, CODE_OF_CONDUCT, and the
-    public `skills/herdr-fleet` skill.
+    public `skills/canter` skill.
   - Amendment-3 architecture artifact set committed under
     `docs/architecture/` (sanitized locked-target JSON/HTML + static
     light/dark previews + SHA-256 provenance README).
@@ -276,6 +276,26 @@ release process activates (docs/RELEASING.md), then semver applies.
   spawns twice. Excluded, as the issue requires: scheduler-driven successor
   work, automatic retries, process-tree cleanup and real deployment
   activation.
+
+### Changed (issue #106 — product rename `herdr-fleet` → `canter`)
+
+- The product is renamed: package + library crate `canter`, canonical binary
+  `canter`, and `--help`/`--version`, docs, skills, install/archive scripts,
+  CI references, and the changelog all use the new name. Schema families
+  (`hf-*`), envelopes, exit codes, and the daemon wire contract are
+  unchanged, and the schema/version facts (`--version`) stay accurate.
+- Compatibility is normative in
+  [docs/contracts/compatibility.md](docs/contracts/compatibility.md#product-rename-issue-106):
+  the pre-rename `herdr-fleet` binary ships as an alias running the identical
+  CLI (deprecation warning on stderr); a pre-rename state/runtime tree is
+  adopted **in place** (never copied, moved, migrated, or deleted) and a
+  pre-rename config is still discovered; `HERDR_FLEET_CRASH_POINT` remains
+  honored; live Herdr integration ids (`custom:herdr-fleet-pi|-jcode`,
+  `herdr-fleet-lane`) are retained; frozen v0.1.0 architecture renders and
+  historical `.report-*.md` records keep the old name by design.
+- Machine-checked by `tests/rename_sweep.rs` (no stale reference outside the
+  documented legacy set) and `tests/rename_compat.rs` (alias binary, legacy
+  tree adoption, legacy config discovery, legacy env var).
 
 ### Changed
 

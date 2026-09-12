@@ -1,15 +1,15 @@
 //! CLI smoke tests against the REAL compiled binary.
 //!
-//! `env!(\"CARGO_BIN_EXE_herdr-fleet\")` is provided by Cargo for integration
+//! `env!(\"CARGO_BIN_EXE_canter\")` is provided by Cargo for integration
 //! tests and points at the built binary of this package.
 
 use std::process::Command;
 
 fn run(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_herdr-fleet"))
+    Command::new(env!("CARGO_BIN_EXE_canter"))
         .args(args)
         .output()
-        .expect("failed to spawn the herdr-fleet binary")
+        .expect("failed to spawn the canter binary")
 }
 
 fn stdout_of(out: &std::process::Output) -> String {
@@ -27,7 +27,7 @@ fn help_exits_zero_and_prints_usage() {
         assert!(out.status.success(), "{flag} should exit 0");
         let stdout = stdout_of(&out);
         assert!(
-            stdout.contains("herdr-fleet"),
+            stdout.contains("canter"),
             "{flag} stdout should name the program"
         );
         assert!(
@@ -58,7 +58,7 @@ fn version_exits_zero_and_prints_package_identity() {
         assert!(
             stdout.contains(&format!(
                 "state schema version: {}",
-                herdr_fleet::state::SCHEMA_VERSION
+                canter::state::SCHEMA_VERSION
             )),
             "{flag} stdout should contain the state schema version fact"
         );

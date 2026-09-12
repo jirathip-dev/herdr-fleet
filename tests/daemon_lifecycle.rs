@@ -4,7 +4,7 @@
 //! evaluation per boot (Herdr absent or not), and fan-out admission
 //! refusals (missing/stale host proof, missing caps, exceeded caps).
 //!
-//! Every test spawns `herdr-fleet daemon run` as a child process with
+//! Every test spawns `canter daemon run` as a child process with
 //! isolated XDG state and an explicit short socket under a per-test temp
 //! dir; nothing here touches the real host state, the service manager, or
 //! the network (see tests/no_network_surface.rs).
@@ -13,13 +13,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use herdr_fleet::client::{Connection, RpcError};
-use herdr_fleet::dirs::DaemonPaths;
-use herdr_fleet::state::{Retention, State};
-use herdr_fleet::value::{Val, integer, object, string};
+use canter::client::{Connection, RpcError};
+use canter::dirs::DaemonPaths;
+use canter::state::{Retention, State};
+use canter::value::{Val, integer, object, string};
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_herdr-fleet")
+    env!("CARGO_BIN_EXE_canter")
 }
 
 struct Fixture {
@@ -41,7 +41,7 @@ impl Fixture {
     }
 
     fn paths(&self) -> DaemonPaths {
-        let state_dir = self.state_dir.join("herdr-fleet");
+        let state_dir = self.state_dir.join("canter");
         DaemonPaths {
             state_dir: state_dir.clone(),
             runtime_dir: self.dir.clone(),
@@ -94,9 +94,7 @@ enum PathMode {
 fn wait_ready(fixture: &Fixture) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        if herdr_fleet::lock::socket_presence(&fixture.socket)
-            == herdr_fleet::lock::SocketPresence::Active
-        {
+        if canter::lock::socket_presence(&fixture.socket) == canter::lock::SocketPresence::Active {
             let ok = Connection::open(&fixture.socket)
                 .and_then(|mut connection| {
                     connection.send_request("aaaaaaaaaaaaaaaa", "status", None)?;
@@ -127,7 +125,7 @@ fn rpc(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
     let response = connection.read_response().expect("read response");
     if response.ok {
         object(vec![
-            ("ok", herdr_fleet::value::bool_(true)),
+            ("ok", canter::value::bool_(true)),
             ("result", response.result),
         ])
     } else {
@@ -136,7 +134,7 @@ fn rpc(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
             message: "no error doc".to_string(),
         });
         object(vec![
-            ("ok", herdr_fleet::value::bool_(false)),
+            ("ok", canter::value::bool_(false)),
             (
                 "error",
                 object(vec![
@@ -154,7 +152,7 @@ fn rpc_ok(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
         doc.get("ok").and_then(Val::as_bool),
         Some(true),
         "expected ok response for {method}: {}",
-        herdr_fleet::canonical::canonical_text(&doc)
+        canter::canonical::canonical_text(&doc)
     );
     doc.get("result").expect("result").clone()
 }
@@ -165,7 +163,7 @@ fn rpc_err(socket: &Path, id: &str, method: &str, params: Option<Val>) -> (Strin
         doc.get("ok").and_then(Val::as_bool),
         Some(false),
         "expected refused response for {method}: {}",
-        herdr_fleet::canonical::canonical_text(&doc)
+        canter::canonical::canonical_text(&doc)
     );
     let error = doc.get("error").expect("error doc");
     (
@@ -232,7 +230,7 @@ fn schedule_doc(schedule_id: &str, anchor: &str, expires_at: &str, every_secs: i
 
 /// RFC3339 seconds-Z offset from `now_unix`.
 fn ts(now_unix: i64, offset_secs: i64) -> String {
-    herdr_fleet::time::rfc3339_from_unix(now_unix + offset_secs)
+    canter::time::rfc3339_from_unix(now_unix + offset_secs)
 }
 
 /// All `read.schedule.ran` audit records currently visible via journal.tail.
@@ -276,7 +274,7 @@ fn schedule_create_list_pause_resume_delete_round_trip() {
     let fixture = Fixture::new("sched-rpc");
     let daemon = fixture.spawn(PathMode::Host);
     wait_ready(&fixture);
-    let now = herdr_fleet::time::unix_now();
+    let now = canter::time::unix_now();
     let doc = schedule_doc(
         "sd_0123456789abcdef",
         &ts(now, 3600),
@@ -409,7 +407,7 @@ fn schedule_evaluate_fires_due_once_and_expired_schedules_park() {
     let fixture = Fixture::new("sched-eval");
     let daemon = fixture.spawn(PathMode::Host);
     wait_ready(&fixture);
-    let now = herdr_fleet::time::unix_now();
+    let now = canter::time::unix_now();
 
     // Due now (anchor two windows back; cadence 60s).
     let due = schedule_doc(
@@ -434,7 +432,7 @@ fn schedule_evaluate_fires_due_once_and_expired_schedules_park() {
         evaluated.get("ran").and_then(Val::as_array).map(Vec::len),
         Some(1),
         "due schedule must run: {}",
-        herdr_fleet::canonical::canonical_text(&evaluated)
+        canter::canonical::canonical_text(&evaluated)
     );
     let records = schedule_ran_records(&fixture.socket, &fresh_id(12));
     assert_eq!(
@@ -454,7 +452,7 @@ fn schedule_evaluate_fires_due_once_and_expired_schedules_park() {
         second.get("ran").and_then(Val::as_array).map(Vec::len),
         Some(0),
         "second evaluation in the same window must not re-fire: {}",
-        herdr_fleet::canonical::canonical_text(&second)
+        canter::canonical::canonical_text(&second)
     );
     assert_eq!(
         schedule_ran_records(&fixture.socket, &fresh_id(14)).len(),
@@ -482,7 +480,7 @@ fn schedule_evaluate_fires_due_once_and_expired_schedules_park() {
         paused.len(),
         1,
         "expired schedule must park: {}",
-        herdr_fleet::canonical::canonical_text(&evaluated)
+        canter::canonical::canonical_text(&evaluated)
     );
     assert!(
         paused[0]
@@ -519,7 +517,7 @@ fn cold_boot_fires_due_schedule_once_per_boot_without_tools_on_path() {
     let fixture = Fixture::new("coldboot");
     let daemon = fixture.spawn(PathMode::WithoutTools);
     wait_ready(&fixture);
-    let now = herdr_fleet::time::unix_now();
+    let now = canter::time::unix_now();
     // The schedule is long overdue (downtime covered many windows).
     let due = schedule_doc(
         "sd_3333333333333333",
@@ -621,7 +619,7 @@ fn step(id: &str, kind: &str, params: Option<Val>) -> Val {
     object(vec![
         ("id", string(id)),
         ("kind", string(kind)),
-        ("params", params.unwrap_or_else(herdr_fleet::value::null)),
+        ("params", params.unwrap_or_else(canter::value::null)),
     ])
 }
 
@@ -642,8 +640,7 @@ fn make_plan(steps: Vec<Val>) -> Val {
         ),
         ("steps", Val::Arr(steps)),
     ]);
-    let digest =
-        herdr_fleet::canonical::sha256_hex(&herdr_fleet::canonical::canonical_bytes(&seed));
+    let digest = canter::canonical::sha256_hex(&canter::canonical::canonical_bytes(&seed));
     let plan_id = format!("hf_plan_{}", &digest[..16]);
     let mut map = match seed {
         Val::Obj(map) => map,
@@ -688,9 +685,9 @@ impl AdmissionScenario {
 
     fn apply_params(&self, seed: u32, admission: Option<Val>) -> Val {
         let mut flags = vec![
-            ("interactive", herdr_fleet::value::bool_(true)),
-            ("digest_confirmed", herdr_fleet::value::bool_(true)),
-            ("scheduled", herdr_fleet::value::bool_(false)),
+            ("interactive", canter::value::bool_(true)),
+            ("digest_confirmed", canter::value::bool_(true)),
+            ("scheduled", canter::value::bool_(false)),
             ("production_confirmation", string("tty")),
         ];
         if let Some(admission) = admission {
@@ -710,8 +707,8 @@ impl AdmissionScenario {
                 object(vec![
                     ("issue_revision", string(REVISION)),
                     ("policy_hash", string(POLICY_HASH)),
-                    ("feature_head", herdr_fleet::value::null()),
-                    ("integration_base", herdr_fleet::value::null()),
+                    ("feature_head", canter::value::null()),
+                    ("integration_base", canter::value::null()),
                 ]),
             ),
             (
@@ -785,7 +782,7 @@ fn admission_refuses_missing_or_stale_proof_and_missing_caps_over_the_wire() {
         16,
         8,
         8,
-        &herdr_fleet::time::rfc3339_from_unix(herdr_fleet::time::unix_now() - 3600),
+        &canter::time::rfc3339_from_unix(canter::time::unix_now() - 3600),
     );
     let (code, _) = rpc_err(
         &scenario.fixture.socket,
@@ -799,10 +796,7 @@ fn admission_refuses_missing_or_stale_proof_and_missing_caps_over_the_wire() {
     // refuse new work: every applicable axis must be bounded).
     let no_caps = object(vec![(
         "host_proof",
-        object(vec![(
-            "measured_at",
-            string(&herdr_fleet::time::rfc3339_now()),
-        )]),
+        object(vec![("measured_at", string(&canter::time::rfc3339_now()))]),
     )]);
     let (code, _) = rpc_err(
         &scenario.fixture.socket,
@@ -813,7 +807,7 @@ fn admission_refuses_missing_or_stale_proof_and_missing_caps_over_the_wire() {
     assert_eq!(code, "refusal.admission.cap_missing");
 
     // Exceeded global cap (0 < 1 running lane).
-    let capped = admission_flags(0, 8, 8, &herdr_fleet::time::rfc3339_now());
+    let capped = admission_flags(0, 8, 8, &canter::time::rfc3339_now());
     let (code, message) = rpc_err(
         &scenario.fixture.socket,
         &fresh_id(33),
@@ -826,7 +820,7 @@ fn admission_refuses_missing_or_stale_proof_and_missing_caps_over_the_wire() {
     // as admission is concerned (the effect then fails on the missing
     // worktree, which is a different, later gate) — assert admission does
     // NOT refuse when measurements are present and fresh.
-    let fresh = admission_flags(16, 8, 8, &herdr_fleet::time::rfc3339_now());
+    let fresh = admission_flags(16, 8, 8, &canter::time::rfc3339_now());
     let doc = rpc(
         &scenario.fixture.socket,
         &fresh_id(34),
@@ -873,7 +867,7 @@ fn paused_schedule_and_instance_survive_restart_and_boot_recovery() {
     let fixture = Fixture::new("pause-restart");
     let daemon = fixture.spawn(PathMode::Host);
     wait_ready(&fixture);
-    let now = herdr_fleet::time::unix_now();
+    let now = canter::time::unix_now();
     let due = schedule_doc(
         "sd_4444444444444444",
         &ts(now, -7200),

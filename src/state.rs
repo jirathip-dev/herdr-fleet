@@ -6966,7 +6966,7 @@ const MIGRATIONS: [(&str, i64, i64); 7] = [
 ];
 
 /// Ordered migration-chain identifiers (`m0001`..`m0007`), exposed for the
-/// release provenance chain (issue #10): `herdr-fleet --version` prints
+/// release provenance chain (issue #10): `canter --version` prints
 /// them so a release archive's provenance record can bind the exact
 /// state-schema migration chain of the binary it ships.
 pub fn migration_chain_ids() -> &'static [&'static str] {

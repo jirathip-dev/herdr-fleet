@@ -66,7 +66,7 @@ to journal fails closed — the mutation does not start.
 | Boundary | Content | Owner | Retention (default; configurable via policy overlay) |
 | --- | --- | --- | --- |
 | Daemon-owned backup | SQLite snapshot + migration chain + journal tail, created via `backup.create` | daemon-owned state dir | keep last N point-in-time backups; prune only with a `cleanup` grant; never touches external repos |
-| External repositories/worktrees | NOT backed up by herdr-fleet | Git remotes + operator | Git history is the operator's own retention domain; herdr-fleet never copies external state into its backup |
+| External repositories/worktrees | NOT backed up by canter | Git remotes + operator | Git history is the operator's own retention domain; canter never copies external state into its backup |
 | Logs/events | JSONL event stream | daemon | bounded by retention policy; rotated without data loss of journal records |
 
 - Backup covers daemon-owned state only; the boundary is explicit so that

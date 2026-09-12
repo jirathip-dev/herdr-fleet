@@ -1,4 +1,4 @@
-# CI for herdr-fleet (public repository).
+# CI for canter (public repository).
 # Job names are STABLE contract: they become required-check contexts later.
 # Do not rename jobs without a conductor-coordinated change.
 
@@ -152,7 +152,7 @@ jobs:
             docs/architecture/herdr-fleet.locked-target.architecture.html
             docs/architecture/herdr-fleet.locked-target.architecture.preview.light.png
             docs/architecture/herdr-fleet.locked-target.architecture.preview.dark.png
-            skills/herdr-fleet/SKILL.md
+            skills/canter/SKILL.md
             SECURITY.md
             .editorconfig
             .gitignore
@@ -297,7 +297,7 @@ jobs:
       - name: Real CLI smoke (exit codes asserted)
         run: |
           set -euo pipefail
-          BIN="target/debug/herdr-fleet"
+          BIN="target/debug/canter"
           "$BIN" --help > /tmp/hf-help.txt
           "$BIN" -h > /tmp/hf-help-short.txt
           "$BIN" --version > /tmp/hf-version.txt
@@ -306,7 +306,7 @@ jobs:
             echo "::error::--help output missing usage text"
             exit 1
           fi
-          if ! grep -q "herdr-fleet" /tmp/hf-version.txt || ! grep -q "0.1.0" /tmp/hf-version.txt; then
+          if ! grep -q "canter" /tmp/hf-version.txt || ! grep -q "0.1.0" /tmp/hf-version.txt; then
             echo "::error::--version output missing package identity"
             exit 1
           fi
@@ -316,6 +316,22 @@ jobs:
           fi
           if "$BIN" > /dev/null 2>&1; then
             echo "::error::no arguments must exit non-zero"
+            exit 1
+          fi
+          # The pre-rename alias binary ships and runs the same CLI
+          # (docs/contracts/compatibility.md, "Product rename (issue #106)").
+          LEGACY="target/debug/herdr-fleet"
+          if [ ! -x "$LEGACY" ]; then
+            echo "::error::pre-rename alias binary was not built"
+            exit 1
+          fi
+          "$LEGACY" --version > /tmp/hf-legacy-version.txt 2>/tmp/hf-legacy-warning.txt
+          if ! grep -q "canter" /tmp/hf-legacy-version.txt; then
+            echo "::error::alias --version output missing the canter identity"
+            exit 1
+          fi
+          if ! grep -q "pre-rename" /tmp/hf-legacy-warning.txt; then
+            echo "::error::alias must warn about the pre-rename name on stderr"
             exit 1
           fi
           echo "CLI smoke: help/version/unknown/no-args all asserted"

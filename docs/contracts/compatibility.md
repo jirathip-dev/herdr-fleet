@@ -1,8 +1,8 @@
-# Compatibility policy: Herdr, `gh`, and the harness adapters
+# Compatibility policy: product name, Herdr, `gh`, and the harness adapters
 
 Refs #3, #7, #35 (deliverables: "A tested compatibility policy for Herdr
 and `gh`: runtime capability negotiation plus declared minimum/current
-versions; `herdr-fleet doctor` diagnoses prerequisites but never installs,
+versions; `canter doctor` diagnoses prerequisites but never installs,
 starts, stops, or upgrades Herdr" and, for issue #7, the declared supported
 version ranges of the official harness adapters). Design commitment for the
 policy shape; version facts are measured from public release metadata. Issue
@@ -12,14 +12,14 @@ harness rows retain their own evidence qualifications below.
 
 ## Policy shape
 
-1. herdr-fleet never embeds Herdr, `gh`, or any harness; all of them are
+1. canter never embeds Herdr, `gh`, or any harness; all of them are
    runtime prerequisites for the operations that use them, discovered on
    PATH (never compiled-in paths).
 2. **Runtime capability negotiation**: harness profiles declare the closed
    operation set through `hf-capability/v1`
    ([spec-capabilities.md](spec-capabilities.md)); version checks are the first
    gate and capability checks authorize each adapter operation. Herdr's own
-   client/server endpoint negotiation remains Herdr-owned. herdr-fleet probes
+   client/server endpoint negotiation remains Herdr-owned. canter probes
    the CLI version and does not reimplement or bypass that socket handshake.
 3. **Declared versions** (this table is updated with each release that
    changes the declared range — updating it is a compatibility change, not
@@ -35,7 +35,7 @@ harness rows retain their own evidence qualifications below.
 | Pi (`pi`, earendil-works/pi) | 0.85.1 (exact-version floor measured live on 2026-09-08 against the SHA-verified linux-x64 prebuilt — the issue #33 lane ran the real binary; older versions are refused until the clean-host matrix lowers the floor; parity on other platforms [awaiting-evidence]) | v0.85.1 (2026-09-08; linux-x64 prebuilt verified and exercised; darwin arm64/x64 prebuilts are available at this version — a real darwin run is a human-gated clean-host smoke like #7 AC6) | public release metadata + measured real binary of the upstream Pi project (earendil-works/pi) |
 | Jcode (`jcode`, 1jehuang/jcode) | 0.84.0 (exact-version floor measured live on 2026-09-08 against the SHA-verified linux-x64 prebuilt — the issue #37 lane ran the real binary's version probe and one-shot `run` argv row; older versions are refused until the clean-host matrix lowers the floor; parity on other platforms [awaiting-evidence]) | v0.84.0 (2026-09-08; linux-x64 prebuilt verified and exercised — version probe, `--` end-of-options guard, `--json` envelope shape and measured missing-key text; darwin arm64/x64 prebuilts are available at this version — a real darwin run is a human-gated clean-host smoke like #7 AC6; the issue #37 darwin arm64 canary measured peak RSS ~19.9 MB on the same INI task) | public release metadata + measured real binary of the upstream Jcode project (1jehuang/jcode) |
 
-   "Declared minimum" is the version below which herdr-fleet refuses to
+   "Declared minimum" is the version below which canter refuses to
    operate (typed refusal + `doctor` diagnosis). "Declared current" is the
    version the release notes/support matrix names as the tested ceiling.
    Official adapters declare their ranges in `src/adapters.rs`
@@ -58,13 +58,13 @@ harness rows retain their own evidence qualifications below.
 4. Harness negotiation outcomes are versioned with the schema
    (`hf-capability/v1`) so a future minimum bump is an explicit, reviewable
    change rather than a silent behavior shift.
-5. **`herdr-fleet doctor` boundary**: `doctor` diagnoses prerequisites —
+5. **`canter doctor` boundary**: `doctor` diagnoses prerequisites —
    presence on PATH and version vs the declared range for Herdr, plus `gh`
    presence/auth state. It does not open Herdr's socket; server compatibility
    is reported by Herdr's own status surface and measured separately below.
    It **never installs, starts, stops, or upgrades** Herdr, `gh`, or any
    harness. Installation/upgrade is the operator's toolchain concern;
-   herdr-fleet only reports and refuses.
+   canter only reports and refuses.
 6. Herdr absence never breaks standalone help/version/config validation or
    supported non-dependent read-only operations (locked spec); the same
    applies to any single optional harness (issue #7 AC4).
@@ -81,7 +81,7 @@ generation to receive one final upgrade. Herdr 0.8.2 uses numbered protocol
 | 0.9.0 client → 0.9.0 server | PASS | Live isolated Linux scratch server: `status --json` reported protocol 22, `compatible:true`, `endpoint_compatible:true`, no restart needed. |
 | 0.8.2 client → 0.9.0 server | RED | Live SHA-256-verified upstream 0.8.2 client: status reported protocol 20 → 22 and `compatible:false`; scoped `workspace get` and `pane read` returned `protocol_mismatch`. |
 | 0.9.0 client → 0.8.2 server | RED | Live isolated 0.8.2 scratch server: status reported protocol 22 → 20, endpoint generation absent, and `compatible:false`; scoped `workspace list` returned `protocol_mismatch`. |
-| Daemon RPC | PASS (portable) | `tests/daemon_rpc.rs` exercises the independent herdr-fleet Unix-socket RPC. It does not call Herdr; the live 0.9.0 server remained running and untouched during the suite. |
+| Daemon RPC | PASS (portable) | `tests/daemon_rpc.rs` exercises the independent canter Unix-socket RPC. It does not call Herdr; the live 0.9.0 server remained running and untouched during the suite. |
 | Events | PASS (live + portable) | A 0.9.0 scratch subscription acknowledged before `session.snapshot`, replayed no workspace event retained before subscription, and delivered the first post-subscription event, confirming live-only semantics. `tests/herdr_compatibility.rs` rejects snapshot-first and retained-replay traces. |
 | Service plans | PASS (portable) | `tests/service_plans.rs` renders doctor/install/status/uninstall plans in fixture XDG dirs. These plans do not call Herdr or activate a host service. |
 | Lifecycle | PASS (live + portable) | 0.9.0 accepted isolated custom `pane report-agent` working/idle rows. Issue #9 scheduling is daemon-owned and never calls upstream `events.subscribe`; its coalesced no-backlog behavior remains covered by `tests/daemon_lifecycle.rs`. |
@@ -92,7 +92,7 @@ generation to receive one final upgrade. Herdr 0.8.2 uses numbered protocol
 The mixed-version failures are an upstream endpoint boundary, not an adapter
 serialization defect: neither direction can issue normal protocol-20/22 API
 calls. No adapter-side retry or replay is safe. Update the client and server
-together (or complete Herdr's supported handoff outside herdr-fleet); do not
+together (or complete Herdr's supported handoff outside canter); do not
 restart them from this CLI. Consequently `HERDR_MINIMUM` remains 0.8.2: issue
 #35 is red in both required mixed-version directions and does not authorize
 the conditional doctor-floor bump. That minimum describes the same-install
@@ -154,10 +154,40 @@ updating it is a compatibility change, not a chore):
 | `gh` CLI 2.x floor | `src/observe.rs` `GH_MINIMUM = (2, 0, 0)` + the same `probe_version` gate; fork-PR read-back behavior is [awaiting-evidence] (clean-host fork-PR tests) |
 | Hermes / Claude Code / Codex / Pi / Jcode minimum + current | `src/adapters.rs` `official_specs()` `VersionRange { minimum, current }` per adapter; the `hf-capability/v1` negotiation refuses below `minimum`; exact argv rows and gate behavior pinned by fake executables in `tests/harness_adapters.rs` (the pi fake pins the one-shot `--print` row with the `--` end-of-options guard; the jcode fake pins the one-shot `run --provider ... --model ... --json --` row with the same guard) |
 | Negotiation envelope versioning | `hf-capability/v1` family fixtures + oracle (`scripts/check-contract-fixtures.py`) and `src/schema.rs` `SUPPORTED_FAMILIES` |
-| Release-to-table binding | every release archive's `provenance.json` records the binary's schema facts (`herdr-fleet --version`: state schema version, migration chain, document families) and its exact source ref — the compatibility table's declared ranges live in that same binary and are exercised by the probes above (`scripts/build-archive.py`, `docs/RELEASING.md`) |
+| Release-to-table binding | every release archive's `provenance.json` records the binary's schema facts (`canter --version`: state schema version, migration chain, document families) and its exact source ref — the compatibility table's declared ranges live in that same binary and are exercised by the probes above (`scripts/build-archive.py`, `docs/RELEASING.md`) |
 
 The release-readiness slice (issue #10) added the probe mapping without new
 live version facts. Issues #33 and #37 subsequently measured the Pi and Jcode
 Linux rows. Issue #35 now advances Herdr's declared current to 0.9.0 and
 records the live same-version and red mixed-version matrix above; it does not
 change any harness row or remove that row's [awaiting-evidence] qualification.
+
+## Product rename (issue #106)
+
+The product was renamed **herdr-fleet → canter** (the GitHub repository was
+renamed earlier; old URLs redirect). This section is the **authoritative**
+compatibility contract for that rename — other documents link here instead of
+restating it. Nothing that is a live or persisted external contract is
+migrated destructively, and every pre-rename form below either keeps working
+or is retained unchanged; the alias/fallbacks are removed only by a future
+release that announces the removal in CHANGELOG.md (itself a compatibility
+change).
+
+| Surface | Pre-rename form | Delivered behavior |
+| --- | --- | --- |
+| Binary name | `herdr-fleet` | The `herdr-fleet` alias binary is built and shipped next to `canter`; it prints a one-line deprecation warning on stderr and runs the identical CLI surface (`src/bin/herdr-fleet.rs`, shared `commands::cli_main`). |
+| State tree | `$XDG_STATE_HOME/herdr-fleet/` (default `~/.local/state/herdr-fleet/`) | **Adopted in place** when it exists and `canter/` does not: the daemon opens and (non-destructively) migrates the pre-rename tree and keeps using it — nothing is copied, moved, or deleted. Once a `canter/` tree exists it is authoritative; the leftover pre-rename tree is ignored and never touched. |
+| Runtime / socket dir | `$XDG_RUNTIME_DIR/herdr-fleet/` | Follows the state-tree choice (socket and state stay together), so a running pre-rename daemon's socket is still found by the renamed CLI. |
+| Config path | `$XDG_CONFIG_HOME/herdr-fleet/config.toml` | Still discovered as a fallback when no `canter/config.toml` exists, and read in place. An explicit `--config PATH` is unchanged. |
+| Crash-point env var (debug builds only) | `HERDR_FLEET_CRASH_POINT` | Both `CANTER_CRASH_POINT` and the pre-rename name are honored; release binaries ignore both. |
+| Rendered service units | `com.herdr-fleet.daemon` (launchd), `herdr-fleet.service` (systemd) | New `service *-plan` output renders `com.canter.daemon` / `canter.service`. An already-installed pre-rename unit keeps working because its program path is the binary the operator installed and the pre-rename binary name remains available (alias above); the CLI never touches the service manager, so retiring a pre-rename unit is a deliberate operator step. |
+| Herdr integration source ids | `custom:herdr-fleet-pi`, `custom:herdr-fleet-jcode` | Retained unchanged: these are live Herdr registry identifiers for running lanes, and renaming live registry identity is out of scope for the product rename. |
+| Default Herdr/terminal session name | `herdr-fleet-lane` | Retained unchanged for the same live-identity reason. |
+| Machine contract | `hf-*` schema families, envelopes, exit codes, daemon RPC | Unchanged: schema ids and the wire contract are versioned independently of the product name. |
+| `capabilities --json` self-report | `"actor":"herdr-fleet"` | Now `"actor":"canter"` (the CLI's own declaration; not a persisted contract). |
+| Frozen architecture renders | `docs/architecture/herdr-fleet.*.architecture.{json,html,png}` | Kept byte-frozen with their pinned SHA-256 and filenames: they are the dated v0.1.0 / locked-target records (their rendered titles show the name as it was then). |
+| Historical reports | `.report-*.md` | Kept as written (historical evidence), old name included. |
+
+The rename sweep (`tests/rename_sweep.rs`) machine-checks exactly this table:
+any `herdr-fleet` / `herdr_fleet` / `HERDR_FLEET` occurrence in the tracked
+tree outside the enumerated legacy/historical set fails the test.

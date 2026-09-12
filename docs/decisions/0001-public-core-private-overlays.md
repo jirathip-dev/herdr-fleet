@@ -6,7 +6,7 @@
 
 ## Context
 
-herdr-fleet is a public, community project aimed at the stranger-utility
+canter is a public, community project aimed at the stranger-utility
 test: every byte committed must be useful and safe for a stranger. The
 operating environment for the real fleet (which repositories to touch, which
 models/providers/roles to use, credentials, host paths, schedules, incident

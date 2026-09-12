@@ -9,7 +9,7 @@
 //! crash-after-stop reconciliation that reconciles exact absence without
 //! ever repeating a signal.
 //!
-//! Every test spawns `herdr-fleet daemon run` as a child process with
+//! Every test spawns `canter daemon run` as a child process with
 //! isolated XDG state and an explicit socket under a per-test temp dir. The
 //! workspace executable the retirement drives is a fake `herdr` recorded in a
 //! per-fixture invocation log, on a PATH that contains nothing else (the
@@ -21,11 +21,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use herdr_fleet::client::{Connection, RpcError};
-use herdr_fleet::value::{Val, bool_, integer, null, object, string};
+use canter::client::{Connection, RpcError};
+use canter::value::{Val, bool_, integer, null, object, string};
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_herdr-fleet")
+    env!("CARGO_BIN_EXE_canter")
 }
 
 /// Default per-test daemon readiness deadline.
@@ -81,7 +81,7 @@ impl Fixture {
     }
 
     fn daemon_log(&self) -> PathBuf {
-        self.state_dir.join("herdr-fleet").join("daemon.log")
+        self.state_dir.join("canter").join("daemon.log")
     }
 
     fn bin_dir(&self) -> PathBuf {
@@ -157,7 +157,7 @@ impl Fixture {
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file));
         if let Some(point) = crash_point {
-            command.env("HERDR_FLEET_CRASH_POINT", point);
+            command.env("CANTER_CRASH_POINT", point);
         }
         command.spawn().expect("spawn daemon")
     }
@@ -172,9 +172,7 @@ enum PathMode {
 fn wait_ready(fixture: &Fixture) {
     let deadline = Instant::now() + READY_TIMEOUT;
     while Instant::now() < deadline {
-        if herdr_fleet::lock::socket_presence(&fixture.socket)
-            == herdr_fleet::lock::SocketPresence::Active
-        {
+        if canter::lock::socket_presence(&fixture.socket) == canter::lock::SocketPresence::Active {
             let ok = Connection::open(&fixture.socket)
                 .and_then(|mut connection| {
                     connection.send_request("aaaaaaaaaaaaaaaa", "status", None)?;
@@ -229,7 +227,7 @@ fn rpc_ok(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
         doc.get("ok").and_then(Val::as_bool),
         Some(true),
         "expected ok response for {method}: {}",
-        herdr_fleet::canonical::canonical_text(&doc)
+        canter::canonical::canonical_text(&doc)
     );
     doc.get("result").expect("result").clone()
 }
@@ -240,7 +238,7 @@ fn rpc_err(socket: &Path, id: &str, method: &str, params: Option<Val>) -> (Strin
         doc.get("ok").and_then(Val::as_bool),
         Some(false),
         "expected refused response for {method}: {}",
-        herdr_fleet::canonical::canonical_text(&doc)
+        canter::canonical::canonical_text(&doc)
     );
     let error = doc.get("error").expect("error doc");
     (
@@ -1110,9 +1108,8 @@ fn retiring_an_orchestrator_preserves_workers_reviewers_and_bytes() {
     std::fs::create_dir_all(&worktree).expect("worktree dir");
     let report = worktree.join(".report-75.md");
     std::fs::write(&report, "lane report bytes: unchanged\n").expect("report");
-    let fingerprint = |path: &Path| {
-        herdr_fleet::canonical::sha256_hex(&std::fs::read(path).expect("read report"))
-    };
+    let fingerprint =
+        |path: &Path| canter::canonical::sha256_hex(&std::fs::read(path).expect("read report"));
     let report_before = fingerprint(&report);
 
     let (orchestrator, digest) = checkpointed_record(

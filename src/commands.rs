@@ -35,7 +35,7 @@ use crate::value::{Val, bool_, integer, null, object, string};
 
 /// Top-level usage text (also the `--help` output body).
 pub const USAGE: &str = "\
-herdr-fleet — typed, plan-first companion CLI for Herdr coding-agent fleets
+canter — typed, plan-first companion CLI for Herdr coding-agent fleets
 
 READ-ONLY CORE: this binary observes configuration, prerequisites, and
 repository state and renders deterministic plans. It never installs, starts,
@@ -44,21 +44,21 @@ it never stores credentials (GitHub reads use the invoking environment's
 authenticated `gh`).
 
 USAGE:
-    herdr-fleet --help
-    herdr-fleet --version
-    herdr-fleet config init
-    herdr-fleet config validate [--config PATH] [--json]
-    herdr-fleet config show [--config PATH] [--json]
-    herdr-fleet doctor [--json]
-    herdr-fleet status [--config PATH] [--json]
-    herdr-fleet plan <repository> <issue> [--revision HEX40] [--config PATH] [--json]
-    herdr-fleet capabilities [--json]
-    herdr-fleet daemon run [--socket PATH] [--config PATH]
-    herdr-fleet daemon status [--config PATH] [--json]
-    herdr-fleet service doctor [--config PATH] [--json]
-    herdr-fleet service install-plan [--config PATH] [--json]
-    herdr-fleet service status-plan [--config PATH] [--json]
-    herdr-fleet service uninstall-plan [--config PATH] [--json]
+    canter --help
+    canter --version
+    canter config init
+    canter config validate [--config PATH] [--json]
+    canter config show [--config PATH] [--json]
+    canter doctor [--json]
+    canter status [--config PATH] [--json]
+    canter plan <repository> <issue> [--revision HEX40] [--config PATH] [--json]
+    canter capabilities [--json]
+    canter daemon run [--socket PATH] [--config PATH]
+    canter daemon status [--config PATH] [--json]
+    canter service doctor [--config PATH] [--json]
+    canter service install-plan [--config PATH] [--json]
+    canter service status-plan [--config PATH] [--json]
+    canter service uninstall-plan [--config PATH] [--json]
 
 GLOBAL OPTIONS:
     -h, --help       Print help (add --help to any command for its usage).
@@ -303,7 +303,7 @@ fn parse_flag_command(name: &str, args: &[&String]) -> Result<Invocation, ParseE
             "-h" | "--help" => return Err(ParseError::Help(help_request(name))),
             flag => {
                 return Err(ParseError::Usage(format!(
-                    "{name}: unknown flag {flag:?}; run `herdr-fleet {name} --help`"
+                    "{name}: unknown flag {flag:?}; run `canter {name} --help`"
                 )));
             }
         }
@@ -335,11 +335,11 @@ fn help_request(name: &str) -> String {
 }
 
 const DOCTOR_USAGE: &str = "\
-herdr-fleet doctor — diagnose prerequisites (read-only; never installs,
+canter doctor — diagnose prerequisites (read-only; never installs,
 starts, stops, or upgrades Herdr, gh, git, or any harness)
 
 USAGE:
-    herdr-fleet doctor [--json]
+    canter doctor [--json]
 
 Checks: git presence, herdr presence + version vs the declared minimum
 0.8.2, gh presence + authentication + reported scopes, and the config file
@@ -348,10 +348,10 @@ missing or degraded, and 5 when a found config/policy document is invalid.
 ";
 
 const STATUS_USAGE: &str = "\
-herdr-fleet status — observe configured repositories (read-only)
+canter status — observe configured repositories (read-only)
 
 USAGE:
-    herdr-fleet status [--config PATH] [--json]
+    canter status [--config PATH] [--json]
 
 Observes each enabled configured repository through the local git checkout
 in the invoking directory and authenticated `gh` from the invoking
@@ -362,21 +362,21 @@ observation is partial; 5 for config errors.
 ";
 
 const CAPABILITIES_USAGE: &str = "\
-herdr-fleet capabilities — report the CLI's declared forge read capabilities
+canter capabilities — report the CLI's declared forge read capabilities
 
 USAGE:
-    herdr-fleet capabilities [--json]
+    canter capabilities [--json]
 
 Emits the hf-capability/v1 declaration for this read-only CLI: axis
-\"forge\", actor \"herdr-fleet\", capabilities [\"read_refs\", \"read_issues\",
+\"forge\", actor \"canter\", capabilities [\"read_refs\", \"read_issues\",
 \"read_checks\"]. No negotiation or shell guessing is performed.
 ";
 
 const PLAN_USAGE: &str = "\
-herdr-fleet plan <repository> <issue> — render a deterministic read-only plan
+canter plan <repository> <issue> — render a deterministic read-only plan
 
 USAGE:
-    herdr-fleet plan <repository> <issue> [--revision HEX40] [--config PATH] [--json]
+    canter plan <repository> <issue> [--revision HEX40] [--config PATH] [--json]
 
 <repository> names a configured repository (its config key or owner/name
 identity — identities always come from the config, never from free text).
@@ -391,17 +391,17 @@ daemon state in this slice). No plan is ever applied by this command.
 ";
 
 const CONFIG_USAGE: &str = "\
-herdr-fleet config <init|validate|show> — configuration guidance/inspection
+canter config <init|validate|show> — configuration guidance/inspection
 
 USAGE:
-    herdr-fleet config init
-    herdr-fleet config validate [--config PATH] [--json]
-    herdr-fleet config show [--config PATH] [--json]
+    canter config init
+    canter config validate [--config PATH] [--json]
+    canter config show [--config PATH] [--json]
 
 init prints an annotated hf-config/v1 template to stdout (the CLI never
 writes files). validate and show load the config at --config PATH or the XDG
-default ($XDG_CONFIG_HOME/herdr-fleet/config.toml or
-~/.config/herdr-fleet/config.toml) and its explicitly named policy overlay.
+default ($XDG_CONFIG_HOME/canter/config.toml or
+~/.config/canter/config.toml) and its explicitly named policy overlay.
 Unknown keys, foreign/missing schema identifiers, unsupported versions, and
 invalid overlay content are refused with typed refusals (exit 5).
 ";
@@ -437,7 +437,7 @@ fn parse_config(args: &[&String]) -> Result<Invocation, ParseError> {
             "-h" | "--help" => return Err(ParseError::Help(help_request("config"))),
             flag => {
                 return Err(ParseError::Usage(format!(
-                    "config: unknown flag {flag:?}; run `herdr-fleet config --help`"
+                    "config: unknown flag {flag:?}; run `canter config --help`"
                 )));
             }
         }
@@ -490,7 +490,7 @@ fn parse_daemon(args: &[&String]) -> Result<Invocation, ParseError> {
                     "-h" | "--help" => return Err(ParseError::Help(help_request("daemon"))),
                     flag => {
                         return Err(ParseError::Usage(format!(
-                            "daemon run: unknown flag {flag:?}; run `herdr-fleet daemon --help`"
+                            "daemon run: unknown flag {flag:?}; run `canter daemon --help`"
                         )));
                     }
                 }
@@ -520,7 +520,7 @@ fn parse_daemon(args: &[&String]) -> Result<Invocation, ParseError> {
                     "-h" | "--help" => return Err(ParseError::Help(help_request("daemon"))),
                     flag => {
                         return Err(ParseError::Usage(format!(
-                            "daemon status: unknown flag {flag:?}; run `herdr-fleet daemon --help`"
+                            "daemon status: unknown flag {flag:?}; run `canter daemon --help`"
                         )));
                     }
                 }
@@ -531,7 +531,7 @@ fn parse_daemon(args: &[&String]) -> Result<Invocation, ParseError> {
         "-h" | "--help" => return Err(ParseError::Help(help_request("daemon"))),
         other => {
             return Err(ParseError::Usage(format!(
-                "daemon: unknown subcommand {other:?}; run `herdr-fleet daemon --help`"
+                "daemon: unknown subcommand {other:?}; run `canter daemon --help`"
             )));
         }
     };
@@ -562,7 +562,7 @@ fn parse_service(args: &[&String]) -> Result<Invocation, ParseError> {
         "-h" | "--help" => return Err(ParseError::Help(help_request("service"))),
         other => {
             return Err(ParseError::Usage(format!(
-                "service: unknown subcommand {other:?}; run `herdr-fleet service --help`"
+                "service: unknown subcommand {other:?}; run `canter service --help`"
             )));
         }
     };
@@ -582,7 +582,7 @@ fn parse_service(args: &[&String]) -> Result<Invocation, ParseError> {
             "-h" | "--help" => return Err(ParseError::Help(help_request("service"))),
             flag => {
                 return Err(ParseError::Usage(format!(
-                    "service: unknown flag {flag:?}; run `herdr-fleet service --help`"
+                    "service: unknown flag {flag:?}; run `canter service --help`"
                 )));
             }
         }
@@ -636,7 +636,7 @@ fn parse_plan(args: &[&String]) -> Result<Invocation, ParseError> {
             "-h" | "--help" => return Err(ParseError::Help(help_request("plan"))),
             flag if flag.starts_with('-') => {
                 return Err(ParseError::Usage(format!(
-                    "plan: unknown flag {flag:?}; run `herdr-fleet plan --help`"
+                    "plan: unknown flag {flag:?}; run `canter plan --help`"
                 )));
             }
             positional => positionals.push(positional.to_string()),
@@ -686,7 +686,7 @@ fn required_config(config_path: &Option<PathBuf>) -> Result<Config, Box<CmdResul
             5,
             "config.not_found",
             format!(
-                "no config file found (looked for {}); run `herdr-fleet config init` and save the template there",
+                "no config file found (looked for {}); run `canter config init` and save the template there",
                 default_config_hint()
             ),
             false,
@@ -845,7 +845,7 @@ fn execute_doctor(invocation: &Invocation) -> CmdResult {
     let (herdr_status, herdr_detail) = match (herdr_present, herdr_version, herdr_compatible) {
         (false, _, _) => (
             "missing",
-            "herdr not found on PATH — herdr-fleet never installs or starts Herdr".to_string(),
+            "herdr not found on PATH — canter never installs or starts Herdr".to_string(),
         ),
         (true, Some(version), true) => (
             "ok",
@@ -919,7 +919,7 @@ fn execute_doctor(invocation: &Invocation) -> CmdResult {
     let checks: Vec<Val> = rows.iter().cloned().map(DoctorRow::into_val).collect();
 
     let mut human = String::new();
-    human.push_str("herdr-fleet doctor\n");
+    human.push_str("canter doctor\n");
     human.push_str(&format!(
         "{:<12}  {:<9}{}\n",
         "config", config_status, config_row
@@ -949,7 +949,7 @@ fn execute_doctor(invocation: &Invocation) -> CmdResult {
     let diagnostics = if degraded {
         let count = rows.iter().filter(|row| row.status != "ok").count();
         format!(
-            "doctor: {count} prerequisite check(s) not ok — herdr-fleet never installs, upgrades, starts, or stops Herdr or gh"
+            "doctor: {count} prerequisite check(s) not ok — canter never installs, upgrades, starts, or stops Herdr or gh"
         )
     } else {
         String::new()
@@ -1146,7 +1146,7 @@ fn execute_plan(plan: &PlanArgs, invocation: &Invocation) -> CmdResult {
             return error_result(
                 2,
                 "usage.error",
-                format!("plan: {message}; run `herdr-fleet plan --help`"),
+                format!("plan: {message}; run `canter plan --help`"),
                 false,
             );
         }
@@ -1238,7 +1238,7 @@ fn execute_capabilities(_invocation: &Invocation) -> CmdResult {
     let capability = object(vec![
         ("schema", string("hf-capability/v1")),
         ("axis", string("forge")),
-        ("actor", string("herdr-fleet")),
+        ("actor", string("canter")),
         (
             "capabilities",
             Val::Arr(vec![
@@ -1251,7 +1251,7 @@ fn execute_capabilities(_invocation: &Invocation) -> CmdResult {
     let data = object(vec![("capability", capability)]);
     ok_result(
         data,
-        "herdr-fleet forge capabilities: read_refs read_issues read_checks\n".to_string(),
+        "canter forge capabilities: read_refs read_issues read_checks\n".to_string(),
     )
 }
 
@@ -1277,7 +1277,7 @@ fn execute_config(action: ConfigAction, invocation: &Invocation) -> CmdResult {
                         5,
                         "config.not_found",
                         format!(
-                            "no config file found (looked for {}); run `herdr-fleet config init` and save the template there",
+                            "no config file found (looked for {}); run `canter config init` and save the template there",
                             default_config_hint()
                         ),
                         false,
@@ -1458,11 +1458,11 @@ fn execute_config(action: ConfigAction, invocation: &Invocation) -> CmdResult {
 // ---------------------------------------------------------------------------
 
 const DAEMON_USAGE: &str = "\
-herdr-fleet daemon <run|status> — run or probe the state daemon
+canter daemon <run|status> — run or probe the state daemon
 
 USAGE:
-    herdr-fleet daemon run [--socket PATH] [--config PATH]
-    herdr-fleet daemon status [--config PATH] [--json]
+    canter daemon run [--socket PATH] [--config PATH]
+    canter daemon status [--config PATH] [--json]
 
 run serves the single-writer daemon in the foreground: it acquires the
 per-user flock, opens/migrates the SQLite state, reconciles interrupted
@@ -1474,13 +1474,13 @@ the live state; when no daemon is running it exits 1 with code daemon.absent
 ";
 
 const SERVICE_USAGE: &str = "\
-herdr-fleet service <doctor|install-plan|status-plan|uninstall-plan>
+canter service <doctor|install-plan|status-plan|uninstall-plan>
 
 USAGE:
-    herdr-fleet service doctor [--config PATH] [--json]
-    herdr-fleet service install-plan [--config PATH] [--json]
-    herdr-fleet service status-plan [--config PATH] [--json]
-    herdr-fleet service uninstall-plan [--config PATH] [--json]
+    canter service doctor [--config PATH] [--json]
+    canter service install-plan [--config PATH] [--json]
+    canter service status-plan [--config PATH] [--json]
+    canter service uninstall-plan [--config PATH] [--json]
 
 doctor checks the daemon environment read-only (platform, config, socket
 state, per-user unit placement). The *-plan commands render the first-party
@@ -1768,7 +1768,7 @@ fn execute_service_plan(invocation: &Invocation, kind: &str) -> CmdResult {
     };
     let bin = std::env::current_exe()
         .ok()
-        .unwrap_or_else(|| std::path::PathBuf::from("herdr-fleet"));
+        .unwrap_or_else(|| std::path::PathBuf::from("canter"));
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let config_home = crate::dirs::config_home().ok();
 
@@ -1830,7 +1830,7 @@ fn execute_service_plan(invocation: &Invocation, kind: &str) -> CmdResult {
     ]);
     let mut human = String::new();
     human.push_str(&format!(
-        "herdr-fleet service {kind}-plan (platform {platform}) — nothing was installed or started\n\n"
+        "canter service {kind}-plan (platform {platform}) — nothing was installed or started\n\n"
     ));
     human.push_str(&format!("unit file: {}\n\n", target.display()));
     human.push_str(&unit);
@@ -1839,6 +1839,95 @@ fn execute_service_plan(invocation: &Invocation, kind: &str) -> CmdResult {
         human.push_str(&format!("  {}. {step}\n", index + 1));
     }
     ok_result(data, human)
+}
+
+/// Run the CLI from `std::env::args()` and return the process exit code.
+///
+/// Single shared entry point for the canonical `canter` binary and the
+/// pre-rename `herdr-fleet` compatibility alias (`src/bin/herdr-fleet.rs`):
+/// both must behave identically (docs/contracts/compatibility.md, "Product
+/// rename (issue #106)").
+pub fn cli_main() -> std::process::ExitCode {
+    use std::process::ExitCode;
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Top-level metadata flags (the only flag forms before a command).
+    if args.len() == 1 {
+        match args[0].as_str() {
+            "--help" | "-h" => {
+                print!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            "--version" | "-V" => {
+                println!("{} {}", crate::PACKAGE_NAME, crate::PACKAGE_VERSION);
+                println!("{}", crate::about());
+                print!("{}", crate::release_facts());
+                return ExitCode::SUCCESS;
+            }
+            _ => {}
+        }
+    }
+    if args.is_empty() {
+        eprintln!("{USAGE}");
+        eprintln!("error: no arguments given; try `canter --help`");
+        return ExitCode::from(2);
+    }
+    if args[0].starts_with('-') {
+        eprintln!("{USAGE}");
+        eprintln!("error: unknown argument `{}`", args[0]);
+        return ExitCode::from(2);
+    }
+
+    let invocation = match parse_invocation(&args) {
+        Ok(invocation) => invocation,
+        Err(ParseError::Help(text)) => {
+            println!("{text}");
+            return ExitCode::SUCCESS;
+        }
+        Err(ParseError::Usage(message)) => {
+            eprintln!("error: {message}");
+            eprintln!();
+            eprintln!("{}", per_command_usage(&args[0]));
+            return ExitCode::from(2);
+        }
+    };
+
+    let result = execute(&invocation);
+
+    if invocation.json {
+        let json = render_envelope(&invocation.command, &result);
+        print!("{json}");
+    } else if !result.human.is_empty() {
+        print!("{}", result.human);
+        if !result.human.ends_with('\n') {
+            println!();
+        }
+    }
+    if !result.diagnostics.is_empty() {
+        eprintln!("{}", result.diagnostics);
+    }
+    ExitCode::from(result.exit_code)
+}
+
+/// Usage hint line printed under a usage error for the offending command.
+fn per_command_usage(command: &str) -> &'static str {
+    match command {
+        "config" => "usage: canter config <init|validate|show> [--config PATH] [--json]",
+        "doctor" => "usage: canter doctor [--json]",
+        "status" => "usage: canter status [--config PATH] [--json]",
+        "plan" => {
+            "usage: canter plan <repository> <issue> [--revision HEX40] [--config PATH] [--json]"
+        }
+        "capabilities" => "usage: canter capabilities [--json]",
+        "daemon" => {
+            "usage: canter daemon run [--socket PATH] [--config PATH]\n       canter daemon status [--config PATH] [--json]"
+        }
+        "service" => {
+            "usage: canter service <doctor|install-plan|status-plan|uninstall-plan> [--config PATH] [--json]"
+        }
+        _ => "usage: canter [--help] [--version] | canter <command> [options]",
+    }
 }
 
 #[cfg(test)]
@@ -1930,7 +2019,7 @@ mod tests {
 
     #[test]
     fn missing_config_is_a_typed_config_error() {
-        // The unit test process has no herdr-fleet config (no XDG override in
+        // The unit test process has no canter config (no XDG override in
         // scope), so plan/status/config validate must refuse with exit 5.
         let result = execute(&invocation(&["plan", "widgets", "1"]));
         assert_eq!(result.exit_code, 5);

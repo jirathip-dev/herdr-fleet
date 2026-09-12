@@ -4,8 +4,8 @@
 //! Herdr session. Live 0.9.0 evidence is recorded separately by the lane; CI
 //! must never inspect or mutate a maintainer's workspaces.
 
-use herdr_fleet::observe::HERDR_MINIMUM;
-use herdr_fleet::value::Val;
+use canter::observe::HERDR_MINIMUM;
+use canter::value::Val;
 
 fn parse(text: &str) -> Val {
     Val::parse_json(text).unwrap_or_else(|error| panic!("fixture JSON: {error}"))

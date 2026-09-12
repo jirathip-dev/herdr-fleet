@@ -7,7 +7,7 @@
 //! lanes, the atomic record+brief commit across restarts, and byte-for-byte
 //! preservation of a dirty worktree.
 //!
-//! Every test spawns `herdr-fleet daemon run` as a child process with
+//! Every test spawns `canter daemon run` as a child process with
 //! isolated XDG state and an explicit socket under a per-test temp dir;
 //! nothing here touches the real host state, the service manager, or the
 //! network. All identities are synthetic.
@@ -16,11 +16,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use herdr_fleet::client::{Connection, RpcError};
-use herdr_fleet::value::{Val, bool_, integer, null, object, string};
+use canter::client::{Connection, RpcError};
+use canter::value::{Val, bool_, integer, null, object, string};
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_herdr-fleet")
+    env!("CARGO_BIN_EXE_canter")
 }
 
 struct Fixture {
@@ -50,13 +50,13 @@ impl Fixture {
     }
 
     /// The daemon-owned checkpoint brief directory (`XDG_STATE_HOME` /
-    /// `herdr-fleet` / `checkpoints`).
+    /// `canter` / `checkpoints`).
     fn checkpoints_dir(&self) -> PathBuf {
-        self.state_dir.join("herdr-fleet").join("checkpoints")
+        self.state_dir.join("canter").join("checkpoints")
     }
 
     fn daemon_log(&self) -> PathBuf {
-        self.state_dir.join("herdr-fleet").join("daemon.log")
+        self.state_dir.join("canter").join("daemon.log")
     }
 
     fn spawn(&self, crash_point: Option<&str>) -> Child {
@@ -75,7 +75,7 @@ impl Fixture {
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file));
         if let Some(point) = crash_point {
-            command.env("HERDR_FLEET_CRASH_POINT", point);
+            command.env("CANTER_CRASH_POINT", point);
         }
         if let PathMode::WithoutTools = path_mode {
             let empty = self.dir.join("empty-bin");
@@ -89,9 +89,7 @@ impl Fixture {
 fn wait_ready(fixture: &Fixture) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        if herdr_fleet::lock::socket_presence(&fixture.socket)
-            == herdr_fleet::lock::SocketPresence::Active
-        {
+        if canter::lock::socket_presence(&fixture.socket) == canter::lock::SocketPresence::Active {
             let ok = Connection::open(&fixture.socket)
                 .and_then(|mut connection| {
                     connection.send_request("aaaaaaaaaaaaaaaa", "status", None)?;
@@ -146,7 +144,7 @@ fn rpc_ok(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
         doc.get("ok").and_then(Val::as_bool),
         Some(true),
         "expected ok response for {method}: {}",
-        herdr_fleet::canonical::canonical_text(&doc)
+        canter::canonical::canonical_text(&doc)
     );
     doc.get("result").expect("result").clone()
 }
@@ -157,7 +155,7 @@ fn rpc_err(socket: &Path, id: &str, method: &str, params: Option<Val>) -> (Strin
         doc.get("ok").and_then(Val::as_bool),
         Some(false),
         "expected refused response for {method}: {}",
-        herdr_fleet::canonical::canonical_text(&doc)
+        canter::canonical::canonical_text(&doc)
     );
     let error = doc.get("error").expect("error doc");
     (
@@ -1049,7 +1047,7 @@ fn checkpoint_commit_is_atomic_across_restarts_and_preserves_dirty_bytes() {
                 format!(
                     "{}:{}",
                     entry.file_name().to_string_lossy(),
-                    herdr_fleet::canonical::sha256_hex(&bytes)
+                    canter::canonical::sha256_hex(&bytes)
                 )
             })
             .collect();
@@ -1184,7 +1182,7 @@ fn checkpoint_commit_is_atomic_across_restarts_and_preserves_dirty_bytes() {
     let brief_path = PathBuf::from(field_str(checkpoint, "brief_path"));
     let brief_bytes = std::fs::read(&brief_path).expect("regenerated brief artifact");
     assert_eq!(
-        herdr_fleet::canonical::sha256_hex(&brief_bytes),
+        canter::canonical::sha256_hex(&brief_bytes),
         field_str(checkpoint, "brief_digest"),
         "the regenerated brief verifies against the digest bound at commit time"
     );
@@ -1225,7 +1223,7 @@ fn checkpoint_commit_is_atomic_across_restarts_and_preserves_dirty_bytes() {
     // Plant an orphan artifact at the deterministic path before restart.
     let orphan = fixture.checkpoints_dir().join(format!(
         "{}.brief",
-        herdr_fleet::state::checkpoint_id_for(&third)
+        canter::state::checkpoint_id_for(&third)
     ));
     std::fs::write(&orphan, b"orphan artifact without a committed record\n").expect("plant orphan");
 

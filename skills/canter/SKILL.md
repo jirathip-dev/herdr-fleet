@@ -1,18 +1,18 @@
 ---
-name: herdr-fleet
-description: "Use when working with or on the herdr-fleet repository or CLI. Read-only CLI core (config/doctor/status/plan/capabilities), single-writer daemon (run/status), service unit plans, and grant-gated mutations via the daemon apply RPC; no live harness runs."
+name: canter
+description: "Use when working with or on the canter repository or CLI. Read-only CLI core (config/doctor/status/plan/capabilities), single-writer daemon (run/status), service unit plans, and grant-gated mutations via the daemon apply RPC; no live harness runs."
 version: 1.11.0
-author: herdr-fleet contributors
+author: canter contributors
 license: Apache-2.0 OR MIT
 platforms: [macos, linux]
 metadata:
   hermes:
-    tags: [herdr-fleet, cli, fleet, repository, read-only-core, operations]
+    tags: [canter, cli, fleet, repository, read-only-core, operations]
 ---
 
-# herdr-fleet
+# canter
 
-herdr-fleet is a public companion CLI for operating Herdr coding-agent
+canter is a public companion CLI for operating Herdr coding-agent
 fleets. Roadmap slices #3-#10 are merged on `staging` (PRs #13-#21): a
 read-only CLI core (#4), a daemon foundation with SQLite state and a local
 socket RPC (#5), the deterministic workflow engine with the bundled
@@ -41,10 +41,19 @@ therefore remains 0.8.2 and is not a mixed-server compatibility claim.
 
 ## When to use
 
-- You are contributing to the herdr-fleet repository (Rust, docs,
+- You are contributing to the canter repository (Rust, docs,
   contracts, CI).
 - You need to know what the CLI does today — or operate it read-only —
   without guessing.
+
+## Product name and pre-rename compatibility (issue #106)
+
+The product/repository is `canter` (renamed from `herdr-fleet`; old GitHub
+URLs redirect). The pre-rename binary name, state/runtime tree, config path,
+and debug crash-point env var keep working, and live Herdr integration ids
+keep their pre-rename spelling — the normative list is
+`docs/contracts/compatibility.md` ("Product rename (issue #106)"). Use
+`canter` in new work; do not rename live registry/session identity.
 
 ## Safe discovery (read-only, no side effects)
 
@@ -61,7 +70,7 @@ therefore remains 0.8.2 and is not a mixed-server compatibility claim.
 6. Repository contract for agents: `AGENTS.md` (public-data boundary,
    branch discipline, smallest-change rule).
 7. To inspect the compiled binary (after `cargo build --locked`):
-   `herdr-fleet --help`, then per command.
+   `canter --help`, then per command.
 
 ## Command surface (100% of `--help`; classification per command)
 
@@ -100,18 +109,18 @@ through a workaround.
 ## Observe → plan (read-only) flow — do this unaided first
 
 1. Build: `cargo build --locked` (release: add `--release`).
-2. `herdr-fleet config init > ~/.config/herdr-fleet/config.toml`, edit it
+2. `canter config init > ~/.config/canter/config.toml`, edit it
    to the repository you operate, then
-   `herdr-fleet config validate --json` → expect `kind:"ok"`, exit 0
+   `canter config validate --json` → expect `kind:"ok"`, exit 0
    (`config.invalid` exit 5 = fix the document).
-3. `herdr-fleet doctor --json` → expect all checks `status:"ok"`, exit 0
+3. `canter doctor --json` → expect all checks `status:"ok"`, exit 0
    (exit 3 = a prerequisite is missing/degraded — install/auth the named
    tool, never have the CLI do it).
 4. From inside the repository's local checkout:
-   `herdr-fleet status --json` → expect `freshness:"fresh"` and
+   `canter status --json` → expect `freshness:"fresh"` and
    `observed_repositories >= 1`, exit 0; `git.available:false` /
    `github.available:false` are explicit degradations, not errors.
-5. `herdr-fleet plan <owner/name> <issue> --revision <40-hex> --json` →
+5. `canter plan <owner/name> <issue> --revision <40-hex> --json` →
    expect `kind:"ok"`, exit 0, with a `hf-plan/v1` document, `plan_id`,
    `digest` (sha256 over canonical bytes), and `state_epoch`. Without
    `--revision`, authenticated `gh` is required (else exit 1
@@ -177,7 +186,7 @@ renderings until an authorized grant + daemon `apply` executes them.
   against the SHA-verified linux-x64 prebuilt; darwin prebuilts available
   at that version, parity human-gated; issue #37 darwin canary peak RSS
   ~19.9 MB).
-- Rust implementation: `src/adapters.rs` (`herdr_fleet::adapters`);
+- Rust implementation: `src/adapters.rs` (`canter::adapters`);
   contract tests with fake executables: `tests/harness_adapters.rs` — the
   shared fixture loop drives every official adapter (hermes, claude-code,
   codex, pi, jcode) plus the argv fake; public CI and fork PRs need no
@@ -191,7 +200,7 @@ renderings until an authorized grant + daemon `apply` executes them.
 
 - Normative contract: `docs/contracts/spec-plans.md` ("Apply semantics")
   and `docs/contracts/spec-review-evidence.md` (durable evidence rows).
-- Rust implementation: `src/mutation.rs` (`herdr_fleet::mutation` engine +
+- Rust implementation: `src/mutation.rs` (`canter::mutation` engine +
   effect registry), `src/daemon.rs` (`plan`/`apply` RPC handlers), durable
   rows + invalidation semantics in `src/state.rs`.
 - Acceptance tests: `tests/mutation_engine.rs` (socket-level flows over
@@ -244,7 +253,7 @@ renderings until an authorized grant + daemon `apply` executes them.
 - `HERDR_MINIMUM` remains 0.8.2 because the mixed matrix is red. Treat it as
   the supported CLI floor, never as permission to operate mismatched
   protocol-20/protocol-22 endpoints; update Herdr endpoints together through
-  Herdr's own workflow, never from herdr-fleet.
+  Herdr's own workflow, never from canter.
 
 ## Safety direction (plan/apply gates)
 
@@ -270,14 +279,14 @@ through pi's native skills discovery (pi `docs/skills.md`; this directory
 is a standard skill: `SKILL.md` + freeform files):
 
 - Global: symlink (keeps the relative `docs/...` links working) or copy
-  this directory to `~/.pi/agent/skills/herdr-fleet/`.
-- Project: `cp -r skills/herdr-fleet <worktree>/.pi/skills/` (project
+  this directory to `~/.pi/agent/skills/canter/`.
+- Project: `cp -r skills/canter <worktree>/.pi/skills/` (project
   skills load once the project is trusted).
-- One-shot/CLI: `pi --skill <repo>/skills/herdr-fleet ...` (repeatable,
+- One-shot/CLI: `pi --skill <repo>/skills/canter ...` (repeatable,
   additive even with `--no-skills`).
 
 Verified 2026-09-08 (issue #33 A1): a real pi session loaded this skill
-and answered a herdr-fleet usage question from the skill content alone —
+and answered a canter usage question from the skill content alone —
 redacted Q/A evidence in `.report-33.md`.
 
 Jcode lanes (the jcode harness adapter, issue #37) have no skill

@@ -1,6 +1,6 @@
 # AGENTS.md — repository contract for coding agents
 
-herdr-fleet is a **public** repository in **bootstrap**: repository
+canter is a **public** repository in **bootstrap**: repository
 foundation, CI/security gates, docs, and contributor tooling only. No
 daemon, workflow engine, adapter, mutation, migration, or release behavior
 exists or may be added here until its roadmap slice is routed (umbrella
@@ -18,7 +18,7 @@ issue #1; children #3–#10 are unrouted).
 | CI + security workflows | `.github/workflows/ci.yml`, `.github/workflows/security.yml` |
 | Architecture docs + ADRs | `docs/ARCHITECTURE.md`, `docs/decisions/`, `docs/architecture/` |
 | Process docs | `docs/WORKFLOW.md`, `docs/RELEASING.md` |
-| Public skill | `skills/herdr-fleet/SKILL.md` |
+| Public skill | `skills/canter/SKILL.md` |
 
 ## Mandatory gates
 

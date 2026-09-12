@@ -249,7 +249,7 @@ impl HarnessKind {
 pub type Semver = (u64, u64, u64);
 
 /// Declared support range for an official adapter: the minimum version
-/// below which herdr-fleet refuses to operate, and the current version the
+/// below which canter refuses to operate, and the current version the
 /// slice documents as the tested ceiling (compatibility.md policy shape).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VersionRange {
@@ -1127,11 +1127,17 @@ fn workspace_args(op: Op, session_id: &str) -> Vec<String> {
 
 /// Stable, unique lifecycle source id the pi adapter reports under (herdr
 /// custom-integration contract). Never reported outside a Herdr pane.
+///
+/// Pre-rename identifier, retained deliberately: this is a live
+/// custom-integration source name registered in operators' Herdr setups,
+/// and renaming live registry identity is out of scope for the product
+/// rename (docs/contracts/compatibility.md, "Product rename (issue #106)").
 pub const HERDR_LIFECYCLE_SOURCE_PI: &str = "custom:herdr-fleet-pi";
 
 /// Stable, unique lifecycle source id the jcode adapter reports under
 /// (herdr custom-integration contract). Never reported outside a Herdr
-/// pane.
+/// pane. Pre-rename identifier, retained for the same reason as
+/// [`HERDR_LIFECYCLE_SOURCE_PI`].
 pub const HERDR_LIFECYCLE_SOURCE_JCODE: &str = "custom:herdr-fleet-jcode";
 
 /// The agent label reported for pi lanes (herdr `agent list` shows the
