@@ -21,10 +21,11 @@
 
 use crate::canonical::canonical_bytes;
 use crate::formats::{
-    is_action_code, is_actor, is_error_code, is_grant_id, is_hex40, is_hex64, is_idempotency_key,
-    is_migration_id, is_plan_id, is_repository_identity, is_request_id, is_rfc3339_seconds_z,
-    is_schedule_id, is_slug,
+    is_action_code, is_actor, is_error_code, is_evidence_id, is_grant_id, is_hex40, is_hex64,
+    is_idempotency_key, is_migration_id, is_plan_id, is_repository_identity, is_request_id,
+    is_rfc3339_seconds_z, is_schedule_id, is_slug, is_work_item_id,
 };
+use crate::redact::redact;
 use crate::value::Val;
 
 /// A contract family handled by this slice.
@@ -65,6 +66,9 @@ pub enum Family {
     /// `hf-schedule/v1` — recurring non-destructive schedule document
     /// (lifecycle slice #9; bounded read-only cadence + exact bindings).
     Schedule,
+    /// `hf-board/v1` — bounded paginated board read page (read-model slice
+    /// #83: work-item identity, run state, verification, evidence refs).
+    Board,
 }
 
 impl Family {
@@ -88,6 +92,7 @@ impl Family {
             Family::Outcome => "hf-outcome",
             Family::Workflow => "hf-workflow",
             Family::Schedule => "hf-schedule",
+            Family::Board => "hf-board",
         }
     }
 
@@ -111,6 +116,7 @@ impl Family {
             Family::Outcome => "hf-outcome/v1",
             Family::Workflow => "hf-workflow/v1",
             Family::Schedule => "hf-schedule/v1",
+            Family::Board => "hf-board/v1",
         }
     }
 
@@ -286,6 +292,7 @@ pub fn validate_doc(family: Family, doc: &Val) -> Verdict {
         Family::Outcome => validate_outcome(doc),
         Family::Workflow => validate_workflow(doc),
         Family::Schedule => validate_schedule(doc),
+        Family::Board => validate_board(doc),
     }
 }
 
@@ -1141,7 +1148,7 @@ fn validate_capability(obj: &Val) -> Verdict {
 }
 
 /// Registry of the families this module validates (used by drift tests).
-pub const SUPPORTED_FAMILIES: [Family; 17] = [
+pub const SUPPORTED_FAMILIES: [Family; 18] = [
     Family::Config,
     Family::Policy,
     Family::Output,
@@ -1159,6 +1166,7 @@ pub const SUPPORTED_FAMILIES: [Family; 17] = [
     Family::Outcome,
     Family::Workflow,
     Family::Schedule,
+    Family::Board,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1999,6 +2007,473 @@ fn validate_workflow(obj: &Val) -> Verdict {
         _ => return Verdict::refuse(Refusal::Malformed, "workflow.edges must be a list"),
     }
     Verdict::accept()
+}
+
+// ---------------------------------------------------------------------------
+// hf-board/v1 (issue #83 read model): closed sets + page validator
+// ---------------------------------------------------------------------------
+
+/// Closed `hf-board/v1` stage set (issue #83; approved #109 operator stages).
+pub const BOARD_STAGES: [&str; 4] = ["planned", "in_progress", "needs_attention", "verified"];
+/// Closed `hf-board/v1` verification set: `passed` exists only with recorded
+/// review evidence; `none`/`failed` never present a run as verified.
+pub const BOARD_VERIFICATIONS: [&str; 3] = ["none", "failed", "passed"];
+/// Closed durable run-state set (`instances.status`).
+pub const BOARD_RUN_STATES: [&str; 7] = [
+    "new",
+    "running",
+    "paused",
+    "human_queue",
+    "blocked",
+    "done",
+    "invalidated",
+];
+/// Closed `next_action` set (null = not recorded is always allowed).
+pub const BOARD_NEXT_ACTIONS: [&str; 2] = ["resume", "human_decision"];
+/// Closed source-kind set for the intent side of a work item.
+pub const BOARD_SOURCE_KINDS: [&str; 1] = ["github"];
+/// Per-row cap on evidence references (overflow is explicit via
+/// `evidence_total`).
+pub const BOARD_EVIDENCE_REF_MAX: usize = 4;
+
+/// One recorded-text board field: null, or redaction-stable text (the
+/// secret-shaped boundary: recorded text may only enter a rendered page
+/// after the conservative redaction pass, so a page carrying an unredacted
+/// secret-shaped run is refused).
+fn board_recorded_text(obj: &Val, key: &str, where_: &str) -> Rule {
+    match obj.get(key) {
+        Some(Val::Null) => Ok(()),
+        Some(Val::Str(text)) => {
+            if text.chars().count() > 128 || text.chars().any(char::is_control) {
+                return Err(Verdict::refuse(
+                    Refusal::Malformed,
+                    format!("{where_}: {key:?} must be <= 128 characters without controls"),
+                ));
+            }
+            if redact(text) != *text {
+                return Err(Verdict::refuse(
+                    Refusal::Malformed,
+                    format!("{where_}: {key:?} carries an unredacted secret-shaped run"),
+                ));
+            }
+            Ok(())
+        }
+        Some(other) => Err(Verdict::refuse(
+            Refusal::Malformed,
+            format!(
+                "{where_}: {key:?} must be null or a string, got {}",
+                other.type_name()
+            ),
+        )),
+        None => Err(Verdict::refuse(
+            Refusal::Malformed,
+            format!("{where_}: missing required key {key:?}"),
+        )),
+    }
+}
+
+/// Optional timestamp field: null or RFC3339 UTC seconds-`Z`.
+fn board_optional_timestamp(obj: &Val, key: &str, where_: &str) -> Rule {
+    match obj.get(key) {
+        Some(Val::Null) => Ok(()),
+        Some(Val::Str(text)) if is_rfc3339_seconds_z(text) => Ok(()),
+        Some(other) => Err(Verdict::refuse(
+            Refusal::Malformed,
+            format!(
+                "{where_}: {key:?} must be null or RFC3339 UTC (seconds, Z), got {}",
+                other.type_name()
+            ),
+        )),
+        None => Err(Verdict::refuse(
+            Refusal::Malformed,
+            format!("{where_}: missing required key {key:?}"),
+        )),
+    }
+}
+
+/// Cursor shape: `repository|issue|run` where the repository part is empty
+/// or `owner/name`, the issue part is a non-negative integer, and the run
+/// part is a non-empty identifier.
+fn board_cursor_shaped(text: &str) -> bool {
+    let parts: Vec<&str> = text.split('|').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    let (repository, issue, run) = (parts[0], parts[1], parts[2]);
+    if !repository.is_empty() && !is_repository_identity(repository) {
+        return false;
+    }
+    if issue.is_empty() || !issue.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    !run.is_empty() && run.len() <= 64 && run.chars().all(crate::board::is_run_char)
+}
+
+/// `hf-board/v1` (issue #83): one bounded page of the authoritative board
+/// read model. The closed consistency rules are the machine-checked half of
+/// the coverage contract — a page either satisfies every rule or it is
+/// refused, so a surface can never present an idle/working run as verified,
+/// never join two runs of one work item into a row, never reorder a page,
+/// never fabricate evidence, and never carry secret-shaped recorded text.
+fn validate_board(obj: &Val) -> Verdict {
+    if let Err(verdict) = check_schema(obj, Family::Board) {
+        return verdict;
+    }
+    const KEYS: [&str; 6] = [
+        "schema",
+        "observed_at",
+        "state",
+        "rows",
+        "next_cursor",
+        "truncated",
+    ];
+    if let Err(verdict) = require_keys(obj, &KEYS, &KEYS, "board") {
+        return verdict;
+    }
+    if let Err(verdict) = expect_timestamp(obj, "observed_at", "board") {
+        return verdict;
+    }
+    let Some(state) = obj.get("state") else {
+        return Verdict::refuse(Refusal::Malformed, "board.state: missing (required)");
+    };
+    const STATE_KEYS: [&str; 2] = ["epoch", "journal_seq"];
+    if let Err(verdict) = require_keys(state, &STATE_KEYS, &STATE_KEYS, "board.state") {
+        return verdict;
+    }
+    if let Err(verdict) = expect_int(state, "epoch", "board.state", 0) {
+        return verdict;
+    }
+    if let Err(verdict) = expect_int(state, "journal_seq", "board.state", 0) {
+        return verdict;
+    }
+    let truncated = match obj.get("truncated") {
+        Some(Val::Bool(value)) => *value,
+        _ => {
+            return Verdict::refuse(Refusal::Malformed, "board.truncated must be a boolean");
+        }
+    };
+    let has_cursor = match obj.get("next_cursor") {
+        Some(Val::Null) => false,
+        Some(Val::Str(text)) => {
+            if !board_cursor_shaped(text) {
+                return Verdict::refuse(
+                    Refusal::Malformed,
+                    "board.next_cursor must be a repository|issue|run ordering key",
+                );
+            }
+            true
+        }
+        _ => {
+            return Verdict::refuse(
+                Refusal::Malformed,
+                "board.next_cursor must be null or a string",
+            );
+        }
+    };
+    // The cursor exists exactly while more rows exist: a page either offers
+    // a continuation or states that it is the last one.
+    if has_cursor != truncated {
+        return Verdict::refuse(
+            Refusal::Malformed,
+            "board.next_cursor and board.truncated must agree (cursor iff more rows)",
+        );
+    }
+    let Some(Val::Arr(rows)) = obj.get("rows") else {
+        return Verdict::refuse(Refusal::Malformed, "board.rows must be a list");
+    };
+    if rows.is_empty() && truncated {
+        return Verdict::refuse(
+            Refusal::Malformed,
+            "board.truncated cannot be true for an empty page",
+        );
+    }
+    let mut previous: Option<(String, i64, String)> = None;
+    for row in rows {
+        let key = match validate_board_row(row, previous.as_ref()) {
+            Ok(key) => key,
+            Err(verdict) => return verdict,
+        };
+        previous = Some(key);
+    }
+    Verdict::accept()
+}
+
+/// Validate one board row against the closed rules; returns its
+/// `(repository, issue, run)` ordering key so the page loop can enforce
+/// strictly increasing order.
+fn validate_board_row(
+    row: &Val,
+    previous: Option<&(String, i64, String)>,
+) -> Result<(String, i64, String), Verdict> {
+    table(row, "board row")?;
+    const KEYS: [&str; 17] = [
+        "work_item",
+        "source",
+        "run",
+        "run_state",
+        "stage",
+        "verification",
+        "owner",
+        "reason",
+        "next_action",
+        "human_gate",
+        "milestone",
+        "evidence",
+        "evidence_total",
+        "evidence_at",
+        "reviewer",
+        "progress_at",
+        "observed_at",
+    ];
+    require_keys(row, &KEYS, &KEYS, "board row")?;
+    let Some(source) = row.get("source") else {
+        return Err(Verdict::refuse(
+            Refusal::Malformed,
+            "board row.source: missing (required)",
+        ));
+    };
+    const SOURCE_KEYS: [&str; 7] = [
+        "kind",
+        "repository",
+        "issue",
+        "revision",
+        "freshness",
+        "completeness",
+        "observed_at",
+    ];
+    require_keys(source, &SOURCE_KEYS, &SOURCE_KEYS, "board row.source")?;
+    expect_in(source, "kind", "board row.source", &BOARD_SOURCE_KINDS)?;
+    let repository = match source.get("repository") {
+        Some(Val::Str(text)) => text.clone(),
+        _ => {
+            return Err(Verdict::refuse(
+                Refusal::Malformed,
+                "board row.source.repository must be a string",
+            ));
+        }
+    };
+    let issue = match source.get("issue") {
+        Some(Val::Int(number)) if *number >= 0 => *number,
+        _ => {
+            return Err(Verdict::refuse(
+                Refusal::Malformed,
+                "board row.source.issue must be a non-negative integer",
+            ));
+        }
+    };
+    let revision = match source.get("revision") {
+        Some(Val::Str(text)) => text.clone(),
+        _ => {
+            return Err(Verdict::refuse(
+                Refusal::Malformed,
+                "board row.source.revision must be a string",
+            ));
+        }
+    };
+    expect_in(source, "freshness", "board row.source", &["fresh", "stale"])?;
+    let completeness = match source.get("completeness") {
+        Some(Val::Str(text)) if matches!(text.as_str(), "complete" | "partial") => text.clone(),
+        _ => {
+            return Err(Verdict::refuse(
+                Refusal::Malformed,
+                "board row.source.completeness must be complete|partial",
+            ));
+        }
+    };
+    board_optional_timestamp(source, "observed_at", "board row.source")?;
+    // A complete source row carries every binding; a partial row is a
+    // legacy run whose bindings predate m0002 and is reported, never fixed.
+    match (row.get("work_item"), completeness.as_str()) {
+        (Some(Val::Null), "partial") => {}
+        (Some(Val::Str(text)), "complete") if is_work_item_id(text) => {}
+        _ => {
+            return Err(Verdict::refuse(
+                Refusal::Malformed,
+                "board row.work_item must be a wi_ id for a complete source and null for a partial one",
+            ));
+        }
+    }
+    if completeness == "complete"
+        && (!is_repository_identity(&repository) || issue < 1 || !is_hex40(&revision))
+    {
+        return Err(Verdict::refuse(
+            Refusal::Malformed,
+            "board row.source: a complete row requires owner/name, a positive issue, and a 40-hex revision",
+        ));
+    }
+    let run = match row.get("run") {
+        Some(Val::Str(text))
+            if !text.is_empty()
+                && text.len() <= 64
+                && text.chars().all(crate::board::is_run_char) =>
+        {
+            text.clone()
+        }
+        _ => {
+            return Err(Verdict::refuse(
+                Refusal::Malformed,
+                "board row.run must be a 1..=64 character identifier",
+            ));
+        }
+    };
+    let run_state = match row.get("run_state") {
+        Some(Val::Str(text)) if BOARD_RUN_STATES.contains(&text.as_str()) => text.clone(),
+        _ => {
+            return Err(Verdict::refuse(
+                Refusal::Malformed,
+                "board row.run_state outside the closed set",
+            ));
+        }
+    };
+    expect_in(row, "stage", "board row", &BOARD_STAGES)?;
+    let stage = row
+        .get("stage")
+        .and_then(Val::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let freshness = source
+        .get("freshness")
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    let verification = match row.get("verification") {
+        Some(Val::Str(text)) if BOARD_VERIFICATIONS.contains(&text.as_str()) => text.clone(),
+        _ => {
+            return Err(Verdict::refuse(
+                Refusal::Malformed,
+                "board row.verification outside the closed set",
+            ));
+        }
+    };
+    // The delivery separation rule, enforced in both directions: a run is
+    // `verified` exactly while recorded review evidence is passed and the
+    // run's facts are current; `done`, busy, idle, paused, stale, or
+    // invalidated runs can never be presented as verified without it.
+    let verified = verification == "passed" && freshness == "fresh" && run_state != "invalidated";
+    if (stage == "verified") != verified {
+        return Err(Verdict::refuse(
+            Refusal::Malformed,
+            "board row.stage must be verified iff verification is passed, fresh, and not invalidated",
+        ));
+    }
+    for key in ["owner", "reason", "reviewer"] {
+        board_recorded_text(row, key, "board row")?;
+    }
+    let next_action = match row.get("next_action") {
+        Some(Val::Null) => None,
+        Some(Val::Str(text)) if BOARD_NEXT_ACTIONS.contains(&text.as_str()) => Some(text.clone()),
+        _ => {
+            return Err(Verdict::refuse(
+                Refusal::Malformed,
+                "board row.next_action outside the closed set (null when not recorded)",
+            ));
+        }
+    };
+    match next_action.as_deref() {
+        None => {}
+        Some("resume") if run_state == "paused" => {}
+        Some("human_decision") if run_state == "human_queue" => {}
+        Some(_) => {
+            return Err(Verdict::refuse(
+                Refusal::Malformed,
+                "board row.next_action must match the recorded run state (resume -> paused, human_decision -> human_queue)",
+            ));
+        }
+    }
+    let human_gate = matches!(row.get("human_gate"), Some(Val::Bool(true)));
+    if !matches!(row.get("human_gate"), Some(Val::Bool(_)))
+        || human_gate != matches!(run_state.as_str(), "paused" | "human_queue")
+    {
+        return Err(Verdict::refuse(
+            Refusal::Malformed,
+            "board row.human_gate must be a boolean equal to (run_state is paused or human_queue)",
+        ));
+    }
+    match row.get("milestone") {
+        Some(Val::Null) => {}
+        Some(Val::Str(text)) if is_slug(text) => {}
+        _ => {
+            return Err(Verdict::refuse(
+                Refusal::Malformed,
+                "board row.milestone must be null or an achieved node slug",
+            ));
+        }
+    }
+    let Some(Val::Arr(evidence)) = row.get("evidence") else {
+        return Err(Verdict::refuse(
+            Refusal::Malformed,
+            "board row.evidence must be a list",
+        ));
+    };
+    if evidence.len() > BOARD_EVIDENCE_REF_MAX {
+        return Err(Verdict::refuse(
+            Refusal::Malformed,
+            "board row.evidence exceeds the bounded evidence-reference cap",
+        ));
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(evidence.len());
+    for item in evidence {
+        match item {
+            Val::Str(text) if is_evidence_id(text) => {
+                if seen.contains(&text.as_str()) {
+                    return Err(Verdict::refuse(
+                        Refusal::Malformed,
+                        "board row.evidence repeats an evidence reference",
+                    ));
+                }
+                seen.push(text);
+            }
+            _ => {
+                return Err(Verdict::refuse(
+                    Refusal::Malformed,
+                    "board row.evidence entries must be ev_ ids",
+                ));
+            }
+        }
+    }
+    let evidence_total = match row.get("evidence_total") {
+        Some(Val::Int(total)) if *total >= evidence.len() as i64 => *total,
+        _ => {
+            return Err(Verdict::refuse(
+                Refusal::Malformed,
+                "board row.evidence_total must be an integer >= the exposed evidence count",
+            ));
+        }
+    };
+    board_optional_timestamp(row, "evidence_at", "board row")?;
+    board_optional_timestamp(row, "progress_at", "board row")?;
+    expect_timestamp(row, "observed_at", "board row")?;
+    // Evidence presence is an exact function of verification: no evidence
+    // means `none` (and no timestamps/reviewer); any evidence means a
+    // recorded verdict with its timestamp.
+    let has_evidence_at = matches!(row.get("evidence_at"), Some(Val::Str(_)));
+    match verification.as_str() {
+        "none" => {
+            if !evidence.is_empty() || evidence_total != 0 || has_evidence_at {
+                return Err(Verdict::refuse(
+                    Refusal::Malformed,
+                    "board row.verification none requires no evidence references and no evidence_at",
+                ));
+            }
+        }
+        _ => {
+            if evidence.is_empty() || evidence_total < 1 || !has_evidence_at {
+                return Err(Verdict::refuse(
+                    Refusal::Malformed,
+                    "board row.verification failed|passed requires recorded evidence and its timestamp",
+                ));
+            }
+        }
+    }
+    let key = (repository, issue, run);
+    if let Some(previous) = previous
+        && &key <= previous
+    {
+        return Err(Verdict::refuse(
+            Refusal::Malformed,
+            "board rows must be in strictly increasing (repository, issue, run) order",
+        ));
+    }
+    Ok(key)
 }
 
 // ---------------------------------------------------------------------------

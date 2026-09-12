@@ -167,6 +167,25 @@ pub fn is_successor_id(text: &str) -> bool {
         && is_lower_hex(&text[PREFIX.len()..], 16)
 }
 
+/// Evidence id: `ev_` + 16 lowercase hex (control-plane evidence rows;
+/// issue #8 / #83 board evidence references).
+pub fn is_evidence_id(text: &str) -> bool {
+    const PREFIX: &str = "ev_";
+    text.len() == PREFIX.len() + 16
+        && text.starts_with(PREFIX)
+        && is_lower_hex(&text[PREFIX.len()..], 16)
+}
+
+/// Work-item id: `wi_` + 16 lowercase hex (issue #83 read model). A stable
+/// local identity for one source work item (repository identity + external
+/// issue number), deterministic so repeated reads and restarts agree.
+pub fn is_work_item_id(text: &str) -> bool {
+    const PREFIX: &str = "wi_";
+    text.len() == PREFIX.len() + 16
+        && text.starts_with(PREFIX)
+        && is_lower_hex(&text[PREFIX.len()..], 16)
+}
+
 /// Repository-relative worktree reference (issue #73 AC2):
 /// `[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*` with no `.`/`..` components and
 /// no leading slash — host-absolute paths and traversal never validate, so
@@ -344,6 +363,18 @@ mod tests {
         assert!(
             !is_worktree_ref(&"a".repeat(201)),
             "over-long worktree refused"
+        );
+
+        // Issue #83: board identity ids share the 16-hex shape.
+        assert!(is_evidence_id("ev_0123456789abcdef"));
+        assert!(!is_evidence_id("ev_0123456789abcde"), "15 hex");
+        assert!(!is_evidence_id("ev_0123456789ABCDEF"), "lowercase only");
+        assert!(!is_evidence_id("0123456789abcdef"));
+        assert!(is_work_item_id("wi_0123456789abcdef"));
+        assert!(!is_work_item_id("wi_0123456789abcde"), "15 hex");
+        assert!(
+            !is_work_item_id("ev_0123456789abcdef"),
+            "wi_ prefix required"
         );
     }
 

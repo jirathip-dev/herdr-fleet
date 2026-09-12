@@ -320,6 +320,42 @@ release process activates (docs/RELEASING.md), then semver applies.
   until normal quiescence/retirement; no new store, scheduler or automatic
   rotation trigger exists.
 
+### Added (issue #83 — Minimal authoritative board read model)
+
+- One bounded, deterministic, paginated read for a board
+  (`src/board.rs` + `State::board_page_rows`): the recorded source
+  identity of a work item (repository identity, external issue number,
+  and the acceptance revision bound when the run started) joined to the
+  daemon-owned workflow runs and their durable review evidence. Read-only
+  and state-store-only: no second database, no remote request per row, no
+  terminal-text status inference, and no write path.
+- Identity: a stable local work-item id (`wi_` + 16 hex of sha256 over
+  `hf-work-item/v1|<repository>|<issue>`) cannot collide across
+  repositories or issue numbers, and every run is its own row — multiple
+  attempts under one issue stay separate. Legacy runs whose bindings
+  predate m0002 are reported `partial` (null work item) instead of being
+  dropped or fabricated.
+- Delivery separation: `stage` (`planned`/`in_progress`/`needs_attention`/
+  `verified`) and `verification` (`none`/`failed`/`passed`) are separate
+  axes. Only recorded review evidence can raise verification to `passed`,
+  and a run is `verified` only while that evidence is current (live epoch,
+  run not invalidated): an idle, working, paused, blocked, stale or merely
+  reported-`done` run is never presented as verified delivery. Recorded
+  text is redacted at the read boundary, and not-recorded facts stay
+  `null`.
+- Pagination: ordering is the `(repository, issue, run)` key (stable
+  across restarts, inserts and out-of-order attempts), the hard page cap
+  is refused rather than clamped, the cursor is an ordering key (not a
+  pointer), and evidence references are bounded with explicit overflow
+  (`evidence_total`).
+- Contract: new closed `hf-board/v1` family (validator in `src/schema.rs`
+  mirroring the fixture probe), fixtures under `schemas/fixtures/board/`
+  with manifest expectations, and a registry/spec entry
+  (`docs/contracts/spec-board.md`). Focused acceptance tests
+  (`tests/board_read_model.rs`) pin identity, the delivery separation, the
+  pagination/restart behavior, the empty/stale/missing-source cases, the
+  redaction boundary, read-only behavior, and the absence of any
+  process/remote surface per rendered row.
 ### Added (issue #78 — CLI preview / request / inspect for one explicit lane handoff)
 
 - The thin CLI lane surface over the completed daemon handoff path

@@ -177,6 +177,42 @@ def run_discrimination(probe) -> None:
     _check(code == probe.REFUSE_MALFORMED,
            "evidence running status must refuse-malformed, got " + code)
 
+    # 10b. Board (issue #83): a reported-done run relabelled as verified
+    #      without recorded evidence must refuse — verified delivery and
+    #      reported status are separate axes.
+    raw = (FIXTURES / "board/board.valid.json").read_bytes()
+    obj = json.loads(raw.decode("utf-8"))
+    obj["rows"].reverse()
+    p = _tamper_copy("board/board.valid.json",
+                     lambda _b: (json.dumps(obj, sort_keys=True,
+                                            separators=(",", ":")).encode() + b"\n"))
+    code, _msg = probe.validate_file(p, "hf-board")
+    _check(code == probe.REFUSE_MALFORMED,
+           "board rows out of order must refuse-malformed, got " + code)
+
+    obj = json.loads(raw.decode("utf-8"))
+    for row in obj["rows"]:
+        if row["run"] == "run-widgets-0003":
+            row["stage"] = "verified"
+    p = _tamper_copy("board/board.valid.json",
+                     lambda _b: (json.dumps(obj, sort_keys=True,
+                                            separators=(",", ":")).encode() + b"\n"))
+    code, _msg = probe.validate_file(p, "hf-board")
+    _check(code == probe.REFUSE_MALFORMED,
+           "reported-done relabelled verified must refuse-malformed, got " + code)
+
+    # An unredacted secret-shaped recorded-text field must refuse.
+    obj = json.loads(raw.decode("utf-8"))
+    for row in obj["rows"]:
+        if row["run"] == "run-widgets-0003":
+            row["reason"] = "handoff ghp_" + "0123456789abcdef0123456789abcdef012345"
+    p = _tamper_copy("board/board.valid.json",
+                     lambda _b: (json.dumps(obj, sort_keys=True,
+                                            separators=(",", ":")).encode() + b"\n"))
+    code, _msg = probe.validate_file(p, "hf-board")
+    _check(code == probe.REFUSE_MALFORMED,
+           "board unredacted recorded text must refuse-malformed, got " + code)
+
     # 11. JSONL event stream: a bad line must refuse-parse.
     p = _tamper_copy("event/events.valid.jsonl",
                      lambda b: b + b'{"schema": "hf-event/v1", broken\n')

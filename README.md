@@ -366,7 +366,7 @@ prints and the daemon speaks conforms to the versioned corpus in
 spec-cli/config/plans/capabilities, spec-daemon/state/workflow, capability-map,
 compatibility, and benchmarks. `canter --version` prints the exact schema
 facts a build binds (`state schema version: 8`; migration chain m0001–m0008;
-17 document schema families from `hf-config/v1` to `hf-schedule/v1`).
+18 document schema families from `hf-config/v1` to `hf-board/v1`).
 
 **Command surface** — mirrors `canter --help` on the release binary
 exactly (one line per shipped command; 13 subcommands):

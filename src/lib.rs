@@ -9,6 +9,7 @@
 
 pub mod adapters;
 pub mod backup;
+pub mod board;
 pub mod canonical;
 pub mod client;
 pub mod commands;
