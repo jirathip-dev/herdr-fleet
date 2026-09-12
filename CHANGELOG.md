@@ -436,6 +436,73 @@ release process activates (docs/RELEASING.md), then semver applies.
 - CLI parity: `canter run pause|resume|retry|status` (`tests/run_control.rs`,
   `tests/run_control_cli.rs`), `run.status` on the read-only allowlist.
 
+### Added (issue #95 — Supervised reconciliation driver with a bounded timer fallback)
+
+- `supervision.status` extends the closed RPC set (35 -> 36) with the
+  versioned `hf-supervision/v1` status of exactly ONE authorized run: the
+  recorded authorization and policy, the closed classification with its
+  stable reason and eligibility, the freshness of the last check, the last
+  check, the NEXT ELIGIBLE CHECK with its reason, the observed
+  meaningful-progress marker and the folded pending wake. Read-only: a read
+  never moves the marker. Arming is NOT a method — it is an explicit
+  `hf-supervision-authorization/v1` block presented as an optional
+  `params.supervision` of `queue.submit` (disabled by default) and
+  committed in the same transaction as the runs it names, bound to the
+  approved preview digest.
+- The daemon-owned driver evaluates each armed run from RECORDED evidence
+  (run row, ownership, committed submission and bound spine, recorded step
+  attempts with their typed outcome codes, review evidence, bounded
+  retries, in-flight claims) into `healthy` / `waiting-workers` /
+  `waiting-CI` / `waiting-approval` / `blocked-capacity` /
+  `continuation-eligible` / `paused` / `completed` / `needs-attention`, or
+  `unknown` when the evidence is missing or stale. An idle or `done` agent
+  alone is neither completion (a `done` run without passing review evidence
+  stays unknown) nor permission to resume (a paused run is never eligible),
+  and an unapproved or drifted plan is never eligible either.
+- Wakes coalesce: semantic completion/review/CI/control events folded from
+  the durable journal stream and the bounded timer fallback share ONE
+  pending trigger slot per run (`supervision_triggers`, m0011), so
+  duplicate, out-of-order and concurrent timer/event wakes produce exactly
+  one run-scoped reconciliation; the meaningful-progress marker moves only
+  when recorded evidence changed, so reads, heartbeats and rendered status
+  never reset it and the progress timeout identifies the ABSENCE of
+  evidence (long-running work and known waits never re-report a
+  continuation; one continuation report per absence window).
+- Restart and clock movement: durable pause/terminal holds, the policy, the
+  check counters and the retry timing survive a restart; the boot pass
+  reconciles every armed run exactly once with a fresh snapshot, and the
+  next eligible check is re-anchored to `now + interval` (missed windows
+  are skipped, never replayed). A persisted event cursor that retention
+  moved past falls back to a fresh snapshot wake. Shutdown cancels and
+  joins the driver, and the timer path never holds the state guard across a
+  wait.
+- NO continuation effect ships in this slice: nothing spawns, prompts,
+  resumes, retries, mutates Git or clears a hold.
+- CLI parity: `canter supervision status --run RUN_ID` (read-only, on the
+  read-only method allowlist; `tests/supervision.rs` pins the acceptance
+  over a real daemon: armed-without-another-request, reads-are-inert,
+  disabled-by-default, restart-holds, and the recorded-evidence fold).
+
+### Fixed (issue #95-R1 — an unobserved run is held, and reads report committed state)
+
+- **No continuation report for a freshly armed run.** A run with no recorded
+  progress observation yet (`progress_at` empty — the m0011 default — or an
+  unreadable instant) is held: class `unknown`, reason
+  `supervision.progress_unobserved`, `eligible:false`. The first
+  reconciliation of a fresh arm therefore opens no continuation window and
+  never advances `continuation_reports`; only a recorded observation that is
+  genuinely older than the explicit `progress_timeout_secs` policy is
+  `continuation-eligible` (`supervision.progress_timeout`) and reports once
+  per absence window.
+- **Reads report committed state.** `supervision.status` (and the human
+  rendering of the same document) now reports the RECORDED result of the last
+  committed check as `class`/`reason`/`eligible` (before the first check: the
+  read's own observation, which is exactly what the driver is about to
+  commit), carries the read-time re-classification separately as `observed`,
+  and keeps the `continuation` block as durable window state
+  (`state`/`since`/`reports`). A read can no longer re-classify to a
+  friendlier class and hide a committed counter.
+
 ### Added (issue #78 — CLI preview / request / inspect for one explicit lane handoff)
 
 - The thin CLI lane surface over the completed daemon handoff path

@@ -141,6 +141,17 @@ pub struct SubmissionMaterial {
     pub grants: Vec<ItemGrant>,
     /// Presented resume authorizations.
     pub resume: Vec<ResumeAuthorization>,
+    /// The optional explicit supervision authorization (issue #95):
+    /// `None` = supervision disabled for the admitted runs (the default).
+    pub supervision: Option<crate::supervision::Authorization>,
+}
+
+/// Validate one presented `params.supervision` block and map its typed
+/// refusal onto the submission vocabulary (the block is validated by the
+/// supervision policy parser, never by a second copy of the rules).
+fn parse_supervision(value: &Val) -> Result<crate::supervision::Authorization, SubmissionError> {
+    crate::supervision::parse_authorization(value)
+        .map_err(|err| SubmissionError::new(err.code, err.message))
 }
 
 /// The re-rendered preview plus the classified membership (issue #85 AC1).
@@ -193,7 +204,7 @@ pub fn parse_params(params: &Val) -> Result<SubmissionMaterial, SubmissionError>
             "the submission params must be an object",
         ));
     };
-    const KEYS: [&str; 10] = [
+    const KEYS: [&str; 11] = [
         "idempotency_key",
         "digest",
         "epoch",
@@ -204,6 +215,7 @@ pub fn parse_params(params: &Val) -> Result<SubmissionMaterial, SubmissionError>
         "observations",
         "grants",
         "resume",
+        "supervision",
     ];
     for key in map.keys() {
         if !KEYS.contains(&key.as_str()) {
@@ -276,6 +288,13 @@ pub fn parse_params(params: &Val) -> Result<SubmissionMaterial, SubmissionError>
     let (host_available, harness_lanes) = parse_observations(params.get("observations"))?;
     let grants = parse_grants(params.get("grants"))?;
     let resume = parse_resume(params.get("resume"))?;
+    // Issue #95: supervision is OPTIONAL and disabled by default. When a
+    // block is presented it is validated here (closed shape, bounded
+    // deadlines) and committed with the submission.
+    let supervision = match params.get("supervision") {
+        None | Some(Val::Null) => None,
+        Some(value) => Some(parse_supervision(value)?),
+    };
     Ok(SubmissionMaterial {
         idempotency_key: key,
         preview,
@@ -288,6 +307,7 @@ pub fn parse_params(params: &Val) -> Result<SubmissionMaterial, SubmissionError>
         harness_lanes,
         grants,
         resume,
+        supervision,
     })
 }
 
@@ -1385,6 +1405,7 @@ pub fn submit_params(
     harness_lanes: Option<i64>,
     grants: &[ItemGrant],
     resume: &[ResumeAuthorization],
+    supervision: Option<&crate::supervision::Authorization>,
 ) -> Val {
     let observations = object(vec![
         (
@@ -1414,7 +1435,7 @@ pub fn submit_params(
             ])
         })
         .collect();
-    object(vec![
+    let mut doc = object(vec![
         ("idempotency_key", string(idempotency_key)),
         ("digest", string(digest)),
         ("epoch", integer(epoch)),
@@ -1432,7 +1453,16 @@ pub fn submit_params(
         ("observations", observations),
         ("grants", Val::Arr(grants_doc)),
         ("resume", Val::Arr(resume_doc)),
-    ])
+    ]);
+    // Issue #95: the supervision block is OPTIONAL — a submission that does
+    // not present one leaves the keyboard of its runs un-supervised.
+    if let (Some(authorization), Val::Obj(map)) = (supervision, &mut doc) {
+        map.insert(
+            "supervision".to_string(),
+            crate::supervision::authorization_params(&authorization.desired, authorization.policy),
+        );
+    }
+    doc
 }
 
 /// Validate one presented harness/profile key (`--profile KEY` shape).

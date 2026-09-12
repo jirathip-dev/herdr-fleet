@@ -633,6 +633,12 @@ impl<'a> OperatorConsole<'a> {
             material.harness_lanes,
             &material.grants,
             &material.resume,
+            // Issue #95: supervision is OPTIONAL and disabled by default. The
+            // operator surface does not arm the supervised reconciliation
+            // driver on the operator's behalf (the CLI's `--supervise arm` is
+            // the explicit arming decision); the admitted runs stay
+            // un-supervised unless that authorization is presented.
+            None,
         );
         let outcome = match client::call(&self.socket, "queue.submit", Some(&params)) {
             Ok(doc) => match doc.get("submission_id").and_then(Val::as_str) {
@@ -765,6 +771,10 @@ impl<'a> OperatorConsole<'a> {
             harness_lanes: run.harness_lanes,
             grants: run.grants.clone(),
             resume: run.resume.clone(),
+            // Issue #95: no supervision authorization is presented by this
+            // surface, so the admitted runs stay un-supervised (the daemon
+            // equivalent of the CLI's `--supervise off` default).
+            supervision: None,
         })
     }
 

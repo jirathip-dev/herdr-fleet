@@ -214,6 +214,8 @@ fn seed_submission(state: &State, issues: &[(i64, &str)]) -> Vec<String> {
                 verdict: SubmissionVerdict::Approved,
             })
             .collect(),
+        // Issue #95: no supervision authorization is presented here.
+        supervision: None,
         at: AT.to_string(),
     };
     let (_, items) = state.submit_queue_run(&plan).expect("submission commits");
