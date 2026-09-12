@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::formats::{is_repository_identity, is_slug};
 use crate::schema::{Family, Refusal, Verdict, validate_bytes};
-use crate::value::Val;
+use crate::value::{Val, bool_, object, string};
 
 /// An error that prevents a config/policy document from being loaded.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,6 +94,22 @@ pub struct Harness {
     pub provider: Option<String>,
     /// See [`Harness::provider`].
     pub model: Option<String>,
+    /// Authorized fallback pairs (`"provider/model"`, issue #77): the only
+    /// alternative bindings a successor may answer with. Anything else is
+    /// fenced. Empty when the profile authorizes no fallback.
+    pub fallback: Vec<String>,
+    /// Credential environment variable names (issue #77): allowlisted
+    /// variables whose *values* participate in the profile-configuration
+    /// revision as digests only. Never stored, never reported.
+    pub secret_env: Vec<String>,
+    /// Configured limits (issue #77 metadata overrides), key → value. These
+    /// are declared configuration, never proof of provider support.
+    pub limits: Vec<(String, String)>,
+    /// Whether the configured profile supports binding introspection (the
+    /// session read-back reports the bound provider/model, issue #77). An
+    /// unsupported profile yields an honest capability hold instead of an
+    /// inferred binding.
+    pub binding_introspection: bool,
 }
 
 /// A bare binding token: non-empty, no whitespace, no path separators, no
@@ -370,6 +386,117 @@ fn extract_config(path: &Path, doc: &Val) -> Result<Config, LoadError> {
                     "config.harness.{key}.provider and .model must be declared together"
                 )));
             }
+            // Issue #77 profile-planning keys. Everything is validated in
+            // the decoder (the schema validator checks shape only): fallback
+            // pairs and secret names are bare-token bounded, credentials must
+            // flow through the declared environment allowlist, and limits are
+            // bounded scalar metadata overrides.
+            let fallback = match entry.get("fallback") {
+                None => Vec::new(),
+                Some(Val::Arr(items)) => {
+                    let mut pairs = Vec::new();
+                    for item in items {
+                        let Some(text) = item.as_str() else {
+                            return Err(fail(format!(
+                                "config.harness.{key}.fallback must be an array of \"provider/model\" strings"
+                            )));
+                        };
+                        if fallback_pair(text).is_none() {
+                            return Err(fail(format!(
+                                "config.harness.{key}.fallback entry {text:?} must be a bare-token provider/model pair"
+                            )));
+                        }
+                        pairs.push(text.to_string());
+                    }
+                    pairs
+                }
+                Some(_) => {
+                    return Err(fail(format!(
+                        "config.harness.{key}.fallback must be an array of \"provider/model\" strings"
+                    )));
+                }
+            };
+            let secret_env = match entry.get("secret_env") {
+                None => Vec::new(),
+                Some(Val::Arr(items)) => {
+                    let mut names = Vec::new();
+                    for item in items {
+                        let Some(name) = item.as_str() else {
+                            return Err(fail(format!(
+                                "config.harness.{key}.secret_env must be an array of environment variable names"
+                            )));
+                        };
+                        names.push(name.to_string());
+                    }
+                    names
+                }
+                Some(_) => {
+                    return Err(fail(format!(
+                        "config.harness.{key}.secret_env must be an array of environment variable names"
+                    )));
+                }
+            };
+            let env_allow: Vec<String> = match entry.get("env_allow") {
+                Some(Val::Arr(items)) => items
+                    .iter()
+                    .filter_map(Val::as_str)
+                    .map(str::to_string)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            // Credentials arrive only through the explicit environment
+            // allowlist (trust model T5): a secret name outside it would be a
+            // value channel with no declared boundary, so it refuses.
+            for name in &secret_env {
+                if !is_bare_token(name) || !env_allow.contains(name) {
+                    return Err(fail(format!(
+                        "config.harness.{key}.secret_env entry {name:?} must be a declared env_allow variable name"
+                    )));
+                }
+            }
+            let binding_introspection = match entry.get("binding_introspection") {
+                None => false,
+                Some(Val::Bool(value)) => *value,
+                Some(_) => {
+                    return Err(fail(format!(
+                        "config.harness.{key}.binding_introspection must be a boolean"
+                    )));
+                }
+            };
+            let limits = match entry.get("limits") {
+                None => Vec::new(),
+                Some(Val::Obj(map)) => {
+                    let mut bounds = Vec::new();
+                    for (name, value) in map {
+                        if !bounded_printable(name, CONFIG_LIMIT_KEY_MAX) {
+                            return Err(fail(format!(
+                                "config.harness.{key}.limits key {name:?} must be 1-{CONFIG_LIMIT_KEY_MAX} printable characters"
+                            )));
+                        }
+                        let text = match value {
+                            Val::Str(text) => text.clone(),
+                            Val::Int(number) => number.to_string(),
+                            _ => {
+                                return Err(fail(format!(
+                                    "config.harness.{key}.limits.{name} must be a string or integer"
+                                )));
+                            }
+                        };
+                        if !bounded_printable(&text, CONFIG_LIMIT_VALUE_MAX) {
+                            return Err(fail(format!(
+                                "config.harness.{key}.limits.{name} must be 1-{CONFIG_LIMIT_VALUE_MAX} printable characters"
+                            )));
+                        }
+                        bounds.push((name.clone(), text));
+                    }
+                    bounds
+                }
+                Some(_) => {
+                    return Err(fail(format!(
+                        "config.harness.{key}.limits must be a table of scalar values"
+                    )));
+                }
+            };
             harnesses.push(Harness {
                 key: key.clone(),
                 kind: entry
@@ -378,16 +505,13 @@ fn extract_config(path: &Path, doc: &Val) -> Result<Config, LoadError> {
                     .expect("validated")
                     .to_string(),
                 executable,
-                env_allow: match entry.get("env_allow") {
-                    Some(Val::Arr(items)) => items
-                        .iter()
-                        .filter_map(Val::as_str)
-                        .map(str::to_string)
-                        .collect(),
-                    _ => Vec::new(),
-                },
+                env_allow,
                 provider,
                 model,
+                fallback,
+                secret_env,
+                limits,
+                binding_introspection,
             });
         }
     }
@@ -579,6 +703,464 @@ pub fn adapter_environment() -> BTreeMap<String, String> {
     env
 }
 
+// ---------------------------------------------------------------------------
+// Target profile binding plans (issue #77)
+//
+// One validated profile-configuration revision binds a replacement plan to
+// the exact target profile a human reviewed: the intended provider/model,
+// the authorized fallback pairs, the configured limits (metadata overrides
+// — declared configuration, never provider proof), the declared binding
+// introspection support and the credential digests (never values). The
+// revision is the sha256 over the canonical material, so any relevant
+// configuration or credential change produces a different revision and the
+// durable binding is invalidated (a newly reviewed plan is required).
+// ---------------------------------------------------------------------------
+
+/// Canonical schema id of one target-profile binding plan document.
+pub const PROFILE_BINDING_SCHEMA: &str = "hf-profile-binding/v1";
+
+/// Typed refusal code: the profile binding is malformed or does not match
+/// the durable plan (missing, unexpected, or materially different).
+pub const CODE_PROFILE_BINDING: &str = "refusal.profile.binding";
+
+/// Typed refusal code: the presented configuration revision does not match
+/// the reviewed plan revision — the relevant configuration (or a declared
+/// credential) changed after the preview.
+pub const CODE_PROFILE_REVISION: &str = "refusal.profile.revision";
+
+/// Recorded digest marker for a declared credential environment variable
+/// that is absent from the environment: the revision still covers the
+/// declared name and the fact that no value was present.
+pub const PROFILE_SECRET_UNSET: &str = "unset";
+
+/// Enforced bound of one configured-limit key (issue #77).
+pub const CONFIG_LIMIT_KEY_MAX: usize = 64;
+/// Enforced bound of one configured-limit value.
+pub const CONFIG_LIMIT_VALUE_MAX: usize = 96;
+/// Maximum authorized fallback pairs bound into one plan.
+pub const PROFILE_FALLBACK_MAX: usize = 8;
+/// Maximum declared credential names bound into one plan.
+pub const PROFILE_SECRET_MAX: usize = 8;
+/// Maximum configured-limit entries bound into one plan.
+pub const PROFILE_LIMITS_MAX: usize = 16;
+
+/// A bounded printable string (never control characters, never empty).
+fn bounded_printable(text: &str, max: usize) -> bool {
+    !text.is_empty() && text.chars().count() <= max && !text.chars().any(char::is_control)
+}
+
+/// Split one `"provider/model"` fallback text into its bare-token pair.
+pub fn fallback_pair(text: &str) -> Option<(&str, &str)> {
+    let (provider, model) = text.split_once('/')?;
+    if is_bare_token(provider) && is_bare_token(model) {
+        Some((provider, model))
+    } else {
+        None
+    }
+}
+
+/// The digest of one declared credential environment variable: a sha256 over
+/// a fixed domain-separated preimage, or [`PROFILE_SECRET_UNSET`] when the
+/// variable is absent. The value itself never enters the binding, a report,
+/// or a log — only this digest does.
+pub fn secret_digest(env: &BTreeMap<String, String>, name: &str) -> String {
+    match env.get(name) {
+        Some(value) => crate::canonical::sha256_hex(
+            format!("{PROFILE_BINDING_SCHEMA}|secret|{name}|{value}").as_bytes(),
+        ),
+        None => PROFILE_SECRET_UNSET.to_string(),
+    }
+}
+
+/// Read the declared credential environment of one harness from the invoking
+/// process (issue #77): the NAMES come from the configuration; each value is
+/// read only to be digested and never leaves this map (it is never stored in
+/// a plan, a report, or a log).
+pub fn credential_environment(harness: &Harness) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    for name in &harness.secret_env {
+        if let Ok(value) = std::env::var(name) {
+            env.insert(name.clone(), value);
+        }
+    }
+    env
+}
+
+/// The declared credential presence of one configured harness (issue #77):
+/// `(present, missing)` variable names. Names only — credential values are
+/// never read into a report and never disclosed.
+pub fn credential_presence(
+    harness: &Harness,
+    env: &BTreeMap<String, String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut present = Vec::new();
+    let mut missing = Vec::new();
+    for name in &harness.secret_env {
+        if env.contains_key(name) {
+            present.push(name.clone());
+        } else {
+            missing.push(name.clone());
+        }
+    }
+    (present, missing)
+}
+
+/// One validated target-profile binding plan (issue #77): the explicit
+/// profile-configuration revision a human reviewed together with the exact
+/// material the revision fingerprints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileBinding {
+    /// Target harness profile key.
+    pub key: String,
+    /// Target adapter kind.
+    pub kind: String,
+    /// INTENDED provider (sourced from the supported profile configuration).
+    pub provider: String,
+    /// INTENDED model (sourced from the supported profile configuration).
+    pub model: String,
+    /// Authorized fallback pairs (`"provider/model"`); anything else is
+    /// fenced at verification time.
+    pub fallbacks: Vec<String>,
+    /// Configured limits (metadata overrides), key → value. Reported as
+    /// configured limits, never as proof of provider support.
+    pub configured_limits: Vec<(String, String)>,
+    /// Whether the configured profile supports binding introspection.
+    pub introspection: bool,
+    /// Declared credential names with their digest (or `unset`).
+    pub secrets: Vec<(String, String)>,
+    /// 64-hex sha256 over the canonical material.
+    pub revision: String,
+}
+
+/// Why a presented profile binding was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProfileBindingError {
+    /// Malformed or inconsistent binding material.
+    Binding(String),
+    /// The presented revision does not match the recomputed fingerprint of
+    /// the presented material.
+    Revision(String),
+}
+
+impl ProfileBindingError {
+    /// The typed refusal code for this error.
+    pub fn code(&self) -> &'static str {
+        match self {
+            ProfileBindingError::Binding(_) => CODE_PROFILE_BINDING,
+            ProfileBindingError::Revision(_) => CODE_PROFILE_REVISION,
+        }
+    }
+
+    /// The human message for this error.
+    pub fn message(&self) -> &str {
+        match self {
+            ProfileBindingError::Binding(message) | ProfileBindingError::Revision(message) => {
+                message
+            }
+        }
+    }
+}
+
+fn binding_error(message: impl Into<String>) -> ProfileBindingError {
+    ProfileBindingError::Binding(message.into())
+}
+
+impl ProfileBinding {
+    /// The canonical material document the revision fingerprints: exactly
+    /// the fields a plan binds. Credential entries carry digests only.
+    pub fn material(&self) -> Val {
+        object(vec![
+            ("schema", string(PROFILE_BINDING_SCHEMA)),
+            ("key", string(&self.key)),
+            ("kind", string(&self.kind)),
+            ("provider", string(&self.provider)),
+            ("model", string(&self.model)),
+            (
+                "fallbacks",
+                Val::Arr(self.fallbacks.iter().map(|text| string(text)).collect()),
+            ),
+            (
+                "configured_limits",
+                object(
+                    self.configured_limits
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), string(value)))
+                        .collect(),
+                ),
+            ),
+            ("introspection", bool_(self.introspection)),
+            (
+                "secrets",
+                Val::Arr(
+                    self.secrets
+                        .iter()
+                        .map(|(name, digest)| {
+                            object(vec![("name", string(name)), ("digest", string(digest))])
+                        })
+                        .collect(),
+                ),
+            ),
+        ])
+    }
+
+    /// The sha256 over the canonical material — the configuration revision.
+    pub fn revision_of(&self) -> String {
+        crate::canonical::sha256_hex(&crate::canonical::canonical_bytes(&self.material()))
+    }
+
+    /// The full `hf-profile-binding/v1` document (material + revision).
+    pub fn to_doc(&self) -> Val {
+        match self.material() {
+            Val::Obj(mut map) => {
+                map.insert("revision".to_string(), string(&self.revision));
+                Val::Obj(map)
+            }
+            _ => unreachable!("material is an object"),
+        }
+    }
+
+    /// Canonical JSON text of the full document (the durable plan bytes).
+    pub fn to_canonical_text(&self) -> String {
+        crate::canonical::canonical_text(&self.to_doc())
+    }
+
+    /// Build one binding from supported profile configuration (issue #77):
+    /// the harness row keyed `key`, with the intended pair taken from the
+    /// declared `provider`/`model` binding and the credential digests taken
+    /// from the supplied environment (digests only). `None` when the profile
+    /// is unknown or declares no binding pair (the prompt would refuse
+    /// `refusal.binding.missing`; there is no inferred plan).
+    pub fn from_config(
+        config: &Config,
+        key: &str,
+        env: &BTreeMap<String, String>,
+    ) -> Option<ProfileBinding> {
+        let harness = config.harnesses.iter().find(|harness| harness.key == key)?;
+        let provider = harness.provider.clone()?;
+        let model = harness.model.clone()?;
+        let secrets = harness
+            .secret_env
+            .iter()
+            .map(|name| (name.clone(), secret_digest(env, name)))
+            .collect();
+        let mut binding = ProfileBinding {
+            key: harness.key.clone(),
+            kind: harness.kind.clone(),
+            provider,
+            model,
+            fallbacks: harness.fallback.clone(),
+            configured_limits: harness.limits.clone(),
+            introspection: harness.binding_introspection,
+            secrets,
+            revision: String::new(),
+        };
+        binding.revision = binding.revision_of();
+        Some(binding)
+    }
+
+    /// Validate one PRESENTED `hf-profile-binding/v1` document (the daemon
+    /// boundary: the document is untrusted) and recompute its revision: the
+    /// presented revision must equal the fingerprint of the presented
+    /// material, so a revision can never be claimed without the material it
+    /// binds. Unknown keys refuse (closed surface).
+    pub fn from_doc(doc: &Val) -> Result<ProfileBinding, ProfileBindingError> {
+        let Val::Obj(map) = doc else {
+            return Err(binding_error("the profile binding must be an object"));
+        };
+        const KEYS: [&str; 10] = [
+            "schema",
+            "key",
+            "kind",
+            "provider",
+            "model",
+            "fallbacks",
+            "configured_limits",
+            "introspection",
+            "secrets",
+            "revision",
+        ];
+        for key in map.keys() {
+            if !KEYS.contains(&key.as_str()) {
+                return Err(binding_error(format!(
+                    "the profile binding carries unknown key {key:?} (closed surface)"
+                )));
+            }
+        }
+        let text = |key: &str| -> Result<String, ProfileBindingError> {
+            match doc.get(key).and_then(Val::as_str) {
+                Some(value) if !value.is_empty() => Ok(value.to_string()),
+                _ => Err(binding_error(format!(
+                    "the profile binding requires {key} (non-empty string)"
+                ))),
+            }
+        };
+        match doc.get("schema").and_then(Val::as_str) {
+            Some(schema) if schema == PROFILE_BINDING_SCHEMA => {}
+            _ => {
+                return Err(binding_error(format!(
+                    "the profile binding schema must be {PROFILE_BINDING_SCHEMA:?}"
+                )));
+            }
+        }
+        let key = text("key")?;
+        if !crate::formats::is_actor(&key) {
+            return Err(binding_error(
+                "the profile binding key must be an actor identity",
+            ));
+        }
+        let kind = text("kind")?;
+        if !is_bare_token(&kind) || kind.chars().count() > 32 {
+            return Err(binding_error(
+                "the profile binding kind must be a bounded bare token",
+            ));
+        }
+        let provider = text("provider")?;
+        let model = text("model")?;
+        for (field, value) in [("provider", &provider), ("model", &model)] {
+            if !is_bare_token(value) {
+                return Err(binding_error(format!(
+                    "the profile binding {field} must be a bare token (no whitespace or path separators)"
+                )));
+            }
+        }
+        let fallbacks = match doc.get("fallbacks") {
+            Some(Val::Arr(items)) => {
+                if items.len() > PROFILE_FALLBACK_MAX {
+                    return Err(binding_error(format!(
+                        "the profile binding carries more than {PROFILE_FALLBACK_MAX} fallback pairs"
+                    )));
+                }
+                let mut pairs = Vec::new();
+                for item in items {
+                    let Some(entry) = item.as_str() else {
+                        return Err(binding_error(
+                            "every profile binding fallback must be a \"provider/model\" string",
+                        ));
+                    };
+                    if fallback_pair(entry).is_none() {
+                        return Err(binding_error(format!(
+                            "profile binding fallback {entry:?} must be a bare-token provider/model pair"
+                        )));
+                    }
+                    pairs.push(entry.to_string());
+                }
+                pairs
+            }
+            _ => {
+                return Err(binding_error(
+                    "the profile binding requires fallbacks (array of \"provider/model\" strings)",
+                ));
+            }
+        };
+        let configured_limits = match doc.get("configured_limits") {
+            Some(Val::Obj(entries)) => {
+                if entries.len() > PROFILE_LIMITS_MAX {
+                    return Err(binding_error(format!(
+                        "the profile binding carries more than {PROFILE_LIMITS_MAX} configured limits"
+                    )));
+                }
+                let mut limits = Vec::new();
+                for (name, value) in entries {
+                    let Some(value) = value.as_str() else {
+                        return Err(binding_error(format!(
+                            "profile binding configured_limits.{name} must be a string"
+                        )));
+                    };
+                    if !bounded_printable(name, CONFIG_LIMIT_KEY_MAX)
+                        || !bounded_printable(value, CONFIG_LIMIT_VALUE_MAX)
+                    {
+                        return Err(binding_error(format!(
+                            "profile binding configured_limits.{name} must be bounded printable text"
+                        )));
+                    }
+                    limits.push((name.clone(), value.to_string()));
+                }
+                limits
+            }
+            _ => {
+                return Err(binding_error(
+                    "the profile binding requires configured_limits (an object; may be empty)",
+                ));
+            }
+        };
+        let introspection = match doc.get("introspection") {
+            Some(Val::Bool(value)) => *value,
+            _ => {
+                return Err(binding_error(
+                    "the profile binding requires introspection (a boolean)",
+                ));
+            }
+        };
+        let secrets = match doc.get("secrets") {
+            Some(Val::Arr(items)) => {
+                if items.len() > PROFILE_SECRET_MAX {
+                    return Err(binding_error(format!(
+                        "the profile binding carries more than {PROFILE_SECRET_MAX} declared credentials"
+                    )));
+                }
+                let mut entries = Vec::new();
+                for item in items {
+                    let name = match item.get("name").and_then(Val::as_str) {
+                        Some(name) if is_bare_token(name) => name.to_string(),
+                        _ => {
+                            return Err(binding_error(
+                                "every profile binding credential requires a bare-token name",
+                            ));
+                        }
+                    };
+                    let digest = match item.get("digest").and_then(Val::as_str) {
+                        Some(digest)
+                            if digest == PROFILE_SECRET_UNSET
+                                || crate::formats::is_hex64(digest) =>
+                        {
+                            digest.to_string()
+                        }
+                        _ => {
+                            return Err(binding_error(format!(
+                                "profile binding credential {name:?} requires a 64-hex digest or {PROFILE_SECRET_UNSET:?}"
+                            )));
+                        }
+                    };
+                    entries.push((name, digest));
+                }
+                entries
+            }
+            _ => {
+                return Err(binding_error(
+                    "the profile binding requires secrets (an array; may be empty)",
+                ));
+            }
+        };
+        let revision = text("revision")?;
+        if !crate::formats::is_hex64(&revision) {
+            return Err(binding_error(
+                "the profile binding revision must be a 64-hex sha256",
+            ));
+        }
+        let binding = ProfileBinding {
+            key,
+            kind,
+            provider,
+            model,
+            fallbacks,
+            configured_limits,
+            introspection,
+            secrets,
+            revision,
+        };
+        let expected = binding.revision_of();
+        if expected != binding.revision {
+            return Err(ProfileBindingError::Revision(format!(
+                "the presented profile revision {} does not match the fingerprint of the presented \
+                 material ({}); the profile configuration changed since the plan and a newly \
+                 reviewed plan is required",
+                binding.revision, expected
+            )));
+        }
+        Ok(binding)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,6 +1266,283 @@ model = "example-model"
                 err.message
             );
         }
+    }
+
+    /// One synthetic profile row exercising every issue #77 key.
+    const PROFILE_VALID: &str = r#"schema = "hf-config/v1"
+[harness.lane-orch-1]
+kind = "pi"
+executable = "pi-example"
+env_allow = ["PATH", "HOME", "EXAMPLE_PROVIDER_KEY"]
+provider = "example-provider"
+model = "example-model"
+fallback = ["example-provider/example-fallback-model", "example-fallback-provider/example-fallback-model"]
+secret_env = ["EXAMPLE_PROVIDER_KEY"]
+binding_introspection = true
+[harness.lane-orch-1.limits]
+context_tokens = 131072
+request_timeout = "90s"
+"#;
+
+    fn profile_config(name: &str) -> Config {
+        load_config(&write_temp(
+            &format!("profile-binding-{name}.toml"),
+            PROFILE_VALID,
+        ))
+        .expect("profile config loads")
+    }
+
+    fn profile_env(secret: Option<&str>) -> BTreeMap<String, String> {
+        let mut env = BTreeMap::new();
+        env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+        if let Some(secret) = secret {
+            env.insert("EXAMPLE_PROVIDER_KEY".to_string(), secret.to_string());
+        }
+        env
+    }
+
+    #[test]
+    fn profile_binding_preview_binds_the_reviewed_configuration() {
+        let config = profile_config("preview");
+        let binding = ProfileBinding::from_config(
+            &config,
+            "lane-orch-1",
+            &profile_env(Some("example-secret-material")),
+        )
+        .expect("bound profile preview");
+        assert_eq!(binding.key, "lane-orch-1");
+        assert_eq!(binding.kind, "pi");
+        assert_eq!(binding.provider, "example-provider");
+        assert_eq!(binding.model, "example-model");
+        assert_eq!(binding.fallbacks.len(), 2);
+        assert_eq!(
+            binding.configured_limits,
+            vec![
+                ("context_tokens".to_string(), "131072".to_string()),
+                ("request_timeout".to_string(), "90s".to_string()),
+            ]
+        );
+        assert!(binding.introspection);
+        assert_eq!(binding.secrets.len(), 1);
+        assert_eq!(binding.secrets[0].0, "EXAMPLE_PROVIDER_KEY");
+        assert!(
+            crate::formats::is_hex64(&binding.secrets[0].1),
+            "a present credential is bound as a digest"
+        );
+        assert!(crate::formats::is_hex64(&binding.revision));
+
+        // The canonical plan round-trips through the validated decoder and
+        // the fingerprint covers exactly the presented material.
+        let doc = binding.to_doc();
+        let reparsed = ProfileBinding::from_doc(&doc).expect("validated plan");
+        assert_eq!(reparsed, binding);
+        assert_eq!(reparsed.revision_of(), binding.revision);
+
+        // An unbound profile has no plan (nothing is inferred).
+        let unbound = load_config(&write_temp(
+            "profile-unbound.toml",
+            "schema = \"hf-config/v1\"\n[harness.cli]\nkind = \"argv\"\nexecutable = \"hf-cli-example\"\nenv_allow = [\"PATH\"]\n",
+        ))
+        .expect("load");
+        assert!(
+            ProfileBinding::from_config(&unbound, "cli", &profile_env(None)).is_none(),
+            "no declared binding means no plan"
+        );
+        assert!(ProfileBinding::from_config(&unbound, "absent", &profile_env(None)).is_none());
+    }
+
+    #[test]
+    fn profile_revision_invalidates_on_config_and_credential_change_without_disclosure() {
+        const SECRET_VALUE: &str = "example-secret-2417-not-a-real-credential";
+        let config = profile_config("revision");
+        let first =
+            ProfileBinding::from_config(&config, "lane-orch-1", &profile_env(Some(SECRET_VALUE)))
+                .expect("preview");
+
+        // The credential VALUE never enters the plan, its canonical bytes,
+        // or the revision — only the digest does.
+        let text = first.to_canonical_text();
+        assert!(
+            !text.contains(SECRET_VALUE),
+            "no credential value in the plan"
+        );
+        assert!(
+            !text.contains("2417"),
+            "no credential value fragment in the plan"
+        );
+        assert!(!first.revision.contains(SECRET_VALUE));
+
+        // The same reviewed configuration is stable.
+        let again =
+            ProfileBinding::from_config(&config, "lane-orch-1", &profile_env(Some(SECRET_VALUE)))
+                .expect("preview");
+        assert_eq!(
+            first.revision, again.revision,
+            "unchanged profile, same revision"
+        );
+
+        // A rotated credential changes the revision (safe revision
+        // semantics): the previous plan no longer matches.
+        let rotated = ProfileBinding::from_config(
+            &config,
+            "lane-orch-1",
+            &profile_env(Some("example-secret-rotated")),
+        )
+        .expect("preview");
+        assert_ne!(
+            first.revision, rotated.revision,
+            "credential change invalidates"
+        );
+
+        // A missing credential is bound as `unset` (the fact of the
+        // declaration is covered) and disclosed as a NAME only.
+        let missing = ProfileBinding::from_config(&config, "lane-orch-1", &profile_env(None))
+            .expect("preview");
+        assert_eq!(missing.secrets[0].1, PROFILE_SECRET_UNSET);
+        assert_ne!(first.revision, missing.revision);
+        let (present, absent) = credential_presence(&config.harnesses[0], &profile_env(None));
+        assert!(present.is_empty());
+        assert_eq!(absent, vec!["EXAMPLE_PROVIDER_KEY".to_string()]);
+        assert!(
+            !missing
+                .to_canonical_text()
+                .contains("EXAMPLE_PROVIDER_KEY="),
+            "presence is a name, never a value"
+        );
+
+        // Every relevant configuration axis is revision-bound.
+        let mut variants: Vec<Config> = Vec::new();
+        for (name, needle, replacement) in [
+            (
+                "provider",
+                "provider = \"example-provider\"",
+                "provider = \"example-provider-2\"",
+            ),
+            (
+                "model",
+                "model = \"example-model\"",
+                "model = \"example-model-2\"",
+            ),
+            (
+                "fallback",
+                "fallback = [\"example-provider/example-fallback-model\", \"example-fallback-provider/example-fallback-model\"]",
+                "fallback = [\"example-provider/example-fallback-model\"]",
+            ),
+            (
+                "limits",
+                "context_tokens = 131072",
+                "context_tokens = 65536",
+            ),
+            (
+                "introspection",
+                "binding_introspection = true",
+                "binding_introspection = false",
+            ),
+        ] {
+            let text = PROFILE_VALID.replace(needle, replacement);
+            assert_ne!(text, PROFILE_VALID, "{name} variant rewritten");
+            variants.push(
+                load_config(&write_temp(&format!("profile-{name}.toml"), &text))
+                    .expect("variant loads"),
+            );
+        }
+        for (index, variant) in variants.iter().enumerate() {
+            let changed = ProfileBinding::from_config(
+                variant,
+                "lane-orch-1",
+                &profile_env(Some(SECRET_VALUE)),
+            )
+            .expect("preview");
+            assert_ne!(
+                first.revision, changed.revision,
+                "variant {index} must change the revision"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_binding_documents_are_validated_and_revision_checked() {
+        let config = profile_config("documents");
+        let binding = ProfileBinding::from_config(&config, "lane-orch-1", &profile_env(None))
+            .expect("preview");
+        let doc = binding.to_doc();
+
+        // A presented revision that does not fingerprint the presented
+        // material refuses as a revision mismatch.
+        let mut tampered = doc.clone();
+        if let Val::Obj(map) = &mut tampered {
+            map.insert(
+                "revision".to_string(),
+                string("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            );
+        }
+        let err = ProfileBinding::from_doc(&tampered).expect_err("revision mismatch");
+        assert_eq!(err.code(), CODE_PROFILE_REVISION);
+
+        // A changed intended pair with the old revision is a revision
+        // mismatch too: the material moved, the plan did not.
+        let mut re_bound = binding.clone();
+        re_bound.provider = "example-provider-2".to_string();
+        let mut mixed = re_bound.to_doc();
+        if let Val::Obj(map) = &mut mixed {
+            map.insert("revision".to_string(), string(&binding.revision));
+        }
+        assert_eq!(
+            ProfileBinding::from_doc(&mixed)
+                .expect_err("stale revision")
+                .code(),
+            CODE_PROFILE_REVISION
+        );
+
+        // Shape violations refuse as binding errors.
+        for (label, mutate) in [
+            (
+                "unknown key",
+                Box::new(|map: &mut BTreeMap<String, Val>| {
+                    map.insert("extra".to_string(), string("value"));
+                }) as Box<dyn Fn(&mut BTreeMap<String, Val>)>,
+            ),
+            (
+                "bad fallback",
+                Box::new(|map: &mut BTreeMap<String, Val>| {
+                    map.insert(
+                        "fallbacks".to_string(),
+                        Val::Arr(vec![string("not-a-pair")]),
+                    );
+                }),
+            ),
+            (
+                "credential digest",
+                Box::new(|map: &mut BTreeMap<String, Val>| {
+                    map.insert(
+                        "secrets".to_string(),
+                        Val::Arr(vec![object(vec![
+                            ("name", string("EXAMPLE_PROVIDER_KEY")),
+                            ("digest", string("example-secret-material")),
+                        ])]),
+                    );
+                }),
+            ),
+        ] {
+            let mut mutated = doc.clone();
+            if let Val::Obj(map) = &mut mutated {
+                map.insert("revision".to_string(), string(&"0".repeat(63)));
+                mutate(map);
+            }
+            let err = ProfileBinding::from_doc(&mutated).expect_err(label);
+            assert_eq!(err.code(), CODE_PROFILE_BINDING, "{label}");
+        }
+    }
+
+    #[test]
+    fn secret_env_must_flow_through_the_declared_allowlist() {
+        let err = load_config(&write_temp(
+            "profile-secret-undeclared.toml",
+            "schema = \"hf-config/v1\"\n[harness.pi]\nkind = \"pi\"\nexecutable = \"pi\"\nenv_allow = [\"PATH\"]\nprovider = \"example-provider\"\nmodel = \"example-model\"\nsecret_env = [\"EXAMPLE_PROVIDER_KEY\"]\n",
+        ))
+        .expect_err("undeclared secret channel refuses");
+        assert_eq!(err.code, "config.invalid");
+        assert!(err.message.contains("secret_env"), "{}", err.message);
     }
 
     #[test]

@@ -19,6 +19,25 @@ kind = "argv"
 executable = "hf-cli-example"
 env_allow = ["PATH", "HOME"]
 
+# Optional profile-planning keys (issue #77): the explicit provider/model
+# binding, the authorized fallback pairs, the credential environment names
+# whose values are fingerprinted as digests only, the configured limits
+# (metadata overrides, never provider proof) and the declared binding
+# introspection support.
+[harness.pi]
+kind = "pi"
+executable = "pi-example"
+env_allow = ["PATH", "EXAMPLE_PROVIDER_KEY"]
+provider = "example-provider"
+model = "example-model"
+fallback = ["example-provider/example-fallback-model"]
+secret_env = ["EXAMPLE_PROVIDER_KEY"]
+binding_introspection = true
+
+[harness.pi.limits]
+context_tokens = 131072
+request_timeout = "90s"
+
 [workflow.bundle]
 id = "fleet-doctrine-1"
 hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

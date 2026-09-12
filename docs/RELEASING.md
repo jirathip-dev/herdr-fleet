@@ -46,8 +46,8 @@ explicit and separate (see [schema-registry.md](contracts/schema-registry.md)):
 
 - Every stable serialized surface carries a versioned identifier
   (`hf-<family>/v<version>`; 17 families today) plus the SQLite state schema
-  version (`SCHEMA_VERSION`, currently 7, applied by the migration chain
-  `m0001`..`m0007` — queryable from any binary via `canter --version`).
+  version (`SCHEMA_VERSION`, currently 8, applied by the migration chain
+  `m0001`..`m0008` — queryable from any binary via `canter --version`).
 - **Breaking a stable schema requires a migration and a MAJOR release.** A
   migration that changes serialized state or document semantics is
   additive and versioned (`m000N`); unknown-version documents are refused

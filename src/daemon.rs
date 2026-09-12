@@ -2338,6 +2338,58 @@ fn required_str<'a>(params: Option<&'a Val>, key: &str) -> Option<&'a str> {
         .and_then(Val::as_str)
 }
 
+/// Parse one OPTIONAL presented `profile` target-profile binding (issue
+/// #77). The document is validated and its revision recomputed at the
+/// boundary (`config::ProfileBinding::from_doc`): a revision that does not
+/// fingerprint the presented material refuses as `refusal.profile.revision`,
+/// a malformed binding as `refusal.profile.binding`. Absent means the
+/// request is unbound (allowed only where no plan exists).
+fn presented_profile(
+    params: Option<&Val>,
+) -> Result<Option<crate::config::ProfileBinding>, (&'static str, String)> {
+    match params.and_then(|params| params.get("profile")) {
+        None | Some(Val::Null) => Ok(None),
+        Some(doc) => crate::config::ProfileBinding::from_doc(doc)
+            .map(Some)
+            .map_err(|err| (err.code(), err.message().to_string())),
+    }
+}
+
+/// Read the durable target-profile plan of one replacement record (issue
+/// #77): `None` when the record was requested unbound. The stored canonical
+/// document is re-validated and its revision re-derived, so a corrupted row
+/// can never silently pass as a plan.
+fn stored_profile(
+    state: &crate::state::State,
+    replacement_id: &str,
+) -> Result<Option<crate::config::ProfileBinding>, (&'static str, String)> {
+    let row = match state.lane_replacement_profile(replacement_id) {
+        Ok(row) => row,
+        Err(err) => return Err((err.code, err.message)),
+    };
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let doc = Val::parse_json(&row.profile).map_err(|message| {
+        (
+            crate::config::CODE_PROFILE_BINDING,
+            format!("the stored target-profile plan is unreadable: {message}"),
+        )
+    })?;
+    let binding = crate::config::ProfileBinding::from_doc(&doc)
+        .map_err(|err| (err.code(), err.message().to_string()))?;
+    if binding.revision != row.revision {
+        return Err((
+            crate::config::CODE_PROFILE_REVISION,
+            format!(
+                "the stored target-profile plan revision {} does not match its fingerprint {}",
+                row.revision, binding.revision
+            ),
+        ));
+    }
+    Ok(Some(binding))
+}
+
 /// `lane.replacement.request`: create the one replacement record for a
 /// logical lane generation (phase `requested`). The request binds the
 /// source session/process identity, role, worktree and reason; missing or
@@ -2423,6 +2475,14 @@ fn method_lane_replacement_request(shared: &Arc<Shared>, request: &Request) -> S
             );
         }
     };
+    // Issue #77: an optional explicit target-profile binding plan (the
+    // profile identity + configuration revision + intended provider/model
+    // the human reviewed). It is validated and revision-checked BEFORE the
+    // claim and bound into the replacement record in the same transaction.
+    let profile = match presented_profile(params) {
+        Ok(profile) => profile,
+        Err((code, message)) => return err_response(&request.id, code, message),
+    };
     let replacement_id = crate::state::replacement_id_for(&lane_id, generation);
     let target = format!("lane-replacement:{replacement_id}");
     match journal_mutation(shared, request, "mutate.lane-replacement.request", &target) {
@@ -2434,6 +2494,7 @@ fn method_lane_replacement_request(shared: &Arc<Shared>, request: &Request) -> S
                         return err_response(&request.id, "state.unavailable", message);
                     }
                 };
+                let profile_text = profile.as_ref().map(|binding| binding.to_canonical_text());
                 match state.request_lane_replacement(
                     &lane_id,
                     generation,
@@ -2442,12 +2503,21 @@ fn method_lane_replacement_request(shared: &Arc<Shared>, request: &Request) -> S
                     &role,
                     &worktree,
                     &reason,
+                    profile_text
+                        .as_deref()
+                        .zip(profile.as_ref().map(|binding| binding.revision.as_str())),
                     &time::rfc3339_now(),
                 ) {
-                    Ok(row) => Ok(object(vec![(
-                        "replacement",
-                        crate::state::lane_replacement_val(&row),
-                    )])),
+                    Ok(row) => Ok(object(vec![
+                        ("replacement", crate::state::lane_replacement_val(&row)),
+                        (
+                            "profile",
+                            profile
+                                .as_ref()
+                                .map(|binding| binding.to_doc())
+                                .unwrap_or_else(null),
+                        ),
+                    ])),
                     Err(err) => Err((err.code, err.message)),
                 }
             };
@@ -2756,10 +2826,20 @@ fn method_lane_replacement_status(shared: &Arc<Shared>, request: &Request) -> St
         Ok(None) => null(),
         Err(err) => return err_response(&request.id, err.code, err.message),
     };
+    // The bound target-profile plan (issue #77), when the record was
+    // requested under one: the reviewer-facing identity/fingerprint surface
+    // (intended pair, authorized fallbacks, configured limits, credential
+    // digests — never values).
+    let profile = match state.lane_replacement_profile(&replacement_id) {
+        Ok(Some(row)) => crate::state::lane_replacement_profile_val(&row),
+        Ok(None) => null(),
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
     ok_response(
         &request.id,
         object(vec![
             ("replacement", crate::state::lane_replacement_val(&row)),
+            ("profile", profile),
             ("successor", successor),
             ("history", Val::Arr(history)),
         ]),
@@ -3488,6 +3568,14 @@ fn method_lane_start(shared: &Arc<Shared>, request: &Request) -> String {
             );
         }
     }
+    // Issue #77: when the replacement was requested under an explicit
+    // profile-configuration revision, the start must present the SAME
+    // reviewed target-profile binding (validated + revision-checked here;
+    // the durable equality check lives in `begin_lane_successor`).
+    let presented = match presented_profile(Some(params)) {
+        Ok(profile) => profile,
+        Err((code, message)) => return err_response(&request.id, code, message),
+    };
     let target = format!("lane-start:{replacement_id}");
     match journal_mutation(shared, request, "mutate.lane.start", &target) {
         Intent::Claimed { key } => {
@@ -3517,6 +3605,83 @@ fn method_lane_start(shared: &Arc<Shared>, request: &Request) -> String {
                     );
                 }
             };
+            // The durable planned target-profile binding (issue #77): the
+            // successor read-back is verified against it. A stored plan that
+            // no longer validates refuses here, before any effect.
+            let target_binding = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                match stored_profile(&state, &plan.record.replacement_id) {
+                    Ok(binding) => binding,
+                    Err((code, message)) => {
+                        return finish_mutation(
+                            shared,
+                            request,
+                            &key,
+                            "lane.start",
+                            false,
+                            null(),
+                            Some((code, message)),
+                        );
+                    }
+                }
+            };
+            // The spawn must run the profile the plan names (issue #77): a
+            // start that runs another harness profile than the reviewed
+            // target refuses before any effect.
+            if let Some(planned) = &target_binding
+                && (planned.key != profile.key || planned.kind != profile.kind.name())
+            {
+                return finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "lane.start",
+                    false,
+                    null(),
+                    Some((
+                        crate::config::CODE_PROFILE_BINDING,
+                        format!(
+                            "replacement {} was reviewed for target profile {:?}/{:?} but \
+                             the start runs harness profile {:?}/{:?}; the spawn must run \
+                             the reviewed target profile",
+                            plan.record.replacement_id,
+                            planned.key,
+                            planned.kind,
+                            profile.key,
+                            profile.kind.name()
+                        ),
+                    )),
+                );
+            }
+            if let (Some(planned), Some(presented)) = (&target_binding, &presented)
+                && planned.revision != presented.revision
+            {
+                // The changed-revision fence before any spawn (the durable
+                // equality check re-asserts it in `begin_lane_successor`):
+                // the profile configuration moved after the preview.
+                return finish_mutation(
+                    shared,
+                    request,
+                    &key,
+                    "lane.start",
+                    false,
+                    null(),
+                    Some((
+                        crate::config::CODE_PROFILE_REVISION,
+                        format!(
+                            "replacement {} was reviewed under target profile revision {} \
+                             but the start presents revision {}; the profile configuration \
+                             changed after the preview and a newly reviewed plan is required",
+                            plan.record.replacement_id, planned.revision, presented.revision
+                        ),
+                    )),
+                );
+            }
             // Existing concurrency/resource gates apply BEFORE anything is
             // committed or spawned: a capacity refusal is a typed hold, the
             // record is untouched and a bounded explicit retry stays legal.
@@ -3699,6 +3864,7 @@ fn method_lane_start(shared: &Arc<Shared>, request: &Request) -> String {
                 worktree: successor.worktree.clone(),
                 kickoff_receipt: successor.kickoff_receipt.clone(),
                 source_process: plan.record.source_process.clone(),
+                binding: target_binding.clone(),
             };
             let mut spawn_evidence = null();
             if successor.delivery == "none" {
@@ -3802,17 +3968,23 @@ fn method_lane_start(shared: &Arc<Shared>, request: &Request) -> String {
                 crate::adapters::ADAPTER_TIMEOUT,
             );
             match evidence {
-                Ok(crate::adapters::SuccessorEvidence::Verified { process, readiness }) => {
+                Ok(crate::adapters::SuccessorEvidence::Verified {
+                    process,
+                    readiness,
+                    binding,
+                }) => {
+                    let binding_doc = binding.to_doc(target_binding.as_ref());
                     let reason = format!(
                         "successor verified after one bounded spawn: fresh session {:?} \
                          process {} role {:?} profile {}/{} cwd {:?} kickoff receipt echoed, \
-                         adapter-observed {readiness} (nonce {})",
+                         adapter-observed {readiness}, binding {} (nonce {})",
                         successor_target.session,
                         process,
                         successor_target.role,
                         successor_target.profile_key,
                         successor_target.profile_kind,
                         successor_target.worktree,
+                        binding.status(),
                         plan.nonce
                     );
                     let committed = {
@@ -3828,6 +4000,7 @@ fn method_lane_start(shared: &Arc<Shared>, request: &Request) -> String {
                                 &plan.nonce,
                                 &process,
                                 &readiness,
+                                &binding_doc,
                                 &reason,
                                 &time::rfc3339_now(),
                             )
@@ -3860,6 +4033,7 @@ fn method_lane_start(shared: &Arc<Shared>, request: &Request) -> String {
                                 ("process", string(&process)),
                                 ("readiness", string(&readiness)),
                                 ("same_worktree", string(&successor_target.worktree)),
+                                ("binding", binding_doc.clone()),
                                 ("observed_at", string(&time::rfc3339_now())),
                             ]),
                         ),
@@ -4042,6 +4216,31 @@ fn method_lane_adopt(shared: &Arc<Shared>, request: &Request) -> String {
                 }
             };
             let env = crate::config::adapter_environment();
+            // The durable planned target-profile binding (issue #77): the
+            // adoption re-verification classifies the read-back against the
+            // SAME reviewed plan the start was fenced on.
+            let target_binding = {
+                let state = match shared.lock_state() {
+                    Ok(state) => state,
+                    Err(message) => {
+                        return err_response(&request.id, "state.unavailable", message);
+                    }
+                };
+                match stored_profile(&state, &plan.record.replacement_id) {
+                    Ok(binding) => binding,
+                    Err((code, message)) => {
+                        return finish_mutation(
+                            shared,
+                            request,
+                            &key,
+                            "lane.adopt",
+                            false,
+                            null(),
+                            Some((code, message)),
+                        );
+                    }
+                }
+            };
             let successor_target = crate::adapters::SuccessorTarget {
                 session: plan.successor.session.clone(),
                 role: plan.successor.role.clone(),
@@ -4050,16 +4249,17 @@ fn method_lane_adopt(shared: &Arc<Shared>, request: &Request) -> String {
                 worktree: plan.successor.worktree.clone(),
                 kickoff_receipt: plan.successor.kickoff_receipt.clone(),
                 source_process: plan.record.source_process.clone(),
+                binding: target_binding.clone(),
             };
             // The committed successor must still verify: a booted successor
             // that stopped answering holds; a reused identity fails closed.
-            match crate::adapters::successor_evidence(
+            let observed_binding = match crate::adapters::successor_evidence(
                 &profile,
                 &successor_target,
                 &env,
                 crate::adapters::ADAPTER_TIMEOUT,
             ) {
-                Ok(crate::adapters::SuccessorEvidence::Verified { .. }) => {}
+                Ok(crate::adapters::SuccessorEvidence::Verified { binding, .. }) => binding,
                 Ok(crate::adapters::SuccessorEvidence::Held { detail }) => {
                     return finish_mutation(
                         shared,
@@ -4116,7 +4316,7 @@ fn method_lane_adopt(shared: &Arc<Shared>, request: &Request) -> String {
                         )),
                     );
                 }
-            }
+            };
             // Source absence is rechecked: source and successor both
             // live/ambiguous blocks advancement.
             let source_target = crate::adapters::RetirementTarget {
@@ -4225,6 +4425,7 @@ fn method_lane_adopt(shared: &Arc<Shared>, request: &Request) -> String {
                 plan.successor.process,
                 plan.successor.worktree
             );
+            let binding_doc = observed_binding.to_doc(target_binding.as_ref());
             let committed = {
                 let state = match shared.lock_state() {
                     Ok(state) => state,
@@ -4240,6 +4441,7 @@ fn method_lane_adopt(shared: &Arc<Shared>, request: &Request) -> String {
                         &plan.successor.session,
                         &plan.observation,
                         &plan.differences,
+                        &binding_doc,
                         &reason,
                         &time::rfc3339_now(),
                     )
@@ -4272,6 +4474,7 @@ fn method_lane_adopt(shared: &Arc<Shared>, request: &Request) -> String {
                         ("successor_id", string(&plan.successor.successor_id)),
                         ("worktree", string(&successor_target.worktree)),
                         ("observation_digest", string(&successor_row.adoption_digest)),
+                        ("binding", binding_doc.clone()),
                         (
                             "differences",
                             Val::Arr(plan.differences.iter().map(|field| string(field)).collect()),
@@ -6008,6 +6211,12 @@ fn reconcile_lane_successor(
             ));
         }
     };
+    let target_binding = stored_profile(state, replacement_id).map_err(|(code, message)| {
+        daemon_error(
+            "daemon.reconcile",
+            format!("successor reconciliation profile plan: {code}: {message}"),
+        )
+    })?;
     let target = crate::adapters::SuccessorTarget {
         session: successor.session.clone(),
         role: successor.role.clone(),
@@ -6016,6 +6225,7 @@ fn reconcile_lane_successor(
         worktree: successor.worktree.clone(),
         kickoff_receipt: successor.kickoff_receipt.clone(),
         source_process: record.source_process.clone(),
+        binding: target_binding.clone(),
     };
     let env = crate::config::adapter_environment();
     match crate::adapters::successor_evidence(
@@ -6024,18 +6234,26 @@ fn reconcile_lane_successor(
         &env,
         crate::adapters::ADAPTER_TIMEOUT,
     ) {
-        Ok(crate::adapters::SuccessorEvidence::Verified { process, readiness }) => {
+        Ok(crate::adapters::SuccessorEvidence::Verified {
+            process,
+            readiness,
+            binding,
+        }) => {
+            let binding_doc = binding.to_doc(target_binding.as_ref());
             let reason = format!(
                 "reconciled after an interrupted start: the adapter observed the committed \
-                 successor {} process {} ({readiness}) with the bound identity, the SAME \
-                 worktree and the echoed kickoff receipt (nonce {nonce})",
-                successor.successor_id, process
+                 successor {} process {} ({readiness}, binding {}) with the bound identity, \
+                 the SAME worktree and the echoed kickoff receipt (nonce {nonce})",
+                successor.successor_id,
+                process,
+                binding.status()
             );
             match state.commit_lane_successor_verified(
                 replacement_id,
                 &nonce,
                 &process,
                 &readiness,
+                &binding_doc,
                 &reason,
                 &time::rfc3339_now(),
             ) {

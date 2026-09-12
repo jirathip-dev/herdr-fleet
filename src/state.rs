@@ -30,7 +30,7 @@ use crate::time;
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The schema version this binary understands (also `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Bounded-retention defaults (rows kept besides the chain genesis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -540,6 +540,30 @@ pub struct LaneAdoptionPlan {
     pub differences: Vec<String>,
 }
 
+/// One durable target-profile binding plan attached to a lane replacement
+/// record (issue #77): the canonical `hf-profile-binding/v1` document and
+/// its explicit configuration revision. The row is written in the SAME
+/// transaction as the replacement record, so a replacement is either bound
+/// from birth or unbound — never retro-fitted after the fact. The successor
+/// start must present the SAME reviewed plan; a changed revision (the
+/// configuration or a declared credential moved since the preview) requires
+/// a newly reviewed plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneReplacementProfileRow {
+    /// The replacement record this plan belongs to (`UNIQUE`).
+    pub replacement_id: String,
+    /// Canonical `hf-profile-binding/v1` document text.
+    pub profile: String,
+    /// The 64-hex profile-configuration revision the plan was reviewed under.
+    pub revision: String,
+    /// Row creation time (RFC3339 UTC).
+    pub created_at: String,
+}
+
+/// Enforced byte bound of one bound profile-plan document (never truncated;
+/// an oversize plan refuses at request time).
+pub const PROFILE_BINDING_MAX_BYTES: usize = 4096;
+
 /// The validated successor binding presented with one start request (the
 /// grant-style document: lane generation, committed checkpoint digest, the
 /// ONE startup nonce).
@@ -679,6 +703,10 @@ impl State {
         if user_version == M0007_APPLIES_FROM {
             run_m0007(&mut conn)?;
             user_version = M0007_APPLIES_TO;
+        }
+        if user_version == M0008_APPLIES_FROM {
+            run_m0008(&mut conn)?;
+            user_version = M0008_APPLIES_TO;
         }
         match user_version {
             v if v == SCHEMA_VERSION => {
@@ -2095,6 +2123,7 @@ impl State {
         role: &str,
         worktree: &str,
         reason: &str,
+        profile: Option<(&str, &str)>,
         at: &str,
     ) -> Result<LaneReplacementRow, StateError> {
         let outcome = self.request_lane_replacement_inner(
@@ -2105,6 +2134,7 @@ impl State {
             role,
             worktree,
             reason,
+            profile,
             at,
         );
         if let Err(err) = &outcome {
@@ -2123,6 +2153,7 @@ impl State {
         role: &str,
         worktree: &str,
         reason: &str,
+        profile: Option<(&str, &str)>,
         at: &str,
     ) -> Result<LaneReplacementRow, StateError> {
         for (field, value) in [
@@ -2150,6 +2181,21 @@ impl State {
             return Err(state_error(
                 "state.replacement_invalid",
                 format!("role {role:?} is outside the closed role set"),
+            ));
+        }
+        // Issue #77: a bound plan carries the canonical target-profile
+        // document and the explicit revision it was reviewed under; the
+        // durable record is the authority the whole handoff is fenced on.
+        if let Some((text, revision)) = profile
+            && (text.is_empty()
+                || !text.starts_with('{')
+                || text.len() > PROFILE_BINDING_MAX_BYTES
+                || !crate::formats::is_hex64(revision))
+        {
+            return Err(state_error(
+                "state.replacement_invalid",
+                "a bound replacement profile must be canonical hf-profile-binding/v1 \
+                 text (bounded) and a 64-hex revision",
             ));
         }
         let replacement_id = replacement_id_for(lane_id, generation);
@@ -2223,6 +2269,17 @@ impl State {
                 ],
             )
             .map_err(|err| StateError::from_sqlite("request_lane_replacement: insert", err))?;
+            if let Some((text, revision)) = profile {
+                tx.execute(
+                    "INSERT INTO lane_replacement_profiles (replacement_id, profile, revision,
+                        created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![replacement_id, text, revision, at],
+                )
+                .map_err(|err| {
+                    StateError::from_sqlite("request_lane_replacement: profile insert", err)
+                })?;
+            }
             append_lane_replacement_event(
                 &tx,
                 &replacement_id,
@@ -2518,6 +2575,16 @@ impl State {
         )
         .optional()
         .map_err(|err| StateError::from_sqlite("lane_replacement_by_id: query", err))
+    }
+
+    /// The target-profile binding plan attached to one replacement record
+    /// (issue #77): `None` when the replacement was requested unbound.
+    pub fn lane_replacement_profile(
+        &self,
+        replacement_id: &str,
+    ) -> Result<Option<LaneReplacementProfileRow>, StateError> {
+        let conn = self.lock("lane_replacement_profile")?;
+        lane_replacement_profile_of(&conn, replacement_id)
     }
 
     /// The full transition history of one replacement, oldest first.
@@ -3360,6 +3427,64 @@ impl State {
                 format!("no lane replacement {replacement_id:?}"),
             ));
         };
+        // Target-profile binding (issue #77). A record requested under an
+        // explicit profile-configuration revision only starts when the SAME
+        // reviewed binding is presented: a changed revision (the relevant
+        // configuration or a declared credential moved after the preview)
+        // requires a newly reviewed plan; a missing, unexpected, or
+        // materially different binding refuses BEFORE any effect.
+        let stored_profile = lane_replacement_profile_of(&conn, &record.replacement_id)?;
+        match (stored_profile, params.get("profile")) {
+            (None, None) => {}
+            (Some(stored), Some(presented)) => {
+                let presented_revision = presented.get("revision").and_then(Val::as_str);
+                if presented_revision != Some(stored.revision.as_str()) {
+                    return Err(state_error(
+                        crate::config::CODE_PROFILE_REVISION,
+                        format!(
+                            "replacement {} is bound to target profile revision {} but the \
+                             start presents revision {}; the profile configuration changed \
+                             after the preview and a newly reviewed plan is required",
+                            record.replacement_id,
+                            stored.revision,
+                            presented_revision.unwrap_or("<missing>")
+                        ),
+                    ));
+                }
+                if canonical_text(presented) != stored.profile {
+                    return Err(state_error(
+                        crate::config::CODE_PROFILE_BINDING,
+                        format!(
+                            "the presented target-profile binding for replacement {} does not \
+                             match the reviewed plan (the revision matches but the material \
+                             does not)",
+                            record.replacement_id
+                        ),
+                    ));
+                }
+            }
+            (Some(_), None) => {
+                return Err(state_error(
+                    crate::config::CODE_PROFILE_BINDING,
+                    format!(
+                        "replacement {} was requested under an explicit profile-configuration \
+                         revision; a start must present the same reviewed target-profile \
+                         binding",
+                        record.replacement_id
+                    ),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(state_error(
+                    crate::config::CODE_PROFILE_BINDING,
+                    format!(
+                        "replacement {} was not requested under a profile-configuration \
+                         revision; a start cannot introduce one (request a new plan)",
+                        record.replacement_id
+                    ),
+                ));
+            }
+        }
         match record.outcome.as_str() {
             "pending" => {}
             "held" => {
@@ -3935,12 +4060,14 @@ impl State {
     /// transaction, fenced on the exact generation/`starting`/pending state
     /// and on the owning nonce. A spawned process alone never reaches this
     /// commit: the caller only calls it with a closed adapter verdict.
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_lane_successor_verified(
         &self,
         replacement_id: &str,
         nonce: &str,
         process: &str,
         readiness: &str,
+        binding: &Val,
         reason: &str,
         at: &str,
     ) -> Result<(LaneSuccessorRow, LaneReplacementRow), StateError> {
@@ -3949,6 +4076,7 @@ impl State {
             nonce,
             process,
             readiness,
+            binding,
             reason,
             at,
         );
@@ -3958,12 +4086,14 @@ impl State {
         outcome
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_lane_successor_verified_inner(
         &self,
         replacement_id: &str,
         nonce: &str,
         process: &str,
         readiness: &str,
+        binding: &Val,
         reason: &str,
         at: &str,
     ) -> Result<(LaneSuccessorRow, LaneReplacementRow), StateError> {
@@ -4070,6 +4200,7 @@ impl State {
                 ),
                 ("kickoff_receipt", string(&successor.kickoff_receipt)),
                 ("readiness", string(readiness)),
+                ("binding", binding.clone()),
                 ("observed_at", string(at)),
             ]);
             let evidence_text = canonical_text(&evidence);
@@ -4385,6 +4516,7 @@ impl State {
         session: &str,
         observation: &Val,
         differences: &[String],
+        binding: &Val,
         reason: &str,
         at: &str,
     ) -> Result<(LaneSuccessorRow, LaneReplacementRow), StateError> {
@@ -4395,6 +4527,7 @@ impl State {
             session,
             observation,
             differences,
+            binding,
             reason,
             at,
         );
@@ -4413,6 +4546,7 @@ impl State {
         session: &str,
         observation: &Val,
         differences: &[String],
+        binding: &Val,
         reason: &str,
         at: &str,
     ) -> Result<(LaneSuccessorRow, LaneReplacementRow), StateError> {
@@ -4555,6 +4689,7 @@ impl State {
                 ("checkpoint_digest", string(&checkpoint.digest)),
                 ("observation_digest", string(&observation_digest)),
                 ("differences", Val::Arr(Vec::new())),
+                ("binding", binding.clone()),
                 ("adopted_at", string(at)),
             ]);
             let adoption_text = canonical_text(&adoption);
@@ -5472,6 +5607,41 @@ fn lane_replacement_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneRe
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
     })
+}
+
+/// Read the bound target-profile plan of one replacement record (issue #77)
+/// on an open connection: `None` when the replacement was requested unbound.
+fn lane_replacement_profile_of(
+    conn: &rusqlite::Connection,
+    replacement_id: &str,
+) -> Result<Option<LaneReplacementProfileRow>, StateError> {
+    conn.query_row(
+        "SELECT replacement_id, profile, revision, created_at
+           FROM lane_replacement_profiles WHERE replacement_id = ?1",
+        params![replacement_id],
+        |row| {
+            Ok(LaneReplacementProfileRow {
+                replacement_id: row.get(0)?,
+                profile: row.get(1)?,
+                revision: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|err| StateError::from_sqlite("lane_replacement_profile: query", err))
+}
+
+/// One bound replacement profile plan as an RPC-facing value (issue #77):
+/// the canonical document (parsed) plus the review revision and row time.
+pub fn lane_replacement_profile_val(row: &LaneReplacementProfileRow) -> Val {
+    let profile = Val::parse_json(&row.profile)
+        .unwrap_or_else(|_| object(vec![("canonical", string(&row.profile))]));
+    object(vec![
+        ("profile", profile),
+        ("revision", string(&row.revision)),
+        ("created_at", string(&row.created_at)),
+    ])
 }
 
 /// The parsed retirement request: the record identity, the grant-style
@@ -6953,9 +7123,18 @@ const M0007_ID: &str = "m0007_lane_successors_v7";
 const M0007_APPLIES_FROM: i64 = 6;
 const M0007_APPLIES_TO: i64 = 7;
 
+/// m0008 adds the lane replacement target-profile plans (issue #77): one
+/// bound `hf-profile-binding/v1` plan per replacement record, written in the
+/// same transaction as the record itself. Purely additive — unbound records
+/// (and every stored #73/#74/#75/#76 row) are untouched and the table starts
+/// empty.
+const M0008_ID: &str = "m0008_lane_replacement_profiles_v8";
+const M0008_APPLIES_FROM: i64 = 7;
+const M0008_APPLIES_TO: i64 = 8;
+
 /// Ordered migration chain (id, applies_from, applies_to). The runner in
 /// [`State::open`] applies every pending migration before serving.
-const MIGRATIONS: [(&str, i64, i64); 7] = [
+const MIGRATIONS: [(&str, i64, i64); 8] = [
     (M0001_ID, M0001_APPLIES_FROM, M0001_APPLIES_TO),
     (M0002_ID, M0002_APPLIES_FROM, M0002_APPLIES_TO),
     (M0003_ID, M0003_APPLIES_FROM, M0003_APPLIES_TO),
@@ -6963,15 +7142,16 @@ const MIGRATIONS: [(&str, i64, i64); 7] = [
     (M0005_ID, M0005_APPLIES_FROM, M0005_APPLIES_TO),
     (M0006_ID, M0006_APPLIES_FROM, M0006_APPLIES_TO),
     (M0007_ID, M0007_APPLIES_FROM, M0007_APPLIES_TO),
+    (M0008_ID, M0008_APPLIES_FROM, M0008_APPLIES_TO),
 ];
 
-/// Ordered migration-chain identifiers (`m0001`..`m0007`), exposed for the
+/// Ordered migration-chain identifiers (`m0001`..`m0008`), exposed for the
 /// release provenance chain (issue #10): `canter --version` prints
 /// them so a release archive's provenance record can bind the exact
 /// state-schema migration chain of the binary it ships.
 pub fn migration_chain_ids() -> &'static [&'static str] {
     const IDS: [&str; MIGRATIONS.len()] = [
-        M0001_ID, M0002_ID, M0003_ID, M0004_ID, M0005_ID, M0006_ID, M0007_ID,
+        M0001_ID, M0002_ID, M0003_ID, M0004_ID, M0005_ID, M0006_ID, M0007_ID, M0008_ID,
     ];
     &IDS
 }
@@ -7092,6 +7272,20 @@ CREATE TABLE lane_successors (
     adoption_digest TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+";
+
+/// m0008 replacement-profile-plan table (issue #77). One bound plan per
+/// replacement record: the canonical `hf-profile-binding/v1` document and
+/// its explicit configuration revision. The row commits in the same
+/// transaction as the replacement record; an unbound record has no row at
+/// all (never an empty/placeholder plan).
+const M0008_SQL: &str = "\
+CREATE TABLE lane_replacement_profiles (
+    replacement_id TEXT PRIMARY KEY,
+    profile TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 ";
 
@@ -8139,6 +8333,36 @@ fn run_m0007(conn: &mut Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+/// Run migration m0008 in one transaction: the lane replacement
+/// profile-plan table (issue #77). Purely additive — no existing table or
+/// row is touched, so stored replacement/checkpoint/successor rows are never
+/// reinterpreted by the upgrade and the profile table starts empty.
+fn run_m0008(conn: &mut Connection) -> Result<(), StateError> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| StateError::from_sqlite("migrate m0008: begin", err))?;
+    let checksum = sha256_hex(M0008_SQL.as_bytes());
+    tx.execute_batch(M0008_SQL)
+        .map_err(|err| StateError::from_sqlite("migrate m0008", err))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (migration_id, applies_from, applies_to, checksum, applied_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            M0008_ID,
+            M0008_APPLIES_FROM,
+            M0008_APPLIES_TO,
+            checksum,
+            time::rfc3339_now()
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("migrate m0008: bookkeeping", err))?;
+    tx.pragma_update(None, "user_version", M0008_APPLIES_TO)
+        .map_err(|err| StateError::from_sqlite("migrate m0008: user_version", err))?;
+    tx.commit()
+        .map_err(|err| StateError::from_sqlite("migrate m0008: commit", err))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8997,12 +9221,12 @@ mod tests {
         assert_eq!(grant.status, "active");
         assert_eq!(grant.state_epoch, 1);
         assert_eq!(state.current_epoch().expect("epoch"), 1);
-        assert_eq!(SCHEMA_VERSION, 7);
+        assert_eq!(SCHEMA_VERSION, 8);
         {
             let conn = state
-                .lock("test: m0005/m0006/m0007 bookkeeping")
+                .lock("test: m0005/m0006/m0007/m0008 bookkeeping")
                 .expect("lock");
-            for migration_id in [M0005_ID, M0006_ID, M0007_ID] {
+            for migration_id in [M0005_ID, M0006_ID, M0007_ID, M0008_ID] {
                 let recorded: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
@@ -9015,7 +9239,7 @@ mod tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .expect("user_version");
-            assert_eq!(version, 7);
+            assert_eq!(version, SCHEMA_VERSION);
         }
     }
 
@@ -9033,6 +9257,7 @@ mod tests {
                 "implementer",
                 "worktrees/issues/73",
                 "host rotation window",
+                None,
                 at,
             )
             .expect("request");
@@ -9052,6 +9277,7 @@ mod tests {
                 "implementer",
                 "worktrees/issues/73",
                 "second request",
+                None,
                 at,
             )
             .expect_err("duplicate refused");
@@ -9130,6 +9356,7 @@ mod tests {
                 "orchestrator",
                 "worktrees/issues/74",
                 "second lane replacement",
+                None,
                 at,
             )
             .expect("request lane-8");
@@ -9260,6 +9487,7 @@ mod tests {
                 "implementer",
                 "worktrees/issues/74",
                 "checkpoint capture",
+                None,
                 at,
             )
             .expect("request");
@@ -9383,8 +9611,10 @@ mod tests {
             "the new successor table starts empty"
         );
         {
-            let conn = state.lock("test: m0006/m0007 bookkeeping").expect("lock");
-            for migration_id in [M0006_ID, M0007_ID] {
+            let conn = state
+                .lock("test: m0006/m0007/m0008 bookkeeping")
+                .expect("lock");
+            for migration_id in [M0006_ID, M0007_ID, M0008_ID] {
                 let recorded: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
@@ -9397,7 +9627,7 @@ mod tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .expect("user_version");
-            assert_eq!(version, 7);
+            assert_eq!(version, SCHEMA_VERSION);
         }
     }
 
@@ -9495,6 +9725,13 @@ mod tests {
             None,
             "the new successor table starts empty"
         );
+        assert_eq!(
+            state
+                .lane_replacement_profile(&replacement_id)
+                .expect("profile read"),
+            None,
+            "the new replacement-profile table starts empty"
+        );
         // The preserved next transition still works after the upgrade: the
         // stored `retired` boundary admits the successor start.
         let plan = state
@@ -9519,19 +9756,21 @@ mod tests {
             .expect("the stored retirement boundary admits a start after the upgrade");
         assert_eq!(plan.record.phase, "retired");
         {
-            let conn = state.lock("test: m0007 bookkeeping").expect("lock");
-            let recorded: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
-                    params![M0007_ID],
-                    |row| row.get(0),
-                )
-                .expect("bookkeeping");
-            assert_eq!(recorded, 1, "m0007 recorded in schema_migrations");
+            let conn = state.lock("test: m0007/m0008 bookkeeping").expect("lock");
+            for migration_id in [M0007_ID, M0008_ID] {
+                let recorded: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
+                        params![migration_id],
+                        |row| row.get(0),
+                    )
+                    .expect("bookkeeping");
+                assert_eq!(recorded, 1, "{migration_id} recorded in schema_migrations");
+            }
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .expect("user_version");
-            assert_eq!(version, 7);
+            assert_eq!(version, SCHEMA_VERSION);
         }
     }
 
@@ -10062,6 +10301,7 @@ mod tests {
                 "implementer",
                 "worktrees/issues/74",
                 "second generation while mid-handoff",
+                None,
                 at,
             )
             .expect_err("new generation fenced");
@@ -10081,6 +10321,7 @@ mod tests {
                 "implementer",
                 "worktrees/issues/74",
                 "duplicate",
+                None,
                 at,
             )
             .expect_err("duplicate refused");
@@ -10095,6 +10336,7 @@ mod tests {
                 "implementer",
                 "worktrees/issues/74",
                 "different lane",
+                None,
                 at,
             )
             .expect("other lanes are unaffected");
@@ -10121,6 +10363,7 @@ mod tests {
                 "implementer",
                 "worktrees/issues/74",
                 "still mid-handoff",
+                None,
                 at,
             )
             .expect_err("checkpointed is still inside the window");
@@ -10139,6 +10382,7 @@ mod tests {
                 "implementer",
                 "worktrees/issues/74",
                 "successor request after cancellation",
+                None,
                 at,
             )
             .expect("the fence lifted");
@@ -10161,6 +10405,7 @@ mod tests {
                 "orchestrator",
                 "worktrees/issues/74",
                 "orchestrator handoff",
+                None,
                 at,
             )
             .expect("orchestrator request");
@@ -10177,6 +10422,7 @@ mod tests {
                 "reviewer",
                 "worktrees/issues/74",
                 "reviewer lane",
+                None,
                 at,
             )
             .expect("reviewer request");
@@ -10278,6 +10524,7 @@ mod tests {
                 "orchestrator",
                 "worktrees/issues/74",
                 "second orchestrator",
+                None,
                 at,
             )
             .expect("second orchestrator");
@@ -10455,6 +10702,195 @@ mod tests {
                 object(vec![("key", string("lane-a")), ("kind", string("pi"))]),
             ),
         ])
+    }
+
+    /// One synthetic reviewed target-profile plan (issue #77): the same
+    /// canonical document the daemon validates at its boundary.
+    fn sample_profile_binding() -> crate::config::ProfileBinding {
+        let mut binding = crate::config::ProfileBinding {
+            key: "lane-orch-1".to_string(),
+            kind: "pi".to_string(),
+            provider: "example-provider".to_string(),
+            model: "example-model".to_string(),
+            fallbacks: vec!["example-fallback-provider/example-fallback-model".to_string()],
+            configured_limits: vec![("context_tokens".to_string(), "131072".to_string())],
+            introspection: true,
+            secrets: vec![(
+                "EXAMPLE_PROVIDER_KEY".to_string(),
+                crate::config::PROFILE_SECRET_UNSET.to_string(),
+            )],
+            revision: String::new(),
+        };
+        binding.revision = binding.revision_of();
+        binding
+    }
+
+    #[test]
+    fn lane_replacement_profile_plan_is_fenced_at_the_start() {
+        // Issue #77 at the state layer: the reviewed plan is durable on the
+        // replacement record and the start is fenced on it — a changed
+        // revision requires a newly reviewed plan, a missing/unexpected/
+        // different binding refuses before any effect.
+        let path = temp_db("profile-fence.db");
+        let at = "2026-09-12T00:00:00Z";
+        let state = State::open(&path, Retention::default()).expect("open");
+        let plan = sample_profile_binding();
+
+        // An unbound record refuses a start that tries to introduce a plan.
+        let (unbound, _) = checkpointed_replacement(&state, "lane-8", at, "ik_cap-7701");
+        state
+            .commit_lane_retirement(
+                &unbound.replacement_id,
+                1,
+                &state
+                    .lane_checkpoint_by_replacement(&unbound.replacement_id)
+                    .expect("checkpoint")
+                    .expect("row")
+                    .digest,
+                "retired for the profile fence test",
+                at,
+            )
+            .expect("retire");
+        let err = state
+            .begin_lane_successor(&object(vec![
+                ("replacement_id", string(&unbound.replacement_id)),
+                ("profile", plan.to_doc()),
+                (
+                    "binding",
+                    object(vec![
+                        ("generation", integer(1)),
+                        ("checkpoint_digest", string(&"d".repeat(64))),
+                        ("nonce", string("nonce-0001")),
+                    ]),
+                ),
+                (
+                    "successor",
+                    object(vec![
+                        ("session", string("sess-0002")),
+                        ("kickoff_receipt", string(&"a".repeat(64))),
+                    ]),
+                ),
+            ]))
+            .expect_err("an unbound record cannot introduce a plan");
+        assert_eq!(err.code, crate::config::CODE_PROFILE_BINDING);
+
+        // A bound record: request under the reviewed revision.
+        let text = plan.to_canonical_text();
+        let record = state
+            .request_lane_replacement(
+                "lane-9",
+                1,
+                "sess-0001",
+                "proc-0001",
+                "implementer",
+                "worktrees/issues/74",
+                "profile-bound rotation",
+                Some((text.as_str(), plan.revision.as_str())),
+                at,
+            )
+            .expect("request");
+        let stored = state
+            .lane_replacement_profile(&record.replacement_id)
+            .expect("read")
+            .expect("the plan is durable on the record");
+        assert_eq!(stored.revision, plan.revision);
+        assert_eq!(stored.profile, text);
+        state
+            .advance_lane_replacement(&record.replacement_id, "requested", 1, at)
+            .expect("advance");
+        let observation = sample_checkpoint_observation();
+        let (checkpoint, updated, _) = state
+            .commit_lane_checkpoint(
+                &record.replacement_id,
+                1,
+                &observation,
+                &observation,
+                "ik_cap-7702",
+                at,
+            )
+            .expect("checkpoint");
+        assert_eq!(updated.phase, "checkpointed");
+        state
+            .commit_lane_retirement(
+                &record.replacement_id,
+                1,
+                &checkpoint.digest,
+                "retired for the profile fence test",
+                at,
+            )
+            .expect("retire");
+
+        let start = |profile: Option<Val>| -> Result<crate::state::LaneSuccessorPlan, StateError> {
+            let mut params = vec![
+                ("replacement_id", string(&record.replacement_id)),
+                (
+                    "binding",
+                    object(vec![
+                        ("generation", integer(1)),
+                        ("checkpoint_digest", string(&checkpoint.digest)),
+                        ("nonce", string("nonce-0001")),
+                    ]),
+                ),
+                (
+                    "successor",
+                    object(vec![
+                        ("session", string("sess-0002")),
+                        ("kickoff_receipt", string(&"a".repeat(64))),
+                    ]),
+                ),
+            ];
+            if let Some(profile) = profile {
+                params.push(("profile", profile));
+            }
+            state.begin_lane_successor(&object(params))
+        };
+
+        // The identical plan passes.
+        start(Some(plan.to_doc())).expect("the reviewed plan admits the start");
+
+        // A changed configuration revision (the reviewed plan was edited)
+        // requires a newly reviewed plan.
+        let mut edited = plan.clone();
+        edited.provider = "example-provider-2".to_string();
+        edited.revision = edited.revision_of();
+        let err = start(Some(edited.to_doc())).expect_err("changed revision");
+        assert_eq!(
+            err.code,
+            crate::config::CODE_PROFILE_REVISION,
+            "{}",
+            err.message
+        );
+
+        // The same revision with different material is a binding mismatch.
+        let mut mixed = plan.to_doc();
+        if let Val::Obj(map) = &mut mixed {
+            map.insert("revision".to_string(), string(&plan.revision));
+            map.insert("provider".to_string(), string("example-provider-2"));
+        }
+        let err = start(Some(mixed)).expect_err("material mismatch");
+        assert_eq!(
+            err.code,
+            crate::config::CODE_PROFILE_BINDING,
+            "{}",
+            err.message
+        );
+
+        // A missing plan on a bound record refuses too.
+        let err = start(None).expect_err("missing plan");
+        assert_eq!(
+            err.code,
+            crate::config::CODE_PROFILE_BINDING,
+            "{}",
+            err.message
+        );
+
+        // Nothing above changed the record: it is still retired/pending.
+        let row = state
+            .lane_replacement_by_id(&record.replacement_id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.phase, "retired");
+        assert_eq!(row.outcome, "pending");
     }
 
     #[test]

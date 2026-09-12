@@ -77,7 +77,7 @@ release process activates (docs/RELEASING.md), then semver applies.
   per-user launchd/systemd environment checks and unit-plan rendering —
   plans only, never installing/starting/stopping/querying the host service
   manager.
-- State layer: SQLite migrations m0001-m0007, audit/event JSONL journals
+- State layer: SQLite migrations m0001-m0008, audit/event JSONL journals
   with mirror rebuild, backup/restore hooks, per-user path resolution.
 - Socket RPC: `hf-rpc-request/v1`/`hf-rpc-response/v1` closed method set,
   typed refusal codes, `events.subscribe` stream.
@@ -276,6 +276,49 @@ release process activates (docs/RELEASING.md), then semver applies.
   spawns twice. Excluded, as the issue requires: scheduler-driven successor
   work, automatic retries, process-tree cleanup and real deployment
   activation.
+
+### Added (issue #77 — Target profile identity/fingerprint bound to the successor)
+
+- One replacement may be requested under an EXPLICIT profile-configuration
+  revision (`params.profile`, the canonical `hf-profile-binding/v1`
+  document a human reviewed; optional — an unbound request keeps the
+  pre-#77 behavior). The document carries the target profile key/kind, the
+  intended `provider`/`model` pair sourced from the supported profile
+  configuration, the authorized fallback pairs, the configured limits
+  (metadata overrides — reported as configured limits, never as proof of
+  provider support), the declared binding-introspection support and the
+  credential DIGESTS (never values; a declared-but-absent credential is
+  recorded as `unset`). Its `revision` is the sha256 over that canonical
+  material: the daemon recomputes it and refuses a presented revision that
+  does not fingerprint its own material (`refusal.profile.revision`), so a
+  revision is never a claim. Any relevant configuration or credential
+  change produces a different revision, and a start that presents the
+  changed revision refuses
+  (`refusal.profile.revision`: a newly reviewed plan is required) with
+  nothing spawned; a missing or unexpected binding refuses
+  (`refusal.profile.binding`).
+- The reviewed plan is durable (`lane_replacement_profiles`, m0008/schema
+  v8, committed in the SAME transaction as the replacement record — a
+  replacement is bound from birth or unbound, never retro-fitted) and is
+  re-validated on read. The start must present the identical plan, run the
+  profile the plan names, and the successor read-back is classified against
+  it: the planned pair verifies (`matched`), an AUTHORIZED fallback is
+  accepted and reported distinctly (`fallback`), an unexpected
+  provider/model stays fenced (fail closed, parked for reconciliation), and
+  a read-back that reports nothing leaves the actual binding `unknown` — a
+  profile that declares binding introspection instead holds with an honest
+  capability hold, and the actual binding is NEVER copied from the
+  requested configuration. The binding verdict (intended vs actual from
+  authoritative adapter evidence, the reviewed revision, the configured
+  limits) is recorded in the successor verification/adoption evidence and
+  returns on `lane.start`/`lane.adopt`; `lane.replacement.status` exposes
+  the bound plan and `config show --json` previews the exact plan (and the
+  credential names present/missing) the human reviews.
+- Excluded, as the issue requires: live in-place provider switching,
+  editing user profiles, provider benchmark/availability services and
+  automatic fallback-policy expansion. The source session is untouched
+  until normal quiescence/retirement; no new store, scheduler or automatic
+  rotation trigger exists.
 
 ### Changed (issue #106 — product rename `herdr-fleet` → `canter`)
 

@@ -1,6 +1,6 @@
 # Spec: XDG TOML configuration and policy overlay
 
-Refs #3, #80. Family: `hf-config/v1` (config), `hf-policy/v1` (overlay). Fixtures:
+Refs #3, #80, #77. Family: `hf-config/v1` (config), `hf-policy/v1` (overlay). Fixtures:
 [`config/`](../../schemas/fixtures/config/config.valid.toml), [`policy/`](../../schemas/fixtures/policy/policy.valid.toml),
 manifest rows in [`schemas/fixtures/manifest.jsonl`](../../schemas/fixtures/manifest.jsonl).
 Design commitment (locked spec: "One canonical XDG TOML config plus one
@@ -32,7 +32,7 @@ stack").
 | `daemon.socket` | string | no | explicit socket path override; default derives from the XDG runtime dir — portable default only |
 | `policy.overlay` | string | no | explicit relative/absolute path of the optional policy overlay; no implicit discovery |
 | `repository.<key>` | table | no | one configured repository per key (slug); `origin` (string URL) required; `branch`, `enabled` optional |
-| `harness.<key>` | table | no | adapter profile per configured harness: `kind` (string; e.g. `argv`), `executable` (name resolved via PATH, never an absolute path), `env_allow` (array of environment variable names — the explicit allowlist), and the optional `provider`/`model` binding pair: bare tokens, declared together, used by the official prompt rows that carry the pair on argv (`pi`, `jcode`). Without the binding the terminal prompt refuses (`refusal.binding.missing`) — there is no default and no substitution |
+| `harness.<key>` | table | no | adapter profile per configured harness: `kind` (string; e.g. `argv`), `executable` (name resolved via PATH, never an absolute path), `env_allow` (array of environment variable names — the explicit allowlist), and the optional `provider`/`model` binding pair: bare tokens, declared together, used by the official prompt rows that carry the pair on argv (`pi`, `jcode`). Without the binding the terminal prompt refuses (`refusal.binding.missing`) — there is no default and no substitution. Issue #77 adds the optional profile-planning keys `fallback` (array of authorized `"provider/model"` bare-token pairs), `secret_env` (credential environment NAMES, each already declared in `env_allow`), `limits` (a table of string/integer metadata overrides — reported as configured limits, never as proof of provider support) and `binding_introspection` (boolean: the profile can report the bound provider/model back) |
 | `workflow.<key>` | table | no | pinned workflow selection: `id` + `hash` (64-hex sha256 over the canonical workflow document) |
 | `role.<key>` | table | no | custom roles only, explicit and hash-pinned: `hash` (64-hex) |
 
@@ -62,8 +62,33 @@ Synthetic valid example: `config/config.valid.toml` (one repository
 An overlay that constrains nothing is refused (an empty overlay is a config
 error, not a no-op).
 
+## Profile-configuration revision and preview (issue #77)
+
+`canter config show --json` previews, per bound harness, the exact
+`hf-profile-binding/v1` plan a human reviews before requesting a lane
+replacement: the target profile key/kind, the intended `provider`/`model`
+(sourced from the supported profile configuration — never a code literal),
+the authorized `fallback` pairs, the `configured_limits` (metadata
+overrides; they are declared configuration, not provider support), the
+declared `introspection` support, the credential DIGESTS and the
+`revision`. The same row reports the declared credential NAMES as
+`present`/`missing` — a credential VALUE is never read into a report or a
+log. The revision is the sha256 over the canonical material
+(domain-separated; a missing credential is bound as `unset`), so any
+relevant configuration OR credential change produces a different revision
+and invalidates a previously reviewed plan: a daemon start under a changed
+revision refuses (`refusal.profile.revision`) and a newly reviewed plan is
+required, while a revision that does not fingerprint its own material is
+refused at the boundary. A plan under an unchanged revision keeps binding.
+
 ## Compatibility and refusal
 
+- A declared `harness.<key>.fallback` entry must be a `"provider/model"`
+  pair of bare tokens; each `harness.<key>.secret_env` name must be a bare
+  name already declared in `env_allow` (credentials arrive only through the
+  explicit allowlist, trust model T5); `limits` values are bounded
+  strings/integers. Violations refuse at load (`config.invalid`, naming the
+  `config.harness.<key>.<field>` path).
 - A declared `harness.<key>.provider`/`model` binding must be a bare-token
   pair: non-empty, no whitespace, no path separators. Malformed, blank, or
   half-declared values are refused at load (`config.invalid`, naming the

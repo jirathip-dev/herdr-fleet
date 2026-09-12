@@ -1888,6 +1888,13 @@ pub struct SuccessorTarget {
     /// The retired source process identity (never a valid successor
     /// process: a reused identity fails closed).
     pub source_process: String,
+    /// The planned target-profile binding (issue #77), when the replacement
+    /// was requested under an explicit profile-configuration revision. The
+    /// read-back is classified against it: the intended pair verifies, an
+    /// authorized fallback is reported distinctly, an unexpected pair is
+    /// fenced, and an unsupported/absent introspection leaves the actual
+    /// binding unknown — never a copy of the intended pair.
+    pub binding: Option<crate::config::ProfileBinding>,
 }
 
 /// The closed verdict of one successor confirmation read-back. The fresh
@@ -1896,12 +1903,16 @@ pub struct SuccessorTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SuccessorEvidence {
     /// The successor is verified: fresh session identity, role/profile/cwd,
-    /// the kickoff receipt and the adapter-observed readiness all match.
+    /// the kickoff receipt, the adapter-observed readiness and (when a
+    /// target-profile binding was planned) the binding verdict all match.
     Verified {
         /// The adapter-observed backend process identity.
         process: String,
         /// The adapter-observed readiness state (`ready`).
         readiness: String,
+        /// What the read-back bound (planned pair, authorized fallback, or
+        /// an honest unknown — never a copy of the planned pair).
+        binding: BindingObservation,
     },
     /// The evidence cannot prove the boundary yet (missing/incomplete
     /// evidence or a not-ready state): hold — nothing further is attempted
@@ -1916,6 +1927,107 @@ pub enum SuccessorEvidence {
         /// Bounded human detail (redacted).
         detail: String,
     },
+}
+
+/// The closed verdict of one successor binding observation against the
+/// planned target-profile binding (issue #77). The ACTUAL binding comes from
+/// authoritative adapter evidence only; when the read-back reports nothing
+/// the actual stays [`BindingObservation::Unknown`] (never a copy of the
+/// requested configuration).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BindingObservation {
+    /// The read-back reported the planned (intended) provider/model pair.
+    Matched {
+        /// The reported provider.
+        provider: String,
+        /// The reported model.
+        model: String,
+    },
+    /// The read-back reported an AUTHORIZED fallback pair: accepted and
+    /// reported distinctly.
+    Fallback {
+        /// The reported fallback provider.
+        provider: String,
+        /// The reported fallback model.
+        model: String,
+    },
+    /// No planned binding was reviewed, or the profile declares no binding
+    /// introspection and the read-back reported nothing: the actual binding
+    /// stays unknown/unverified.
+    Unknown,
+}
+
+impl BindingObservation {
+    /// The closed observation status (`matched` | `fallback` | `unknown`).
+    pub fn status(&self) -> &'static str {
+        match self {
+            BindingObservation::Matched { .. } => "matched",
+            BindingObservation::Fallback { .. } => "fallback",
+            BindingObservation::Unknown => "unknown",
+        }
+    }
+
+    /// The observed pair, if the read-back reported one.
+    pub fn observed(&self) -> Option<(&str, &str)> {
+        match self {
+            BindingObservation::Matched { provider, model }
+            | BindingObservation::Fallback { provider, model } => {
+                Some((provider.as_str(), model.as_str()))
+            }
+            BindingObservation::Unknown => None,
+        }
+    }
+
+    /// The RPC/evidence document for one observation against the planned
+    /// binding (issue #77). `intended` and `actual` are ALWAYS distinct:
+    /// `actual` is null when the evidence reported nothing — it is never a
+    /// copy of the requested configuration. Configured limits are reported
+    /// as configured limits, never as proof of provider support.
+    pub fn to_doc(&self, plan: Option<&crate::config::ProfileBinding>) -> crate::value::Val {
+        let intended = plan.map(|plan| {
+            object(vec![
+                ("provider", string(&plan.provider)),
+                ("model", string(&plan.model)),
+            ])
+        });
+        let actual = self.observed().map(|(provider, model)| {
+            object(vec![
+                ("provider", string(provider)),
+                ("model", string(model)),
+            ])
+        });
+        let configured_limits = plan.map(|plan| {
+            object(
+                plan.configured_limits
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), string(value)))
+                    .collect(),
+            )
+        });
+        object(vec![
+            ("status", string(self.status())),
+            (
+                "revision",
+                plan.map(|plan| string(&plan.revision)).unwrap_or_else(null),
+            ),
+            (
+                "introspection",
+                plan.map(|plan| bool_(plan.introspection))
+                    .unwrap_or_else(null),
+            ),
+            ("intended", intended.unwrap_or_else(null)),
+            ("actual", actual.unwrap_or_else(null)),
+            (
+                "source",
+                if self.observed().is_some() {
+                    string("adapter")
+                } else {
+                    null()
+                },
+            ),
+            ("configured_limits", configured_limits.unwrap_or_else(null)),
+        ])
+    }
 }
 
 /// Run the successor start row — the ONE bounded fresh-session start
@@ -2196,7 +2308,84 @@ pub fn classify_successor_evidence(
             ),
         });
     }
-    Ok(SuccessorEvidence::Verified { process, readiness })
+    // Target-profile binding verdict (issue #77). The ACTUAL binding is only
+    // ever what the authoritative read-back reported: the planned pair
+    // verifies, an AUTHORIZED fallback is accepted and reported distinctly,
+    // an unexpected pair is fenced (fail closed), and a read-back that
+    // reports nothing leaves the actual unknown — or holds honestly when the
+    // bound profile declares binding introspection.
+    let binding = match &target.binding {
+        None => BindingObservation::Unknown,
+        Some(plan) => match doc.get("binding") {
+            None | Some(Val::Null) => {
+                if plan.introspection {
+                    return Ok(SuccessorEvidence::Held {
+                        detail: format!(
+                            "the confirmation read-back carries no provider/model binding \
+                             although the bound profile {:?} declares binding introspection; \
+                             the actual binding is unverifiable at this boundary (an honest \
+                             capability hold — nothing is inferred and nothing is copied from \
+                             the requested configuration)",
+                            plan.key
+                        ),
+                    });
+                }
+                BindingObservation::Unknown
+            }
+            Some(Val::Obj(map)) => {
+                match (
+                    map.get("provider").and_then(Val::as_str),
+                    map.get("model").and_then(Val::as_str),
+                ) {
+                    (Some(provider), Some(model)) => {
+                        if provider == plan.provider && model == plan.model {
+                            BindingObservation::Matched {
+                                provider: provider.to_string(),
+                                model: model.to_string(),
+                            }
+                        } else if plan.fallbacks.iter().any(|text| {
+                            crate::config::fallback_pair(text) == Some((provider, model))
+                        }) {
+                            BindingObservation::Fallback {
+                                provider: provider.to_string(),
+                                model: model.to_string(),
+                            }
+                        } else {
+                            return Ok(SuccessorEvidence::Reused {
+                                detail: format!(
+                                    "the confirmation read-back reports an unexpected \
+                                     provider/model binding {provider:?}/{model:?} that is \
+                                     neither the planned binding {:?}/{:?} nor one of the \
+                                     authorized fallbacks; the successor stays fenced",
+                                    plan.provider, plan.model
+                                ),
+                            });
+                        }
+                    }
+                    _ => {
+                        return Ok(SuccessorEvidence::Held {
+                            detail: "the confirmation read-back carries an incomplete \
+                                     provider/model binding (both parts are required); an \
+                                     incomplete binding holds"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+            Some(_) => {
+                return Ok(SuccessorEvidence::Held {
+                    detail: "the confirmation read-back carries malformed provider/model \
+                             binding evidence; an unreadable binding holds"
+                        .to_string(),
+                });
+            }
+        },
+    };
+    Ok(SuccessorEvidence::Verified {
+        process,
+        readiness,
+        binding,
+    })
 }
 
 /// Build a successor result with the wall time already measured.
@@ -2672,6 +2861,10 @@ mod tests {
             env_allow: vec!["PATH".to_string()],
             provider: None,
             model: None,
+            fallback: vec![],
+            secret_env: vec![],
+            limits: vec![],
+            binding_introspection: false,
         };
         let profile = Profile::from_config(&harness).expect("profile");
         assert_eq!(profile.kind, HarnessKind::Codex);
@@ -2685,6 +2878,10 @@ mod tests {
             env_allow: vec![],
             provider: None,
             model: None,
+            fallback: vec![],
+            secret_env: vec![],
+            limits: vec![],
+            binding_introspection: false,
         };
         let err = Profile::from_config(&unknown).expect_err("refused");
         assert_eq!(err.code, CODE_UNKNOWN_HARNESS);
@@ -2696,6 +2893,10 @@ mod tests {
             env_allow: vec!["PATH".to_string()],
             provider: None,
             model: None,
+            fallback: vec![],
+            secret_env: vec![],
+            limits: vec![],
+            binding_introspection: false,
         };
         let profile = Profile::from_config(&argv).expect("profile");
         assert_eq!(profile.kind, HarnessKind::Argv);
@@ -2797,6 +2998,10 @@ mod tests {
             env_allow: vec![],
             provider: None,
             model: None,
+            fallback: vec![],
+            secret_env: vec![],
+            limits: vec![],
+            binding_introspection: false,
         };
         let profile = Profile::from_config(&harness).expect("profile");
         let session = sample_session();
@@ -3009,6 +3214,10 @@ mod tests {
             env_allow: vec!["PATH".to_string()],
             provider: Some("example-provider".to_string()),
             model: Some("example-model".to_string()),
+            fallback: vec![],
+            secret_env: vec![],
+            limits: vec![],
+            binding_introspection: false,
         };
         let profile = Profile::from_config(&harness).expect("profile");
         assert_eq!(profile.provider.as_deref(), Some("example-provider"));
@@ -3021,6 +3230,10 @@ mod tests {
             env_allow: vec!["PATH".to_string()],
             provider: Some("example-provider".to_string()),
             model: None,
+            fallback: vec![],
+            secret_env: vec![],
+            limits: vec![],
+            binding_introspection: false,
         };
         let err = Profile::from_config(&half).expect_err("half pair refused");
         assert_eq!(err.code, CODE_BAD_REQUEST);
