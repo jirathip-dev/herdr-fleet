@@ -483,6 +483,26 @@ release process activates (docs/RELEASING.md), then semver applies.
   over a real daemon: armed-without-another-request, reads-are-inert,
   disabled-by-default, restart-holds, and the recorded-evidence fold).
 
+### Fixed (issue #95-R1 — an unobserved run is held, and reads report committed state)
+
+- **No continuation report for a freshly armed run.** A run with no recorded
+  progress observation yet (`progress_at` empty — the m0011 default — or an
+  unreadable instant) is held: class `unknown`, reason
+  `supervision.progress_unobserved`, `eligible:false`. The first
+  reconciliation of a fresh arm therefore opens no continuation window and
+  never advances `continuation_reports`; only a recorded observation that is
+  genuinely older than the explicit `progress_timeout_secs` policy is
+  `continuation-eligible` (`supervision.progress_timeout`) and reports once
+  per absence window.
+- **Reads report committed state.** `supervision.status` (and the human
+  rendering of the same document) now reports the RECORDED result of the last
+  committed check as `class`/`reason`/`eligible` (before the first check: the
+  read's own observation, which is exactly what the driver is about to
+  commit), carries the read-time re-classification separately as `observed`,
+  and keeps the `continuation` block as durable window state
+  (`state`/`since`/`reports`). A read can no longer re-classify to a
+  friendlier class and hide a committed counter.
+
 ### Added (issue #78 — CLI preview / request / inspect for one explicit lane handoff)
 
 - The thin CLI lane surface over the completed daemon handoff path

@@ -383,7 +383,21 @@ clears a repository/fleet-level hold or bypasses a gate.
   observed meaningful-progress marker (time, age, source), the continuation
   report count and the folded pending wake. No claim, no journal write and
   no marker movement: a read, a heartbeat or a rendered status is never
-  progress. `state.not_found` when the run carries no authorization.
+  progress. `state.not_found` when the run carries no authorization. The
+  reported `class`/`reason`/`eligible` are the RECORDED result of the last
+  committed check (and, before the first check, the read's own observation);
+  the read-time re-classification of the same evidence is carried separately
+  as `observed`, and the `continuation` block is durable window state only
+  (`state`/`since`/`reports`) — a read can therefore never launder a
+  committed effect, and the surface never presents an observation as if it
+  were the record.
+- A run with NO recorded progress observation yet (a fresh arm: `progress_at`
+  empty, or an unreadable instant) is **held** — class `unknown`, reason
+  `supervision.progress_unobserved`, `eligible:false` — never eligible: an
+  unobserved run is not a timed-out one, so a fresh arm cannot open a
+  continuation window. Only a recorded observation that is genuinely older
+  than the explicit `progress_timeout_secs` policy is `continuation-eligible`
+  with reason `supervision.progress_timeout`.
 - `continuation-eligible` is a REPORT for a later slice: supervision never
   continues work, and an idle/done agent alone is neither completion (a
   `done` run without passing review evidence stays unknown) nor permission

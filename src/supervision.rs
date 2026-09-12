@@ -28,7 +28,16 @@
 //!   actually changed: reads, heartbeats and rendered status never reset it,
 //!   so the progress timeout identifies the **absence of evidence**, not
 //!   useful reasoning, and long-running work or known waits never re-report
-//!   a continuation.
+//!   a continuation. A run with NO recorded observation yet is **held**
+//!   (`unknown` / `supervision.progress_unobserved`, never eligible): an
+//!   unobserved run is not a timed-out one, so a fresh arm can never open a
+//!   continuation window.
+//! - Reads report **committed** state: `supervision.status` renders the
+//!   recorded result of the last committed check as `class`/`reason`/
+//!   `eligible`, carries the read-time re-classification separately as
+//!   `observed`, and keeps the continuation block as durable window state.
+//!   A read can therefore never re-classify to a friendlier class and hide a
+//!   committed counter.
 //! - All time arithmetic takes `now_unix` as an explicit argument (the same
 //!   design as `crate::lifecycle`): wall-clock movement and sleep surface as
 //!   jumps of that argument and re-anchor the next eligible check to the
@@ -176,6 +185,10 @@ pub mod codes {
     /// Recorded evidence has not moved within the policy window: this is
     /// the absence of evidence, and the run is reported eligible.
     pub const PROGRESS_TIMEOUT: &str = "supervision.progress_timeout";
+    /// No meaningful-progress observation is recorded yet (or the recorded
+    /// instant is unreadable): the run is HELD, never eligible — an
+    /// unobserved run is not a timed-out one.
+    pub const PROGRESS_UNOBSERVED: &str = "supervision.progress_unobserved";
     /// Recorded evidence moved within the policy window.
     pub const RECENT_PROGRESS: &str = "supervision.recent_progress";
 }
@@ -578,8 +591,11 @@ pub fn classify(
     if WORKER_STEP_KINDS.contains(&next_kind.as_str()) {
         return Verdict::new("waiting-workers", codes::WAITING_WORKERS, false, &next_step);
     }
-    // 7. Absence of evidence: the recorded marker has not moved within the
-    //    explicit policy window and nothing else explains the stall.
+    // 7. Absence of evidence. The recorded marker has not moved within the
+    //    explicit policy window and nothing else explains the stall. A run
+    //    with NO recorded observation yet is HELD, never eligible: an
+    //    unobserved run is not a timed-out one, so a fresh arm can never open
+    //    a continuation window.
     let progress_age = progress_age_secs(&evidence.progress_at, now_unix);
     match progress_age {
         Some(age) if age >= policy.progress_timeout_secs => Verdict::new(
@@ -589,12 +605,7 @@ pub fn classify(
             &next_step,
         ),
         Some(_) => Verdict::new("healthy", codes::RECENT_PROGRESS, false, &next_step),
-        None => Verdict::new(
-            "continuation-eligible",
-            codes::PROGRESS_TIMEOUT,
-            true,
-            &next_step,
-        ),
+        None => Verdict::new("unknown", codes::PROGRESS_UNOBSERVED, false, &next_step),
     }
 }
 
@@ -812,9 +823,45 @@ pub fn status_doc(
         (
             "evaluation",
             object(vec![
-                ("class", string(verdict.class)),
-                ("reason", string(verdict.reason)),
-                ("eligible", bool_(verdict.eligible)),
+                // What a read reports is the RECORDED result of the last
+                // committed check, never a read-time re-classification: a
+                // committed counter can not be laundered by re-deriving the
+                // class here. Before the first committed check nothing is
+                // recorded yet, so the read-time observation is the only view
+                // (and it is exactly the view the driver is about to commit).
+                (
+                    "class",
+                    string(if row.checks > 0 {
+                        row.last_check_class.as_str()
+                    } else {
+                        verdict.class
+                    }),
+                ),
+                (
+                    "reason",
+                    string(if row.checks > 0 {
+                        row.last_check_reason.as_str()
+                    } else {
+                        verdict.reason
+                    }),
+                ),
+                (
+                    "eligible",
+                    bool_(if row.checks > 0 {
+                        row.continuation_open
+                    } else {
+                        verdict.eligible
+                    }),
+                ),
+                (
+                    "observed",
+                    object(vec![
+                        ("class", string(verdict.class)),
+                        ("reason", string(verdict.reason)),
+                        ("eligible", bool_(verdict.eligible)),
+                        ("detail", string(&verdict.detail)),
+                    ]),
+                ),
                 ("detail", string(&verdict.detail)),
                 ("checks", integer(row.checks)),
                 (
@@ -866,10 +913,20 @@ pub fn status_doc(
                 (
                     "continuation",
                     object(vec![
-                        ("eligible", bool_(verdict.eligible)),
+                        // Durable window state ONLY (never a read-time guess):
+                        // `state`/`since`/`reports` are what the driver
+                        // committed, so a read can not hide a report that
+                        // already happened.
+                        (
+                            "state",
+                            string(if row.continuation_open {
+                                "open"
+                            } else {
+                                "closed"
+                            }),
+                        ),
                         ("since", string(&row.continuation_since)),
                         ("reports", integer(row.continuation_reports)),
-                        ("open", bool_(row.continuation_open)),
                     ]),
                 ),
                 (
@@ -1627,6 +1684,27 @@ mod tests {
         assert_eq!(verdict.class, "continuation-eligible");
         assert_eq!(verdict.reason, codes::PROGRESS_TIMEOUT);
         assert!(verdict.eligible);
+        // A run with NO recorded observation at all is HELD, never eligible
+        // (reviewer finding 95-R1): an unobserved run is not a timed-out one,
+        // so a fresh arm can never open a continuation window.
+        let evidence = evidence_for(run_row("run-0123456789abcdef"), bound, &steps, &[], "");
+        let verdict = classify(&evidence, &digest, &policy, fresh_unix);
+        assert_eq!(verdict.class, "unknown");
+        assert_eq!(verdict.reason, codes::PROGRESS_UNOBSERVED);
+        assert!(!verdict.eligible);
+        // ...and an unreadable instant is held too: the timeout path requires
+        // a recorded observation that is genuinely older than the policy.
+        let evidence = evidence_for(
+            run_row("run-0123456789abcdef"),
+            bound,
+            &steps,
+            &[],
+            "not-a-time",
+        );
+        let verdict = classify(&evidence, &digest, &policy, fresh_unix + 10_000);
+        assert_eq!(verdict.class, "unknown");
+        assert_eq!(verdict.reason, codes::PROGRESS_UNOBSERVED);
+        assert!(!verdict.eligible);
         // A failure verdict needs attention.
         let mut failed = evidence_for(run_row("run-0123456789abcdef"), bound, &steps, &[], fresh);
         failed.verdicts.push((
@@ -2164,6 +2242,203 @@ mod tests {
             .commit_supervision_check(&plan(1_800_000_030, true, "continuation-eligible"))
             .expect("again");
         assert_eq!(again.continuation_reports, 2, "a new window reports once");
+    }
+
+    /// Walk one document path (`Val::get` per key), `null` when absent.
+    fn path(doc: &Val, keys: &[&str]) -> Val {
+        let mut cursor = doc.clone();
+        for key in keys {
+            cursor = cursor.get(key).cloned().unwrap_or_else(null);
+        }
+        cursor
+    }
+
+    /// Check (via `check_plan`, the driver's own plan builder) and commit one
+    /// reconciliation of the armed run, returning the committed row.
+    fn commit_for(
+        state: &State,
+        evidence: &SupervisionEvidence,
+        boot: bool,
+        now_unix: i64,
+    ) -> (crate::state::SupervisionRow, SupervisionCheckPlan) {
+        let row = state
+            .supervision_by_id(&evidence.run.instance_id)
+            .expect("read")
+            .expect("row");
+        let plan = check_plan(&row, evidence, None, boot, now_unix);
+        let committed = state.commit_supervision_check(&plan).expect("commit");
+        (committed, plan)
+    }
+
+    #[test]
+    fn an_unobserved_run_is_held_and_a_genuine_deadline_opens_exactly_one_window() {
+        // The production commit path (check_plan -> commit_supervision_check)
+        // for the two cases the fix contract separates: NO observation (held,
+        // no report ever) and an observation genuinely older than the explicit
+        // policy (progress timeout, exactly one report per window).
+        let state = temp_state("unobserved");
+        let digest = "d".repeat(64);
+        let run = "run-0123456789abcdef";
+        let policy = Policy {
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+        };
+        state
+            .arm_supervision_for_test(
+                run,
+                "armed",
+                &digest,
+                "review",
+                policy,
+                "2026-09-13T00:00:00Z",
+            )
+            .expect("arm");
+        let steps = [("checkout", "checkout")];
+        let now = 1_800_000_000;
+        // 1. No observation recorded yet: held, and the commit must not open
+        //    a window (this is the reviewer's exact scenario).
+        let unobserved = evidence_for(run_row(run), Some(&digest), &steps, &[], "");
+        let (row, plan) = commit_for(&state, &unobserved, true, now);
+        assert_eq!(plan.class, "unknown");
+        assert_eq!(plan.reason, codes::PROGRESS_UNOBSERVED);
+        assert!(!plan.eligible);
+        assert_eq!(row.continuation_reports, 0);
+        assert!(!row.continuation_open);
+        // A second and third unobserved-looking check keep it at zero.
+        for at in [now + 10, now + 20] {
+            let unreadable = evidence_for(run_row(run), Some(&digest), &steps, &[], "not-a-time");
+            let (row, plan) = commit_for(&state, &unreadable, false, at);
+            assert_eq!(plan.reason, codes::PROGRESS_UNOBSERVED);
+            assert_eq!(row.continuation_reports, 0);
+            assert!(!row.continuation_open);
+        }
+        // 2. An observation that IS recorded and older than the deadline is
+        //    the legitimate timeout path: eligible, exactly one report.
+        let stale_at = time::rfc3339_from_unix(now - 61);
+        let stale = evidence_for(run_row(run), Some(&digest), &steps, &[], &stale_at);
+        let (row, plan) = commit_for(&state, &stale, false, now);
+        assert!(plan.eligible, "a genuinely aged observation is eligible");
+        assert_eq!(plan.class, "continuation-eligible");
+        assert_eq!(plan.reason, codes::PROGRESS_TIMEOUT);
+        assert_eq!(row.continuation_reports, 1);
+        assert!(row.continuation_open);
+        // 3. A repeat within the same window never reports again.
+        let (row, _) = commit_for(&state, &stale, false, now + 10);
+        assert_eq!(row.continuation_reports, 1, "one report per absence window");
+        assert!(row.continuation_open);
+        // 4. A fresh observation closes the window, and the SAME observation
+        //    61s later is a NEW absence window (per window, not per run).
+        let fresh_at = time::rfc3339_from_unix(now + 20);
+        let fresh = evidence_for(run_row(run), Some(&digest), &steps, &[], &fresh_at);
+        let (row, plan) = commit_for(&state, &fresh, false, now + 20);
+        assert_eq!(plan.reason, codes::RECENT_PROGRESS);
+        assert!(!row.continuation_open);
+        assert_eq!(row.continuation_reports, 1);
+        let (row, plan) = commit_for(&state, &fresh, false, now + 20 + 61);
+        assert!(plan.eligible, "the aged observation is eligible again");
+        assert_eq!(row.continuation_reports, 2, "a new window reports again");
+    }
+
+    #[test]
+    fn the_read_reports_the_committed_state_and_never_launders_it() {
+        // The status surface is durable-first: it reports the RECORDED result
+        // of the last committed check and the durable window state, even when
+        // a read-time re-classification of the same evidence would look
+        // friendlier. Reads can therefore never hide a committed effect.
+        let state = temp_state("read-honesty");
+        let digest = "d".repeat(64);
+        let run = "run-0123456789abcdef";
+        let policy = Policy {
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+        };
+        state
+            .arm_supervision_for_test(
+                run,
+                "armed",
+                &digest,
+                "review",
+                policy,
+                "2026-09-13T00:00:00Z",
+            )
+            .expect("arm");
+        let steps = [("checkout", "checkout")];
+        let now = 1_800_000_000;
+        // A committed HELD check is reported as held ...
+        let unobserved = evidence_for(run_row(run), Some(&digest), &steps, &[], "");
+        let (row, _) = commit_for(&state, &unobserved, true, now);
+        let verdict = classify(&unobserved, &digest, &policy, now);
+        let doc = status_doc(&row, &unobserved, None, &verdict, now);
+        assert_eq!(
+            path(&doc, &["evaluation", "class"]).as_str(),
+            Some("unknown")
+        );
+        assert_eq!(
+            path(&doc, &["evaluation", "reason"]).as_str(),
+            Some(codes::PROGRESS_UNOBSERVED)
+        );
+        assert_eq!(
+            path(&doc, &["evaluation", "eligible"]).as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            path(&doc, &["evaluation", "continuation", "reports"]).as_int(),
+            Some(0)
+        );
+        // ...and the headline fields equal the committed record.
+        assert_eq!(
+            path(&doc, &["evaluation", "class"]),
+            path(&doc, &["evaluation", "last_check", "class"]),
+            "the reported class is the committed one"
+        );
+        // A committed ELIGIBLE check is an OPEN window with one report — and
+        // the read says so even though re-classifying the SAME evidence with
+        // the marker now on file would answer `healthy`.
+        let stale = evidence_for(
+            run_row(run),
+            Some(&digest),
+            &steps,
+            &[],
+            &time::rfc3339_from_unix(now - 61),
+        );
+        let (row, plan) = commit_for(&state, &stale, false, now);
+        assert!(plan.eligible);
+        assert_eq!(row.continuation_reports, 1);
+        let fresh = evidence_for(
+            run_row(run),
+            Some(&digest),
+            &steps,
+            &[],
+            &time::rfc3339_from_unix(now),
+        );
+        let observed_now = classify(&fresh, &digest, &policy, now);
+        assert_eq!(
+            observed_now.class, "healthy",
+            "the read-time observation is the friendlier view"
+        );
+        let doc = status_doc(&row, &fresh, None, &observed_now, now);
+        assert_eq!(
+            path(&doc, &["evaluation", "class"]).as_str(),
+            Some("continuation-eligible"),
+            "the committed class is what a read reports"
+        );
+        assert_eq!(
+            path(&doc, &["evaluation", "eligible"]).as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            path(&doc, &["evaluation", "continuation", "state"]).as_str(),
+            Some("open")
+        );
+        assert_eq!(
+            path(&doc, &["evaluation", "continuation", "reports"]).as_int(),
+            Some(1)
+        );
+        assert_eq!(
+            path(&doc, &["evaluation", "observed", "class"]).as_str(),
+            Some("healthy"),
+            "the observation is reported separately, never as the record"
+        );
     }
 
     #[test]

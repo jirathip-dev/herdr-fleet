@@ -26,7 +26,7 @@ use canter::queue_executor as qx;
 use canter::queue_preview as qp;
 use canter::state::{Retention, State};
 use canter::supervision;
-use canter::value::{Val, integer, object, string};
+use canter::value::{Val, integer, null, object, string};
 
 // ---------------------------------------------------------------------------
 // Constants and builders (the #84/#85 fixture shape, one selected issue)
@@ -417,6 +417,34 @@ fn class_of(doc: &Val) -> String {
         .to_string()
 }
 
+/// The DURABLE continuation report count recorded by the driver.
+fn reports_of(doc: &Val) -> i64 {
+    evaluation(doc)
+        .get("continuation")
+        .and_then(|continuation| continuation.get("reports"))
+        .and_then(Val::as_int)
+        .unwrap_or(-1)
+}
+
+/// The DURABLE continuation window state ("open"/"closed").
+fn window_state(doc: &Val) -> String {
+    evaluation(doc)
+        .get("continuation")
+        .and_then(|continuation| continuation.get("state"))
+        .and_then(Val::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Walk one document path (`Val::get` per key), `null` when absent.
+fn path_of(doc: &Val, keys: &[&str]) -> Val {
+    let mut cursor = doc.clone();
+    for key in keys {
+        cursor = cursor.get(key).cloned().unwrap_or_else(null);
+    }
+    cursor
+}
+
 /// Poll `supervision.status` until the recorded check count reaches `want`
 /// (bounded; no fixed sleeps).
 fn wait_for_checks(fixture: &DaemonFixture, run: &str, want: i64) -> Val {
@@ -487,12 +515,50 @@ fn armed_run_is_evaluated_without_another_client_request_and_reads_are_inert() {
             .and_then(Val::as_int),
         Some(60)
     );
-    // The first unachieved step is a plain dispatchable step with no recorded
-    // progress inside the window: healthy, never eligible.
-    assert_eq!(class_of(&first), "healthy");
+    // AC3: the FIRST reconciliation of a freshly armed run has no recorded
+    // progress observation yet, so it is HELD (unknown), never eligible: an
+    // unobserved run is not a timed-out one, and the durable continuation
+    // counter must not move.
+    assert_eq!(class_of(&first), "unknown");
+    assert_eq!(
+        evaluation(&first).get("reason").and_then(Val::as_str),
+        Some(canter::supervision::codes::PROGRESS_UNOBSERVED)
+    );
     assert_eq!(
         evaluation(&first).get("eligible").and_then(Val::as_bool),
         Some(false)
+    );
+    assert_eq!(
+        evaluation(&first)
+            .get("continuation")
+            .and_then(|continuation| continuation.get("state"))
+            .and_then(Val::as_str),
+        Some("closed")
+    );
+    assert_eq!(
+        evaluation(&first)
+            .get("continuation")
+            .and_then(|continuation| continuation.get("reports"))
+            .and_then(Val::as_int),
+        Some(0),
+        "a fresh arm must never open a continuation window"
+    );
+    // ...and the read agrees with the recorded durable state, never with a
+    // read-time re-classification that could hide a committed effect.
+    assert_eq!(
+        evaluation(&first).get("class"),
+        evaluation(&first)
+            .get("last_check")
+            .and_then(|check| check.get("class")),
+        "the reported class is the committed one"
+    );
+    assert!(
+        evaluation(&first)
+            .get("observed")
+            .and_then(|observed| observed.get("class"))
+            .and_then(Val::as_str)
+            .is_some(),
+        "the read-time observation is reported separately"
     );
     assert_eq!(
         evaluation(&first)
@@ -526,19 +592,34 @@ fn armed_run_is_evaluated_without_another_client_request_and_reads_are_inert() {
     );
 
     // AC2: reads and a rendered status never reset the meaningful-progress
-    // marker: three more reads leave the observation byte-identical and the
-    // check count untouched.
-    let progress = evaluation(&first)
-        .get("progress")
-        .cloned()
-        .expect("progress block");
+    // marker: three more reads leave the DURABLE observation (marker, at,
+    // source) byte-identical and the check count untouched. The derived age
+    // is not compared: it is a rendering of the clock, not recorded state.
+    let durable_progress = |doc: &Val| {
+        let progress = evaluation(doc)
+            .get("progress")
+            .cloned()
+            .unwrap_or_else(null);
+        object(vec![
+            (
+                "marker",
+                progress.get("marker").cloned().unwrap_or_else(null),
+            ),
+            ("at", progress.get("at").cloned().unwrap_or_else(null)),
+            (
+                "source",
+                progress.get("source").cloned().unwrap_or_else(null),
+            ),
+        ])
+    };
+    let durable_before = durable_progress(&first);
     let checks_before = checks_of(&first);
     for seed in 10..13 {
         let doc = status_doc(&fixture.socket, &fresh_id(seed), &run);
         assert_eq!(checks_of(&doc), checks_before, "a read is not a check");
         assert_eq!(
-            evaluation(&doc).get("progress"),
-            Some(&progress),
+            durable_progress(&doc),
+            durable_before,
             "a read must never move the progress marker"
         );
     }
@@ -688,7 +769,11 @@ fn restart_preserves_the_pause_hold_and_yields_one_fresh_reconciliation() {
     let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
     let run = instance_of(&result, 5);
     let first = wait_for_checks(&fixture, &run, 1);
-    assert_eq!(class_of(&first), "healthy");
+    // The first check of a freshly armed run has no observation on file yet:
+    // it is HELD (unknown), never eligible, and opens no window.
+    assert_eq!(class_of(&first), "unknown");
+    assert_eq!(reports_of(&first), 0);
+    assert_eq!(window_state(&first), "closed");
     let checks_before_pause = checks_of(&first);
 
     // Pause the run through the control surface: the durable hold must be
@@ -895,10 +980,23 @@ fn cli_supervision_status_reads_the_versioned_status_back_inert() {
         status.get("schema").and_then(Val::as_str),
         Some(canter::supervision::SUPERVISION_SCHEMA)
     );
-    assert_eq!(class_of(&status), "healthy");
+    assert_eq!(
+        path_of(&status, &["evaluation", "class"]).as_str(),
+        Some("unknown"),
+        "the first check is held: no observation is recorded yet"
+    );
+    assert_eq!(
+        path_of(&status, &["evaluation", "reason"]).as_str(),
+        Some(supervision::codes::PROGRESS_UNOBSERVED)
+    );
     assert_eq!(
         evaluation(&status).get("eligible").and_then(Val::as_bool),
         Some(false)
+    );
+    assert_eq!(
+        reports_of(&status),
+        0,
+        "no continuation report on a fresh arm"
     );
 
     // The human rendering of the SAME document.
@@ -907,13 +1005,162 @@ fn cli_supervision_status_reads_the_versioned_status_back_inert() {
         &["supervision", "status", "--run", &run, "--socket", &socket],
     );
     assert_eq!(exit, 0, "human exit; stderr: {stderr}");
-    assert!(stdout.contains("healthy"), "human rendering: {stdout}");
+    assert!(stdout.contains("unknown"), "human rendering: {stdout}");
     assert!(stdout.contains(&run), "human rendering names the run");
 
     // Inert: the reads never moved the evaluation.
     let after = status_doc(&fixture.socket, &fresh_id(9), &run);
     assert_eq!(checks_of(&after), checks_before);
-    assert_eq!(class_of(&after), "healthy");
+    assert_eq!(class_of(&after), "unknown");
+    assert_eq!(reports_of(&after), 0);
+    shutdown(daemon);
+}
+
+#[test]
+fn freshly_armed_run_is_held_and_never_opens_a_continuation_window() {
+    // AC3 (reviewer finding 95-R1): a freshly armed run has NO recorded
+    // progress observation yet. The first reconciliations must classify it as
+    // held (unknown) and must never advance the durable continuation counter,
+    // and the read must report exactly what the driver committed.
+    let fixture = DaemonFixture::new("fresh-arm");
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000095", 5);
+        render_bound(&state, &request_with(vec![selected("#5", REV_A)]))
+    };
+    let daemon = fixture.spawn();
+    wait_ready(&fixture);
+    let key = idem_key("fresh-arm");
+    let params = params_doc(
+        &key,
+        &bound,
+        &digest,
+        &role_revision(),
+        "gr_0000000000000095",
+        Some(armed(10, 60)),
+    );
+    let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
+    let run = instance_of(&result, 5);
+
+    // The FIRST committed check: held, and no window opened.
+    let first = wait_for_checks(&fixture, &run, 1);
+    assert_eq!(class_of(&first), "unknown");
+    assert_eq!(
+        evaluation(&first).get("reason").and_then(Val::as_str),
+        Some(supervision::codes::PROGRESS_UNOBSERVED)
+    );
+    assert_eq!(
+        evaluation(&first).get("eligible").and_then(Val::as_bool),
+        Some(false)
+    );
+    assert_eq!(reports_of(&first), 0, "a fresh arm opens no window");
+    assert_eq!(window_state(&first), "closed");
+
+    // The read agrees with the committed record at every step, and the
+    // counter stays at zero across several further reconciliations.
+    let mut last = first;
+    for want in 2..=4 {
+        let doc = wait_for_checks(&fixture, &run, want);
+        assert_eq!(reports_of(&doc), 0, "no check may open a window here");
+        assert_eq!(window_state(&doc), "closed");
+        assert_eq!(
+            evaluation(&doc).get("class"),
+            evaluation(&doc)
+                .get("last_check")
+                .and_then(|check| check.get("class")),
+            "the reported class is the committed one"
+        );
+        assert_eq!(
+            evaluation(&doc).get("eligible").and_then(Val::as_bool),
+            Some(false),
+            "the recorded window state is never eligible here"
+        );
+        last = doc;
+    }
+    // The marker is recorded (the run WAS observed), and the record says how
+    // the first held check differed from the observation now on file.
+    assert!(
+        evaluation(&last)
+            .get("progress")
+            .and_then(|progress| progress.get("marker"))
+            .and_then(Val::as_str)
+            .is_some_and(|marker| marker.len() == 64)
+    );
+    assert_eq!(
+        class_of(&last),
+        "healthy",
+        "the run is observed and healthy"
+    );
+    shutdown(daemon);
+}
+
+#[test]
+fn a_genuine_deadline_reports_exactly_one_continuation() {
+    // AC4 (the legitimate path): once an observation IS recorded and then
+    // genuinely ages past the explicit policy deadline, the reader reports
+    // continuation-eligible and the durable counter advances exactly once —
+    // with the status surface showing that committed state.
+    let fixture = DaemonFixture::new("deadline");
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000095", 5);
+        render_bound(&state, &request_with(vec![selected("#5", REV_A)]))
+    };
+    let daemon = fixture.spawn();
+    wait_ready(&fixture);
+    let key = idem_key("deadline");
+    // The minimum legal window: a 5s check interval and a 60s deadline, so the
+    // bounded poll below observes the REAL timeout path (~65s), never a
+    // simulated one.
+    let params = params_doc(
+        &key,
+        &bound,
+        &digest,
+        &role_revision(),
+        "gr_0000000000000095",
+        Some(armed(5, 60)),
+    );
+    let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
+    let run = instance_of(&result, 5);
+    let first = wait_for_checks(&fixture, &run, 1);
+    assert_eq!(reports_of(&first), 0, "the first check is held");
+    let deadline = Instant::now() + Duration::from_secs(150);
+    let mut eligible = None;
+    let mut attempt = 0u64;
+    while Instant::now() < deadline {
+        attempt += 1;
+        let doc = status_doc(&fixture.socket, &fresh_id(700 + attempt), &run);
+        if class_of(&doc) == "continuation-eligible" {
+            eligible = Some(doc);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let doc = eligible.expect("a genuinely aged observation must report a continuation");
+    assert_eq!(
+        evaluation(&doc).get("reason").and_then(Val::as_str),
+        Some(supervision::codes::PROGRESS_TIMEOUT)
+    );
+    assert_eq!(
+        evaluation(&doc).get("eligible").and_then(Val::as_bool),
+        Some(true)
+    );
+    assert_eq!(reports_of(&doc), 1, "exactly one report per absence window");
+    assert_eq!(window_state(&doc), "open");
+    assert_eq!(
+        evaluation(&doc).get("class"),
+        evaluation(&doc)
+            .get("last_check")
+            .and_then(|check| check.get("class")),
+        "the read reports the committed class"
+    );
+    // A later check within the same window never reports again.
+    let after = wait_for_checks(&fixture, &run, checks_of(&doc) + 2);
+    assert_eq!(
+        reports_of(&after),
+        1,
+        "one report per window, never one per check"
+    );
     shutdown(daemon);
 }
 
