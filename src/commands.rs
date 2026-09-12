@@ -60,12 +60,13 @@ USAGE:
     canter lane preview --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY] [--socket PATH] [--config PATH] [--json]
     canter lane request --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY] [--confirm-digest HEX64 | --confirm | --yes] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter lane status (--replacement RP_ID | --lane ID --generation N) [--socket PATH] [--config PATH] [--json]
-    canter queue submit --request FILE --confirm-digest HEX64 [--epoch N] [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]... [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter queue submit --request FILE --confirm-digest HEX64 [--epoch N] [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]... [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--supervise arm|off] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter queue status --submission QS_ID [--socket PATH] [--config PATH] [--json]
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run resume --run RUN_ID --digest HEX64 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run status --run RUN_ID [--socket PATH] [--config PATH] [--json]
+    canter supervision status --run RUN_ID [--socket PATH] [--config PATH] [--json]
     canter service doctor [--config PATH] [--json]
     canter service install-plan [--config PATH] [--json]
     canter service status-plan [--config PATH] [--json]
@@ -92,6 +93,10 @@ COMMANDS:
     run              Pause, resume, retry, or inspect exactly ONE run
                      (pause/resume/retry are typed controls; status is
                      read-only; the surface is run-scoped only).
+    supervision      Read the versioned supervision status of exactly ONE
+                     supervised run back (read-only; supervision is armed
+                     with the run's queue submission and evaluated by the
+                     daemon, and this surface never continues work).
     service          Render per-user launchd/systemd plans; doctor checks.
 
 EXIT CODES (with or without --json):
@@ -124,6 +129,9 @@ pub struct Invocation {
     pub queue_action: Option<QueueAction>,
     /// Run-scoped control subcommand (pause/resume/retry/status; issue #86).
     pub run_action: Option<RunAction>,
+    /// Supervision subcommand (status; issue #95): the versioned supervision
+    /// status of ONE run. Read-only.
+    pub supervision_action: Option<SupervisionAction>,
 }
 
 /// Run-scoped control subcommands (issue #86): pause, resume, retry or
@@ -202,6 +210,26 @@ pub enum QueueAction {
     Status(QueueStatusArgs),
 }
 
+/// Supervision subcommands (issue #95): the versioned status read of
+/// exactly ONE supervised run. Read-only: nothing on this surface arms,
+/// disarms or nudges supervision (arming is part of the run's queue
+/// submission, and the driver is daemon-owned).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SupervisionAction {
+    /// Read one run's supervision status back (read-only):
+    /// `supervision status`.
+    Status(SupervisionStatusArgs),
+}
+
+/// `supervision status`: one exact run read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisionStatusArgs {
+    /// The supervised run identity (`run-` + 16 hex).
+    pub run: String,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
+}
+
 /// `queue submit`: the presented submission material plus the explicit
 /// digest authorization.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -223,6 +251,12 @@ pub struct QueueSubmitArgs {
     pub harness_lanes: Option<i64>,
     /// Presented fan-out concurrency caps (the admission axes).
     pub caps: crate::lifecycle::ConcurrencyCaps,
+    /// `--supervise arm|off`: whether the admitted runs carry an explicit
+    /// supervision authorization (issue #95). Default `off`: supervision is
+    /// disabled unless it is explicitly authorized as part of this
+    /// submission, and even `arm` only binds the run to an evaluation driver
+    /// that never continues work.
+    pub supervise: String,
     /// `--idempotency-key`: replay-safe automation key.
     pub idempotency_key: Option<String>,
     /// Explicit daemon socket override.
@@ -485,6 +519,7 @@ pub fn parse_invocation(args: &[String]) -> Result<Invocation, ParseError> {
         "lane" => parse_lane(&rest),
         "queue" => parse_queue(&rest),
         "run" => parse_run(&rest),
+        "supervision" => parse_supervision(&rest),
         other => Err(ParseError::Usage(format!("unknown command {other:?}"))),
     }
 }
@@ -525,6 +560,7 @@ fn parse_flag_command(name: &str, args: &[&String]) -> Result<Invocation, ParseE
         lane_action: None,
         queue_action: None,
         run_action: None,
+        supervision_action: None,
     })
 }
 
@@ -576,6 +612,7 @@ fn parse_board(args: &[&String]) -> Result<Invocation, ParseError> {
         // exists on every initializer so the merged struct has one shape.
         queue_action: None,
         run_action: None,
+        supervision_action: None,
     })
 }
 
@@ -592,6 +629,7 @@ fn help_request(name: &str) -> String {
         "lane" => LANE_USAGE.trim_end().to_string(),
         "queue" => QUEUE_USAGE.trim_end().to_string(),
         "run" => RUN_USAGE.trim_end().to_string(),
+        "supervision" => SUPERVISION_USAGE.trim_end().to_string(),
         "service" => SERVICE_USAGE.trim_end().to_string(),
         _ => USAGE.to_string(),
     }
@@ -743,6 +781,7 @@ fn parse_config(args: &[&String]) -> Result<Invocation, ParseError> {
         lane_action: None,
         queue_action: None,
         run_action: None,
+        supervision_action: None,
     })
 }
 
@@ -836,6 +875,7 @@ fn parse_daemon(args: &[&String]) -> Result<Invocation, ParseError> {
         lane_action: None,
         queue_action: None,
         run_action: None,
+        supervision_action: None,
     })
 }
 
@@ -895,6 +935,7 @@ fn parse_service(args: &[&String]) -> Result<Invocation, ParseError> {
         lane_action: None,
         queue_action: None,
         run_action: None,
+        supervision_action: None,
     })
 }
 
@@ -1079,6 +1120,7 @@ fn parse_lane(args: &[&String]) -> Result<Invocation, ParseError> {
             lane_action: Some(LaneAction::Status(status)),
             queue_action: None,
             run_action: None,
+            supervision_action: None,
         });
     }
 
@@ -1150,6 +1192,7 @@ fn parse_lane(args: &[&String]) -> Result<Invocation, ParseError> {
         lane_action: Some(lane_action),
         queue_action: None,
         run_action: None,
+        supervision_action: None,
     })
 }
 
@@ -1334,6 +1377,79 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
         lane_action: None,
         queue_action: None,
         run_action: Some(action),
+        supervision_action: None,
+    })
+}
+
+/// Parse `supervision <status>` (issue #95). Read-only: it issues
+/// `supervision.status` through the read-only allowlist, so a status read can
+/// never arm, disable or nudge the supervised driver.
+fn parse_supervision(args: &[&String]) -> Result<Invocation, ParseError> {
+    let action = args
+        .first()
+        .ok_or_else(|| ParseError::Help(help_request("supervision")))?;
+    let command = match action.as_str() {
+        "status" => "supervision status",
+        "-h" | "--help" => return Err(ParseError::Help(help_request("supervision"))),
+        other => {
+            return Err(ParseError::Usage(format!(
+                "supervision: unknown subcommand {other:?}; run `canter supervision --help`"
+            )));
+        }
+    };
+    let mut json = false;
+    let mut config_path: Option<PathBuf> = None;
+    let mut socket: Option<String> = None;
+    let mut run: Option<String> = None;
+    let rest = &args[1..];
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--json" => json = true,
+            "--config" => {
+                let value = flag_value(rest, &mut index, command, "--config")?;
+                config_path = Some(PathBuf::from(value));
+            }
+            "--socket" => {
+                socket = Some(flag_value(rest, &mut index, command, "--socket")?);
+            }
+            "--run" => {
+                let value = flag_value(rest, &mut index, command, "--run")?;
+                if !crate::formats::is_run_id(&value) {
+                    return Err(ParseError::Usage(format!(
+                        "{command}: --run must be `run-` + 16 lowercase hex, got {value:?}"
+                    )));
+                }
+                run = Some(value);
+            }
+            flag => {
+                return Err(ParseError::Usage(format!(
+                    "{command}: unknown flag {flag:?}; run `canter supervision --help`"
+                )));
+            }
+        }
+        index += 1;
+    }
+    let Some(run) = run else {
+        return Err(ParseError::Usage(format!(
+            "{command}: --run RUN_ID is required"
+        )));
+    };
+    Ok(Invocation {
+        command: command.to_string(),
+        json,
+        config_path,
+        plan: None,
+        config_action: None,
+        daemon_action: None,
+        service_action: None,
+        lane_action: None,
+        queue_action: None,
+        run_action: None,
+        supervision_action: Some(SupervisionAction::Status(SupervisionStatusArgs {
+            run,
+            socket,
+        })),
     })
 }
 
@@ -1368,6 +1484,9 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
     let mut harness_lanes: Option<i64> = None;
     let mut harness_lanes_set = false;
     let mut caps: Option<crate::lifecycle::ConcurrencyCaps> = None;
+    // Issue #95: supervision is disabled unless this submission explicitly
+    // authorizes it (`--supervise arm`).
+    let mut supervise = "disabled".to_string();
     let mut idempotency_key: Option<String> = None;
     let mut submission: Option<String> = None;
     let mut index = 0;
@@ -1518,6 +1637,19 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
                     per_harness,
                 });
             }
+            "--supervise" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--supervise")?;
+                supervise = match raw.as_str() {
+                    "arm" => "armed".to_string(),
+                    "off" => "disabled".to_string(),
+                    other => {
+                        return Err(ParseError::Usage(format!(
+                            "queue submit: --supervise takes arm|off, got {other:?} (supervision is \
+                             disabled unless explicitly authorized here, and arming only evaluates)"
+                        )));
+                    }
+                };
+            }
             "--idempotency-key" => {
                 let raw = flag_value(&rest, &mut index, "queue", "--idempotency-key")?;
                 if !crate::formats::is_idempotency_key(&raw) {
@@ -1580,6 +1712,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
             host_available,
             harness_lanes,
             caps,
+            supervise,
             idempotency_key,
             socket,
         })
@@ -1615,6 +1748,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
         lane_action: None,
         queue_action: Some(queue_action),
         run_action: None,
+        supervision_action: None,
     })
 }
 
@@ -1710,6 +1844,7 @@ fn parse_plan(args: &[&String]) -> Result<Invocation, ParseError> {
         lane_action: None,
         queue_action: None,
         run_action: None,
+        supervision_action: None,
     })
 }
 
@@ -1799,6 +1934,9 @@ pub fn render_envelope(command: &str, result: &CmdResult) -> String {
 pub fn execute(invocation: &Invocation) -> CmdResult {
     if let Some(action) = invocation.run_action.clone() {
         return execute_run(action, invocation);
+    }
+    if let Some(action) = invocation.supervision_action.clone() {
+        return execute_supervision(action, invocation);
     }
     if let Some(action) = invocation.queue_action.clone() {
         return execute_queue(action, invocation);
@@ -2638,16 +2776,17 @@ fn lane_error(code: &str, message: String, retryable: bool) -> CmdResult {
 }
 
 /// The closed read-only method allowlist of the lane/queue/run surface: lane
-/// preview/status, queue status and run status may issue ONLY these methods (plus the
+/// preview/status, queue status, run status and supervision status may issue ONLY these methods (plus the
 /// live-epoch read `queue submit` needs to present the state epoch). Every
 /// read-only call goes through [`read_only_call`], which fails closed
 /// (typed) on anything else — the guard that keeps the read-only commands
 /// free of mutations even if a call site is ever edited.
-const READ_ONLY_METHODS: [&str; 5] = [
+const READ_ONLY_METHODS: [&str; 6] = [
     "lane.replacement.status",
     "lane.checkpoint.status",
     "queue.status",
     "run.status",
+    "supervision.status",
     "state.epoch",
 ];
 
@@ -3279,6 +3418,11 @@ fn execute_queue_submit(args: &QueueSubmitArgs, invocation: &Invocation) -> CmdR
         args.harness_lanes,
         &grants,
         &resume,
+        Some(&crate::supervision::Authorization {
+            desired: args.supervise.clone(),
+            policy: crate::supervision::Policy::default(),
+        })
+        .filter(|authorization| authorization.desired == "armed"),
     );
     match client::call(&paths.socket_path, "queue.submit", Some(&params)) {
         Ok(result) => {
@@ -3425,6 +3569,31 @@ fn execute_run_status(args: &RunStatusArgs, invocation: &Invocation) -> CmdResul
         }
         Err(RpcError { code, message }) => {
             lane_error(&code, format!("run status: {message}"), false)
+        }
+    }
+}
+
+/// `supervision status`: read one run's versioned supervision status back
+/// read-only (issue #95) — class, reason, eligibility, freshness, last check
+/// and next eligible check. This read NEVER moves the meaningful-progress
+/// marker and never re-arms anything.
+fn execute_supervision(action: SupervisionAction, invocation: &Invocation) -> CmdResult {
+    match action {
+        SupervisionAction::Status(args) => {
+            let paths = match run_control_paths(args.socket.as_deref(), invocation) {
+                Ok(paths) => paths,
+                Err(result) => return result,
+            };
+            let params = crate::supervision::status_params(&args.run);
+            match read_only_call(&paths.socket_path, "supervision.status", Some(&params)) {
+                Ok(result) => {
+                    let human = crate::supervision::render_human(&result);
+                    ok_result(result, human)
+                }
+                Err(RpcError { code, message }) => {
+                    lane_error(&code, format!("supervision status: {message}"), false)
+                }
+            }
         }
     }
 }
@@ -3900,6 +4069,41 @@ paused (the safe boundary has been reached).
 EXIT CODES: 0 ok · 1 daemon/transport error · 2 usage · 4 refusal
 (refusal.run.*, refusal.state.epoch, refusal.grant.inactive,
 state.not_found, state.stale_resume, daemon refusals) · 5 config error.
+";
+
+const SUPERVISION_USAGE: &str = "\
+canter supervision status — the versioned supervision status of ONE run
+
+USAGE:
+    canter supervision status --run RUN_ID [--socket PATH] [--config PATH] \
+[--json]
+
+The scope is the RUN only: --run names exactly one durable supervised run
+record (`run-` + 16 hex).
+
+Supervision is a daemon-owned reconciliation driver (issue #95), NOT another
+agent and NOT a scheduler surface:
+  - it is DISABLED by default: a run is supervised only when an explicit
+    hf-supervision-authorization/v1 block was committed as part of its
+    queue submission, and the authorization binds the approved preview
+    digest (a drifted or unapproved plan is held and is never eligible);
+  - it evaluates and REPORTS: it classifies recorded evidence
+    (healthy / waiting-workers / waiting-CI / waiting-approval /
+    blocked-capacity / continuation-eligible / paused / completed /
+    needs-attention, or unknown/held when evidence is missing) and never
+    continues work, spawns, prompts, resumes a pause, authorizes a retry,
+    mutates Git or clears a hold;
+  - this status read is read-only and never resets the meaningful-progress
+    marker, never re-arms anything and never nudges the driver.
+
+status renders the hf-supervision/v1 document: the recorded authorization
+and policy, the class/reason and eligibility, freshness of the last check,
+the last check (time, class, reason, wake), the NEXT ELIGIBLE CHECK with its
+reason, the observed progress marker (with its age and source), the
+continuation report count and the folded pending wake.
+
+EXIT CODES: 0 ok · 1 daemon/transport error · 2 usage · 4 refusal
+(usage.supervision.*, state.not_found, daemon refusals) · 5 config error.
 ";
 
 /// Resolve the daemon socket override: the CLI flag wins over

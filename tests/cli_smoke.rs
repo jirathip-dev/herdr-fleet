@@ -122,6 +122,7 @@ fn every_documented_command_has_working_help() {
         "run resume",
         "run retry",
         "run status",
+        "supervision status",
         "board",
     ] {
         assert!(usage.contains(command), "USAGE must document `{command}`");
@@ -134,6 +135,7 @@ fn every_documented_command_has_working_help() {
         &["capabilities", "--help"][..],
         &["queue", "--help"][..],
         &["run", "--help"][..],
+        &["supervision", "--help"][..],
         &["board", "--help"][..],
     ] {
         let out = run(args);

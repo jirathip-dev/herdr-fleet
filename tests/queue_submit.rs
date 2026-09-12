@@ -193,6 +193,7 @@ fn params_doc(
         observations.1,
         &grants,
         &resume,
+        None,
     )
 }
 
@@ -875,6 +876,10 @@ fn plan_for(
                 },
             )
             .collect(),
+        // Issue #95: supervision stays disabled for these fixtures (the
+        // default); the supervision acceptance cases live in
+        // `tests/supervision.rs`.
+        supervision: None,
         at: "2026-09-06T02:00:00Z".to_string(),
     }
 }

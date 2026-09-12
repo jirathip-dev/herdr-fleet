@@ -201,13 +201,16 @@ impl Hub {
 
 /// Everything shared between connection threads.
 struct Shared {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     hub: Mutex<Hub>,
     log: DaemonLog,
     paths: DaemonPaths,
     pid: u32,
     started_at: String,
     running: AtomicBool,
+    /// The supervised reconciliation driver's wait/stop handle (issue #95):
+    /// handing it a wake never blocks and never touches the state guard.
+    supervisor: Arc<crate::supervision::SupervisorWake>,
 }
 
 impl Shared {
@@ -215,6 +218,12 @@ impl Shared {
         self.state
             .lock()
             .map_err(|_| "state mutex poisoned".to_string())
+    }
+
+    /// Ask the supervision driver to re-evaluate promptly. Coalesced: the
+    /// driver folds every wake into ONE pending trigger per run.
+    fn wake_supervisor(&self) {
+        self.supervisor.wake();
     }
 }
 
@@ -346,14 +355,24 @@ pub fn serve(paths: &DaemonPaths) -> Result<(), DaemonError> {
         .event_bounds()
         .map_err(|err| daemon_error("daemon.state", format!("{}: {}", err.code, err.message)))?;
     state.put_daemon_lease(std::process::id(), &started_at)?;
+    let state = Arc::new(Mutex::new(state));
+    // Issue #95: the supervised reconciliation driver. It starts after every
+    // boot reconciliation above (schedule recovery, claim reconciliation,
+    // pause boundaries) and runs ONE fresh snapshot reconciliation per armed
+    // run before it waits for semantic wakes or its bounded timer deadline.
+    let supervisor = crate::supervision::start(
+        Arc::clone(&state),
+        crate::supervision::SupervisorOptions::default(),
+    );
     let shared = Arc::new(Shared {
-        state: Mutex::new(state),
+        state,
         hub: Mutex::new(Hub::new(max_seq.unwrap_or(0))),
         log,
         paths: paths.clone(),
         pid: std::process::id(),
         started_at,
         running: AtomicBool::new(true),
+        supervisor: supervisor.wake_handle(),
     });
     shared.log.write(
         "info",
@@ -366,6 +385,16 @@ pub fn serve(paths: &DaemonPaths) -> Result<(), DaemonError> {
     );
 
     let result = serve_loop(&shared, &listener);
+    // Shutdown: cancel and JOIN the supervision driver before the lease is
+    // dropped, so no reconciliation can journal into a closing daemon.
+    shared.supervisor.signal_stop();
+    let mut supervisor = supervisor;
+    let joined = supervisor.join();
+    shared.log.write(
+        "info",
+        "daemon.stop",
+        &format!("supervision driver joined: {joined}"),
+    );
     // Graceful cleanup: drop the lease and unlink the socket so the next
     // start classifies it Absent rather than Stale.
     let state = shared
@@ -570,6 +599,7 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "run.resume" => method_run_resume(shared, request),
         "run.retry" => method_run_retry(shared, request),
         "run.status" => method_run_status(shared, request),
+        "supervision.status" => method_supervision_status(shared, request),
         "schedules.list" => method_schedules(shared, request),
         "schedules.create" => method_schedule_create(shared, request),
         "schedules.pause" => method_schedule_pause(shared, request),
@@ -2499,6 +2529,15 @@ fn method_queue_submit(shared: &Arc<Shared>, request: &Request) -> String {
         request_line,
         admission_caps: material.caps,
         harness_lanes: material.harness_lanes,
+        // Issue #95: the supervision authorization rides with the approval;
+        // absent means supervision stays disabled for every admitted run.
+        supervision: material.supervision.as_ref().map(|authorization| {
+            crate::state::SupervisionAuthorizationPlan {
+                desired: authorization.desired.clone(),
+                check_interval_secs: authorization.policy.check_interval_secs,
+                progress_timeout_secs: authorization.policy.progress_timeout_secs,
+            }
+        }),
         items: revalidated
             .items
             .iter()
@@ -2972,6 +3011,82 @@ fn method_run_status(shared: &Arc<Shared>, request: &Request) -> String {
             ),
             Err(err) => err_response(&request.id, err.code, err.message),
         },
+        Err(message) => err_response(&request.id, "state.unavailable", message),
+    }
+}
+
+/// `supervision.status`: read the versioned supervision status of exactly
+/// ONE run back read-only — the recorded authorization, the class/reason the
+/// driver last recorded, freshness, the last check, the next eligible check
+/// with its reason, the observed meaningful-progress marker and the folded
+/// pending wake. No claim, no journal write, and NO marker movement: a read
+/// (or a rendered status) is never progress (issue #95 AC2/AC7).
+fn method_supervision_status(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "supervision.status requires params.instance_id (run- + 16 hex)",
+        );
+    };
+    let instance_id = match crate::supervision::parse_status_params(params) {
+        Ok(instance_id) => instance_id,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    match shared.lock_state() {
+        Ok(state) => {
+            let row = match state.supervision_by_id(&instance_id) {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    return err_response(
+                        &request.id,
+                        "state.not_found",
+                        format!(
+                            "no supervision exists for run {instance_id:?} (supervision is \
+                             disabled by default and is armed only by an explicit authorization \
+                             committed with the run's submission)"
+                        ),
+                    );
+                }
+                Err(err) => return err_response(&request.id, err.code, err.message),
+            };
+            let evidence = match state.supervision_evidence(&instance_id) {
+                Ok(Some(evidence)) => evidence,
+                Ok(None) => {
+                    return err_response(
+                        &request.id,
+                        "state.not_found",
+                        format!("run {instance_id:?} no longer exists"),
+                    );
+                }
+                Err(err) => return err_response(&request.id, err.code, err.message),
+            };
+            let trigger = match state.supervision_trigger(&instance_id) {
+                Ok(trigger) => trigger,
+                Err(err) => return err_response(&request.id, err.code, err.message),
+            };
+            let now_unix = time::unix_now();
+            let policy = crate::supervision::Policy {
+                check_interval_secs: row.check_interval_secs,
+                progress_timeout_secs: row.progress_timeout_secs,
+            };
+            let verdict = crate::supervision::classify(
+                &evidence,
+                &row.authorization_digest,
+                &policy,
+                now_unix,
+            );
+            ok_response(
+                &request.id,
+                crate::supervision::status_doc(
+                    &row,
+                    &evidence,
+                    trigger.as_ref(),
+                    &verdict,
+                    now_unix,
+                ),
+            )
+        }
         Err(message) => err_response(&request.id, "state.unavailable", message),
     }
 }
@@ -5612,10 +5727,15 @@ fn journal_mutation_on(state: &State, request: &Request, action: &str, target: &
 }
 
 /// Publish journal events appended by one state change (called after the
-/// state guard is dropped; see the hub locking rule).
+/// state guard is dropped; see the hub locking rule). A committed mutation is
+/// also a SEMANTIC wake for the supervision driver (issue #95): the driver
+/// folds it from the durable event stream into the ONE pending trigger of
+/// each affected run, so this only has to say "look now" — it never blocks
+/// and it never touches the state guard.
 fn publish_after_state_change(shared: &Arc<Shared>, audit: Option<AuditRow>) {
     let seq = audit.map(|audit| audit.event_seq);
     publish_events(shared);
+    shared.wake_supervisor();
     let _ = seq; // the event seq is carried by the row itself
 }
 

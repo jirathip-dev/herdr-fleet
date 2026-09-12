@@ -30,7 +30,7 @@ use crate::time;
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The schema version this binary understands (also `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// Bounded-retention defaults (rows kept besides the chain genesis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -515,6 +515,11 @@ pub struct QueueSubmissionPlan {
     pub harness_lanes: Option<i64>,
     /// Presented membership items in classified order.
     pub items: Vec<QueueSubmissionItemPlan>,
+    /// The explicit supervision authorization presented with this submission
+    /// (issue #95). `None` = supervision disabled for the admitted runs: the
+    /// default. The authorization is committed in the SAME transaction as
+    /// the runs it names.
+    pub supervision: Option<SupervisionAuthorizationPlan>,
     /// Committed at (RFC3339 UTC).
     pub at: String,
 }
@@ -1054,6 +1059,10 @@ impl State {
         if user_version == M0010_APPLIES_FROM {
             run_m0010(&mut conn)?;
             user_version = M0010_APPLIES_TO;
+        }
+        if user_version == M0011_APPLIES_FROM {
+            run_m0011(&mut conn)?;
+            user_version = M0011_APPLIES_TO;
         }
         match user_version {
             v if v == SCHEMA_VERSION => {
@@ -3036,6 +3045,33 @@ impl State {
                 ],
             )
             .map_err(|err| StateError::from_sqlite("submit_queue_run: item", err))?;
+        }
+        // Issue #95: the explicit supervision authorization commits in the
+        // SAME transaction as the runs it names. Absent = supervision stays
+        // disabled for every admitted run (the default), and an unapproved
+        // plan can never be supervised later because the authorization binds
+        // the approved digest committed right here.
+        if let Some(supervision) = &plan.supervision {
+            for item in &items {
+                let Some(instance_id) = item.instance_id.as_deref() else {
+                    continue;
+                };
+                arm_supervision_in_tx(
+                    &tx,
+                    instance_id,
+                    supervision,
+                    &plan.digest,
+                    &plan.boundary_phase,
+                    plan.state_epoch,
+                    &plan.at,
+                )
+                .map_err(|err| {
+                    state_error(
+                        err.code,
+                        format!("supervision authorization refused: {}", err.message),
+                    )
+                })?;
+            }
         }
         tx.commit()
             .map_err(|err| StateError::from_sqlite("submit_queue_run: commit", err))?;
@@ -8858,9 +8894,25 @@ const M0010_ID: &str = "m0010_run_controls_v10";
 const M0010_APPLIES_FROM: i64 = 9;
 const M0010_APPLIES_TO: i64 = 10;
 
+/// Migration m0011 (issue #95: supervised reconciliation). Purely additive:
+/// three tables — the durable supervision authorization of one run
+/// (`supervisions`: desired state, owner/run generation, the approved-plan
+/// binding, the observed meaningful-progress marker, last/next check with
+/// their reasons, the bounded policy and the continuation report counters),
+/// the ONE pending trigger slot per run (`supervision_triggers`: every
+/// semantic wake folds into this row, which is what makes duplicate,
+/// out-of-order and concurrent timer/event wakes coalesce into one
+/// reconciliation) and the one-row driver cursor (`supervision_runtime`:
+/// the event cursor plus the last tick time). No existing table or row is
+/// touched, so stored grants, instances, lane records, queue submissions and
+/// run controls are never reinterpreted.
+const M0011_ID: &str = "m0011_supervision_v11";
+const M0011_APPLIES_FROM: i64 = 10;
+const M0011_APPLIES_TO: i64 = 11;
+
 /// Ordered migration chain (id, applies_from, applies_to). The runner in
 /// [`State::open`] applies every pending migration before serving.
-const MIGRATIONS: [(&str, i64, i64); 10] = [
+const MIGRATIONS: [(&str, i64, i64); 11] = [
     (M0001_ID, M0001_APPLIES_FROM, M0001_APPLIES_TO),
     (M0002_ID, M0002_APPLIES_FROM, M0002_APPLIES_TO),
     (M0003_ID, M0003_APPLIES_FROM, M0003_APPLIES_TO),
@@ -8871,16 +8923,17 @@ const MIGRATIONS: [(&str, i64, i64); 10] = [
     (M0008_ID, M0008_APPLIES_FROM, M0008_APPLIES_TO),
     (M0009_ID, M0009_APPLIES_FROM, M0009_APPLIES_TO),
     (M0010_ID, M0010_APPLIES_FROM, M0010_APPLIES_TO),
+    (M0011_ID, M0011_APPLIES_FROM, M0011_APPLIES_TO),
 ];
 
-/// Ordered migration-chain identifiers (`m0001`..`m0010`), exposed for the
+/// Ordered migration-chain identifiers (`m0001`..`m0011`), exposed for the
 /// release provenance chain (issue #10): `canter --version` prints
 /// them so a release archive's provenance record can bind the exact
 /// state-schema migration chain of the binary it ships.
 pub fn migration_chain_ids() -> &'static [&'static str] {
     const IDS: [&str; MIGRATIONS.len()] = [
         M0001_ID, M0002_ID, M0003_ID, M0004_ID, M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID,
-        M0010_ID,
+        M0010_ID, M0011_ID,
     ];
     &IDS
 }
@@ -10222,6 +10275,1232 @@ fn run_m0010(conn: &mut Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Supervision (issue #95): durable authorization, ONE coalesced wake slot per
+// run, the recorded-evidence snapshot and the bounded event fold.
+// ---------------------------------------------------------------------------
+
+/// One durable supervision authorization of one run (issue #95). Written
+/// ONLY by an explicit `hf-supervision-authorization/v1` block presented as
+/// part of a queue submission, in the same transaction that commits the
+/// submission: supervision is disabled by default, and a run without this
+/// row is never evaluated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisionRow {
+    /// The supervised run identity.
+    pub instance_id: String,
+    /// Supervision id (`sv_` + 16 hex, derived from the run and its owner
+    /// generation).
+    pub supervision_id: String,
+    /// Desired supervision (`armed` | `disabled`; closed set).
+    pub desired: String,
+    /// Ownership generation: 1 for the first authorization of the run, N+1
+    /// for every explicit re-authorization (a generation the driver binds).
+    pub owner_generation: i64,
+    /// Run generation: the run's state epoch at authorization time.
+    pub run_generation: i64,
+    /// The approved preview digest the authorization bound.
+    pub authorization_digest: String,
+    /// The approved completion boundary phase.
+    pub approved_boundary: String,
+    /// Bounded timer fallback cadence (seconds).
+    pub check_interval_secs: i64,
+    /// Meaningful-progress window (seconds).
+    pub progress_timeout_secs: i64,
+    /// The observed meaningful-progress marker (sha256 hex; '' until the
+    /// first reconciliation observed evidence).
+    pub progress_marker: String,
+    /// When the marker was observed (RFC3339 UTC; '' until then).
+    pub progress_at: String,
+    /// The recorded evidence family that moved the marker.
+    pub progress_source: String,
+    /// Reconciliations performed (the coalescing observable).
+    pub checks: i64,
+    /// Continuation reports opened (one per absence window, never one per
+    /// check).
+    pub continuation_reports: i64,
+    /// Whether an absence window is currently open.
+    pub continuation_open: bool,
+    /// When the open absence window started ('' when none).
+    pub continuation_since: String,
+    /// Last check time (RFC3339 UTC; '' until the first check).
+    pub last_check_at: String,
+    /// Last check class (closed classification vocabulary).
+    pub last_check_class: String,
+    /// Last check reason (stable `supervision.*` code).
+    pub last_check_reason: String,
+    /// Last check wake class (closed wake vocabulary).
+    pub last_check_trigger: String,
+    /// Next eligible check (RFC3339 UTC).
+    pub next_check_at: String,
+    /// Next eligible check as Unix seconds (the driver's comparison key).
+    pub next_check_unix: i64,
+    /// Why the next check is eligible (stable reason code).
+    pub next_check_reason: String,
+    /// Authorized at (RFC3339 UTC).
+    pub armed_at: String,
+    /// Last row update (RFC3339 UTC).
+    pub updated_at: String,
+}
+
+/// The ONE pending trigger slot of one supervised run. Every semantic wake
+/// folds here; `trigger_seq` is the highest folded event seq and `folded`
+/// counts distinct wakes in the current window, so duplicate and
+/// out-of-order events can never open a second reconciliation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisionTriggerRow {
+    /// The supervised run identity.
+    pub instance_id: String,
+    /// The folded wake class (closed wake vocabulary).
+    pub trigger: String,
+    /// Highest folded event seq.
+    pub trigger_seq: i64,
+    /// Distinct wakes folded into this window.
+    pub folded: i64,
+    /// When the window opened (RFC3339 UTC).
+    pub first_at: String,
+    /// When the window was last refreshed (RFC3339 UTC).
+    pub last_at: String,
+}
+
+/// The durable supervision driver cursor (one row).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisionRuntime {
+    /// Highest event seq folded by the driver.
+    pub event_cursor: i64,
+    /// Last tick time (RFC3339 UTC).
+    pub last_tick_at: String,
+}
+
+/// The recorded-evidence snapshot of one supervised run: everything the
+/// classification reads, re-read from durable rows under ONE guard. Nothing
+/// here is inferred from activity or from the caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisionEvidence {
+    /// The durable run row.
+    pub run: InstanceRow,
+    /// The live owner run recorded for the run's work item, when one is.
+    pub ownership_instance: Option<String>,
+    /// The committed submission that admitted the run, when one is.
+    pub submission_id: Option<String>,
+    /// That submission's approved preview digest.
+    pub submission_digest: Option<String>,
+    /// The bound step spine as `(step id, step kind)` in spine order.
+    pub steps: Vec<(String, String)>,
+    /// Recorded step attempts as `(step, status, error code)` in claim order.
+    pub attempts: Vec<(String, String, String)>,
+    /// Every durable retry authorization of the run (the retry cursor and
+    /// its timing; never edited by supervision).
+    pub retries: Vec<RunRetryRow>,
+    /// Recorded review evidence as `(evidence id, verdict, created_at)`,
+    /// newest first.
+    pub verdicts: Vec<(String, String, String)>,
+    /// The step of the dispatch currently in flight, when one is.
+    pub in_flight: Option<String>,
+    /// The stored meaningful-progress observation time ('' when none).
+    pub progress_at: String,
+}
+
+/// The plan of one committed supervision check (built by the driver from the
+/// snapshot it read; the transaction re-reads the row and fences the wake
+/// slot on `consumed_seq`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisionCheckPlan {
+    /// The supervised run identity.
+    pub instance_id: String,
+    /// The clock the driver used (Unix seconds).
+    pub now_unix: i64,
+    /// The clock the driver used (RFC3339 UTC).
+    pub at: String,
+    /// The classification class (closed vocabulary member).
+    pub class: &'static str,
+    /// The classification reason code.
+    pub reason: &'static str,
+    /// Whether the run is reported continuation-eligible.
+    pub eligible: bool,
+    /// The consumed wake class (closed wake vocabulary).
+    pub trigger: &'static str,
+    /// The exact trigger seq the driver read (`0` when none was pending).
+    pub consumed_seq: i64,
+    /// Consume the whole pending slot regardless of seq (a fresh snapshot
+    /// check supersedes every pending wake).
+    pub consumed_all: bool,
+    /// The observed meaningful-progress marker.
+    pub marker: String,
+    /// The recorded evidence family that moved the marker.
+    pub marker_source: &'static str,
+    /// Next eligible check (Unix seconds).
+    pub next_check_unix: i64,
+    /// Why the next check is eligible.
+    pub next_check_reason: &'static str,
+}
+
+/// The outcome of one bounded event-fold pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisionFold {
+    /// The cursor after the pass.
+    pub cursor: i64,
+    /// Whether event retention moved past the cursor (or an audit row a
+    /// folded event named was pruned): every armed run then gets a fresh
+    /// snapshot reconciliation.
+    pub lost: bool,
+    /// Distinct wakes folded by this pass.
+    pub folded: usize,
+    /// The runs whose pending slot was refreshed.
+    pub runs: Vec<String>,
+}
+
+/// The plan of one supervision authorization committed with a submission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisionAuthorizationPlan {
+    /// Desired supervision (`armed` | `disabled`).
+    pub desired: String,
+    /// Bounded timer fallback cadence (seconds).
+    pub check_interval_secs: i64,
+    /// Meaningful-progress window (seconds).
+    pub progress_timeout_secs: i64,
+}
+
+/// One supervision-write outcome (the row plus whether it was a duplicate).
+fn supervision_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<SupervisionRow> {
+    Ok(SupervisionRow {
+        instance_id: row.get(0)?,
+        supervision_id: row.get(1)?,
+        desired: row.get(2)?,
+        owner_generation: row.get(3)?,
+        run_generation: row.get(4)?,
+        authorization_digest: row.get(5)?,
+        approved_boundary: row.get(6)?,
+        check_interval_secs: row.get(7)?,
+        progress_timeout_secs: row.get(8)?,
+        progress_marker: row.get(9)?,
+        progress_at: row.get(10)?,
+        progress_source: row.get(11)?,
+        checks: row.get(12)?,
+        continuation_reports: row.get(13)?,
+        continuation_open: row.get::<_, i64>(14)? != 0,
+        continuation_since: row.get(15)?,
+        last_check_at: row.get(16)?,
+        last_check_class: row.get(17)?,
+        last_check_reason: row.get(18)?,
+        last_check_trigger: row.get(19)?,
+        next_check_at: row.get(20)?,
+        next_check_unix: row.get(21)?,
+        next_check_reason: row.get(22)?,
+        armed_at: row.get(23)?,
+        updated_at: row.get(24)?,
+    })
+}
+
+/// The shared supervision-row projection.
+fn supervision_select_sql() -> &'static str {
+    "SELECT instance_id, supervision_id, desired, owner_generation, run_generation,
+            authorization_digest, approved_boundary, check_interval_secs,
+            progress_timeout_secs, progress_marker, progress_at, progress_source, checks,
+            continuation_reports, continuation_open, continuation_since, last_check_at,
+            last_check_class, last_check_reason, last_check_trigger, next_check_at,
+            next_check_unix, next_check_reason, armed_at, updated_at
+       FROM supervisions"
+}
+
+/// The deterministic supervision id: `sv_` + first 16 hex of the sha256 over
+/// the domain-separated `(run, owner generation)` pair, so a re-authorization
+/// and a restart can never invent a second id for one generation.
+pub fn supervision_id_for(instance_id: &str, owner_generation: i64) -> String {
+    let preimage = format!("hf-supervision/v1|{instance_id}|{owner_generation}");
+    format!("sv_{}", &sha256_hex(preimage.as_bytes())[..16])
+}
+
+/// The wake class of one journal action: review evidence, hosted checks,
+/// run controls, or a generic semantic completion.
+fn supervision_wake_class(action: &str) -> &'static str {
+    let kind = action.strip_prefix("mutate.").unwrap_or("");
+    match kind {
+        "review_evidence" => "review",
+        "hosted_check" | "post_merge_verify" => "ci",
+        "run.pause" | "run.resume" | "run.retry" => "control",
+        _ => "completion",
+    }
+}
+
+/// The run identity named by one audit target, when one is named. Apply
+/// targets read `repository:run-…:step`; run controls read `run:run-…`.
+fn supervision_run_of_target(target: &str) -> Option<&str> {
+    target
+        .split(':')
+        .find(|segment| crate::formats::is_run_id(segment))
+}
+
+/// One recorded retry row as the classification reads it.
+fn retry_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRetryRow> {
+    Ok(RunRetryRow {
+        retry_id: row.get(0)?,
+        instance_id: row.get(1)?,
+        step_id: row.get(2)?,
+        attempt: row.get(3)?,
+        authorized_at: row.get(4)?,
+        consumed_at: row.get(5)?,
+        consumed_key: row.get(6)?,
+    })
+}
+
+/// Arm (or re-arm) supervision inside the CALLER'S transaction: the queue
+/// submission transaction commits the authorization together with the runs it
+/// names, and a caller that already holds the state guard must use this form
+/// (the std guard is not reentrant, so a lock-taking helper here would
+/// self-deadlock the submission).
+#[allow(clippy::too_many_arguments)]
+fn arm_supervision_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    instance_id: &str,
+    plan: &SupervisionAuthorizationPlan,
+    authorization_digest: &str,
+    approved_boundary: &str,
+    run_generation: i64,
+    at: &str,
+) -> Result<SupervisionRow, StateError> {
+    if !crate::formats::is_run_id(instance_id) {
+        return Err(state_error(
+            "state.supervision_invalid",
+            format!("supervision addresses ONE run identity; {instance_id:?} is not one"),
+        ));
+    }
+    if !crate::supervision::DESIRED.contains(&plan.desired.as_str()) {
+        return Err(state_error(
+            "state.supervision_invalid",
+            format!(
+                "desired supervision {:?} is outside the closed set",
+                plan.desired
+            ),
+        ));
+    }
+    let existing: Option<i64> = tx
+        .query_row(
+            "SELECT owner_generation FROM supervisions WHERE instance_id = ?1",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("arm_supervision: existing", err))?;
+    let owner_generation = existing.map(|value| value + 1).unwrap_or(1);
+    let supervision_id = supervision_id_for(instance_id, owner_generation);
+    tx.execute(
+        "INSERT INTO supervisions (instance_id, supervision_id, desired, owner_generation,
+                run_generation, authorization_digest, approved_boundary,
+                check_interval_secs, progress_timeout_secs, progress_marker, progress_at,
+                progress_source, checks, continuation_reports, continuation_open,
+                continuation_since, last_check_at, last_check_class, last_check_reason,
+                last_check_trigger, next_check_at, next_check_unix, next_check_reason,
+                armed_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '', '', '', 0, 0, 0, '', '', '', '',
+                 '', '', 0, '', ?10, ?10)
+         ON CONFLICT(instance_id) DO UPDATE SET
+                supervision_id = excluded.supervision_id,
+                desired = excluded.desired,
+                owner_generation = excluded.owner_generation,
+                run_generation = excluded.run_generation,
+                authorization_digest = excluded.authorization_digest,
+                approved_boundary = excluded.approved_boundary,
+                check_interval_secs = excluded.check_interval_secs,
+                progress_timeout_secs = excluded.progress_timeout_secs,
+                next_check_at = '',
+                next_check_unix = 0,
+                next_check_reason = '',
+                updated_at = excluded.updated_at",
+        params![
+            instance_id,
+            supervision_id,
+            plan.desired,
+            owner_generation,
+            run_generation,
+            authorization_digest,
+            approved_boundary,
+            plan.check_interval_secs,
+            plan.progress_timeout_secs,
+            at
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("arm_supervision: upsert", err))?;
+    let row: Option<SupervisionRow> = tx
+        .query_row(
+            format!("{} WHERE instance_id = ?1", supervision_select_sql()).as_str(),
+            params![instance_id],
+            supervision_row_from,
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("arm_supervision: reread", err))?;
+    row.ok_or_else(|| state_error("state.supervision_invalid", "supervision row missing"))
+}
+
+impl State {
+    /// Arm (or explicitly disable) supervision for ONE run. Called by the
+    /// queue submission transaction with the authorization the submission
+    /// presented; a re-authorization increments the ownership generation and
+    /// keeps the observed progress observation (a re-arm is not progress).
+    #[allow(clippy::too_many_arguments)]
+    pub fn arm_supervision(
+        &self,
+        instance_id: &str,
+        plan: &SupervisionAuthorizationPlan,
+        authorization_digest: &str,
+        approved_boundary: &str,
+        run_generation: i64,
+        at: &str,
+    ) -> Result<SupervisionRow, StateError> {
+        let outcome = self.arm_supervision_inner(
+            instance_id,
+            plan,
+            authorization_digest,
+            approved_boundary,
+            run_generation,
+            at,
+        );
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn arm_supervision_inner(
+        &self,
+        instance_id: &str,
+        plan: &SupervisionAuthorizationPlan,
+        authorization_digest: &str,
+        approved_boundary: &str,
+        run_generation: i64,
+        at: &str,
+    ) -> Result<SupervisionRow, StateError> {
+        self.ensure_writable()?;
+        if !crate::formats::is_run_id(instance_id) {
+            return Err(state_error(
+                "state.supervision_invalid",
+                format!("supervision addresses ONE run identity; {instance_id:?} is not one"),
+            ));
+        }
+        if !crate::supervision::DESIRED.contains(&plan.desired.as_str()) {
+            return Err(state_error(
+                "state.supervision_invalid",
+                format!(
+                    "desired supervision {:?} is outside the closed set",
+                    plan.desired
+                ),
+            ));
+        }
+        let mut conn = self.lock("arm_supervision")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("arm_supervision: begin", err))?;
+        arm_supervision_in_tx(
+            &tx,
+            instance_id,
+            plan,
+            authorization_digest,
+            approved_boundary,
+            run_generation,
+            at,
+        )?;
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("arm_supervision: commit", err))?;
+        self.supervision_row_locked(&conn, instance_id)?
+            .ok_or_else(|| state_error("state.supervision_invalid", "supervision row missing"))
+    }
+
+    /// One supervision row by run identity.
+    pub fn supervision_by_id(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<SupervisionRow>, StateError> {
+        let conn = self.lock("supervision_by_id")?;
+        self.supervision_row_locked(&conn, instance_id)
+    }
+
+    fn supervision_row_locked(
+        &self,
+        conn: &Connection,
+        instance_id: &str,
+    ) -> Result<Option<SupervisionRow>, StateError> {
+        conn.query_row(
+            format!("{} WHERE instance_id = ?1", supervision_select_sql()).as_str(),
+            params![instance_id],
+            supervision_row_from,
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("supervision_by_id: read", err))
+    }
+
+    /// Every supervision row, ordered by run identity.
+    pub fn supervision_rows(&self) -> Result<Vec<SupervisionRow>, StateError> {
+        let conn = self.lock("supervision_rows")?;
+        let mut statement = conn
+            .prepare(format!("{} ORDER BY instance_id", supervision_select_sql()).as_str())
+            .map_err(|err| StateError::from_sqlite("supervision_rows: prepare", err))?;
+        let rows = statement
+            .query_map([], supervision_row_from)
+            .map_err(|err| StateError::from_sqlite("supervision_rows: query", err))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|err| StateError::from_sqlite("supervision_rows: row", err))?);
+        }
+        Ok(out)
+    }
+
+    /// Fold ONE semantic wake into the run's single pending slot. A wake
+    /// whose seq already IS the slot's seq is a duplicate and changes
+    /// nothing; an older (out-of-order) wake folds without lowering the
+    /// slot's seq. Returns whether the slot changed.
+    pub fn record_supervision_trigger(
+        &self,
+        instance_id: &str,
+        trigger: &str,
+        seq: i64,
+        at: &str,
+    ) -> Result<bool, StateError> {
+        let outcome = self.record_supervision_trigger_inner(instance_id, trigger, seq, at);
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn record_supervision_trigger_inner(
+        &self,
+        instance_id: &str,
+        trigger: &str,
+        seq: i64,
+        at: &str,
+    ) -> Result<bool, StateError> {
+        self.ensure_writable()?;
+        let conn = self.lock("record_supervision_trigger")?;
+        Self::fold_trigger_locked(&conn, instance_id, trigger, seq, at)
+    }
+
+    /// Fold one wake inside an existing guard/transaction.
+    fn fold_trigger_locked(
+        conn: &Connection,
+        instance_id: &str,
+        trigger: &str,
+        seq: i64,
+        at: &str,
+    ) -> Result<bool, StateError> {
+        let existing: Option<(String, i64, i64)> = conn
+            .query_row(
+                "SELECT trigger, trigger_seq, folded FROM supervision_triggers
+                  WHERE instance_id = ?1",
+                params![instance_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("record_supervision_trigger: read", err))?;
+        match existing {
+            Some((_, current_seq, _)) if current_seq == seq => Ok(false),
+            Some((current_trigger, current_seq, folded)) => {
+                let (label, next_seq) = if seq > current_seq {
+                    (trigger.to_string(), seq)
+                } else {
+                    (current_trigger, current_seq)
+                };
+                conn.execute(
+                    "UPDATE supervision_triggers
+                        SET trigger = ?2, trigger_seq = ?3, folded = ?4, last_at = ?5
+                      WHERE instance_id = ?1",
+                    params![instance_id, label, next_seq, folded + 1, at],
+                )
+                .map_err(|err| {
+                    StateError::from_sqlite("record_supervision_trigger: update", err)
+                })?;
+                Ok(true)
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO supervision_triggers (instance_id, trigger, trigger_seq,
+                            folded, first_at, last_at)
+                     VALUES (?1, ?2, ?3, 1, ?4, ?4)",
+                    params![instance_id, trigger, seq, at],
+                )
+                .map_err(|err| {
+                    StateError::from_sqlite("record_supervision_trigger: insert", err)
+                })?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// The pending wake slot of one run.
+    pub fn supervision_trigger(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<SupervisionTriggerRow>, StateError> {
+        let conn = self.lock("supervision_trigger")?;
+        conn.query_row(
+            "SELECT instance_id, trigger, trigger_seq, folded, first_at, last_at
+               FROM supervision_triggers WHERE instance_id = ?1",
+            params![instance_id],
+            |row| {
+                Ok(SupervisionTriggerRow {
+                    instance_id: row.get(0)?,
+                    trigger: row.get(1)?,
+                    trigger_seq: row.get(2)?,
+                    folded: row.get(3)?,
+                    first_at: row.get(4)?,
+                    last_at: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("supervision_trigger: read", err))
+    }
+
+    /// The coalesced due set: every ARMED run that has a pending wake OR an
+    /// elapsed (or never scheduled) next eligible check — ONE entry per run,
+    /// however many wake sources agree. A disabled or absent supervision is
+    /// never evaluated.
+    pub fn supervision_due_runs(&self, now_unix: i64) -> Result<Vec<String>, StateError> {
+        let conn = self.lock("supervision_due_runs")?;
+        let mut statement = conn
+            .prepare(
+                "SELECT s.instance_id
+                   FROM supervisions s
+                   LEFT JOIN supervision_triggers t ON t.instance_id = s.instance_id
+                  WHERE s.desired = 'armed'
+                    AND (t.instance_id IS NOT NULL
+                         OR s.next_check_unix = 0
+                         OR s.next_check_unix <= ?1)
+                  ORDER BY s.instance_id",
+            )
+            .map_err(|err| StateError::from_sqlite("supervision_due_runs: prepare", err))?;
+        let rows = statement
+            .query_map(params![now_unix], |row| row.get::<_, String>(0))
+            .map_err(|err| StateError::from_sqlite("supervision_due_runs: query", err))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|err| StateError::from_sqlite("supervision_due_runs: row", err))?);
+        }
+        Ok(out)
+    }
+
+    /// Every ARMED run, ordered by run identity: the boot sweep reconciles
+    /// each exactly once (a fresh snapshot), so a restart after any number of
+    /// missed windows still yields one check per run, never a catch-up storm.
+    pub fn supervision_armed_runs(&self) -> Result<Vec<String>, StateError> {
+        let conn = self.lock("supervision_armed_runs")?;
+        let mut statement = conn
+            .prepare(
+                "SELECT instance_id FROM supervisions WHERE desired = 'armed' ORDER BY instance_id",
+            )
+            .map_err(|err| StateError::from_sqlite("supervision_armed_runs: prepare", err))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| StateError::from_sqlite("supervision_armed_runs: query", err))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(
+                row.map_err(|err| StateError::from_sqlite("supervision_armed_runs: row", err))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Seconds until the nearest scheduled check among armed runs (`None`
+    /// when nothing is scheduled).
+    pub fn supervision_next_due_in(&self, now_unix: i64) -> Result<Option<i64>, StateError> {
+        let conn = self.lock("supervision_next_due_in")?;
+        let next: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(next_check_unix) FROM supervisions
+                  WHERE desired = 'armed' AND next_check_unix > 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("supervision_next_due_in: read", err))?
+            .flatten();
+        Ok(next.map(|unix| (unix - now_unix).max(0)))
+    }
+
+    /// The recorded-evidence snapshot of one supervised run, read under ONE
+    /// guard. `None` when no supervision row exists (a run that was never
+    /// authorized is never evaluated).
+    pub fn supervision_evidence(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<SupervisionEvidence>, StateError> {
+        let conn = self.lock("supervision_evidence")?;
+        let row = match self.supervision_row_locked(&conn, instance_id)? {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+        let run: Option<InstanceRow> = conn
+            .query_row(
+                format!("{} WHERE instance_id = ?1", instance_select_sql()).as_str(),
+                params![instance_id],
+                instance_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("supervision_evidence: run", err))?;
+        let Some(run) = run else {
+            return Ok(None);
+        };
+        let mut statement = conn
+            .prepare(
+                "SELECT i.submission_id, s.digest, s.request_line
+                   FROM queue_submission_items i
+                   JOIN queue_submissions s ON s.submission_id = i.submission_id
+                  WHERE i.instance_id = ?1 AND i.status = 'admitted'",
+            )
+            .map_err(|err| StateError::from_sqlite("supervision_evidence: submission", err))?;
+        let submission: Option<(String, String, String)> = statement
+            .query_row(params![instance_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()
+            .map_err(|err| StateError::from_sqlite("supervision_evidence: submission row", err))?;
+        drop(statement);
+        let (submission_id, submission_digest, steps) = match submission {
+            Some((submission_id, digest, request_line)) => (
+                Some(submission_id),
+                Some(digest),
+                bound_steps_of(&request_line),
+            ),
+            None => (None, None, Vec::new()),
+        };
+        let ownership_instance: Option<String> = conn
+            .query_row(
+                "SELECT instance_id FROM queue_ownership WHERE instance_id = ?1",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("supervision_evidence: ownership", err))?;
+        let mut statement = conn
+            .prepare(
+                "SELECT retry_id, instance_id, step_id, attempt, authorized_at, consumed_at,
+                        consumed_key
+                   FROM run_retries WHERE instance_id = ?1 ORDER BY step_id, attempt",
+            )
+            .map_err(|err| StateError::from_sqlite("supervision_evidence: retries", err))?;
+        let rows = statement
+            .query_map(params![instance_id], retry_row_from)
+            .map_err(|err| StateError::from_sqlite("supervision_evidence: retries query", err))?;
+        let mut retries = Vec::new();
+        for row in rows {
+            retries.push(
+                row.map_err(|err| StateError::from_sqlite("supervision_evidence: retry", err))?,
+            );
+        }
+        drop(statement);
+        let attempts = self.run_step_attempts_with_codes(&conn, instance_id)?;
+        let mut statement = conn
+            .prepare(
+                "SELECT evidence_id, verdict, created_at FROM evidence
+                  WHERE instance_id = ?1 ORDER BY created_at DESC, evidence_id DESC",
+            )
+            .map_err(|err| StateError::from_sqlite("supervision_evidence: verdicts", err))?;
+        let rows = statement
+            .query_map(params![instance_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|err| StateError::from_sqlite("supervision_evidence: verdicts query", err))?;
+        let mut verdicts = Vec::new();
+        for row in rows {
+            verdicts.push(
+                row.map_err(|err| StateError::from_sqlite("supervision_evidence: verdict", err))?,
+            );
+        }
+        drop(statement);
+        let in_flight = in_flight_steps_locked(&conn)?
+            .into_iter()
+            .find(|(run, _)| run == instance_id || run == "*")
+            .map(|(_, step)| step);
+        Ok(Some(SupervisionEvidence {
+            run,
+            ownership_instance,
+            submission_id,
+            submission_digest,
+            steps,
+            attempts,
+            retries,
+            verdicts,
+            in_flight,
+            progress_at: row.progress_at,
+        }))
+    }
+
+    /// Recorded step attempts of one run as `(step, status, error code)` in
+    /// claim order, read on the caller's guard. Never inferred: an unreadable
+    /// outcome is skipped, and an attempt without a recorded outcome is not
+    /// an attempt yet (the claim is still in flight).
+    fn run_step_attempts_with_codes(
+        &self,
+        conn: &Connection,
+        instance_id: &str,
+    ) -> Result<Vec<(String, String, String)>, StateError> {
+        let mut statement = conn
+            .prepare(
+                "SELECT request_line, outcome FROM idempotency
+                  WHERE method = 'apply' AND outcome IS NOT NULL
+                  ORDER BY claimed_at, key",
+            )
+            .map_err(|err| StateError::from_sqlite("supervision attempts: prepare", err))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|err| StateError::from_sqlite("supervision attempts: query", err))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (line, outcome) =
+                row.map_err(|err| StateError::from_sqlite("supervision attempts: row", err))?;
+            let Some(outcome) = outcome else {
+                continue;
+            };
+            let Ok(request) = Val::parse_json(&line) else {
+                continue;
+            };
+            let params = request.get("params").cloned().unwrap_or_else(null);
+            if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
+                continue;
+            }
+            let step = params
+                .get("step")
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string();
+            let Ok(outcome) = Val::parse_json(&outcome) else {
+                continue;
+            };
+            let status = outcome
+                .get("status")
+                .and_then(Val::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let code = outcome
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string();
+            out.push((step, status, code));
+        }
+        Ok(out)
+    }
+
+    /// Commit ONE run-scoped reconciliation in one transaction: consume the
+    /// pending wake slot (fenced on the exact seq the driver read), advance
+    /// the meaningful-progress observation ONLY when the evidence marker
+    /// changed, open/close the continuation window, and record the check with
+    /// its reason and next eligible check.
+    pub fn commit_supervision_check(
+        &self,
+        plan: &SupervisionCheckPlan,
+    ) -> Result<SupervisionRow, StateError> {
+        let outcome = self.commit_supervision_check_inner(plan);
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn commit_supervision_check_inner(
+        &self,
+        plan: &SupervisionCheckPlan,
+    ) -> Result<SupervisionRow, StateError> {
+        self.ensure_writable()?;
+        let mut conn = self.lock("commit_supervision_check")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("commit_supervision_check: begin", err))?;
+        let row: Option<SupervisionRow> = tx
+            .query_row(
+                format!("{} WHERE instance_id = ?1", supervision_select_sql()).as_str(),
+                params![plan.instance_id],
+                supervision_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("commit_supervision_check: read", err))?;
+        let Some(row) = row else {
+            return Err(state_error(
+                "state.not_found",
+                format!("no supervision exists for run {:?}", plan.instance_id),
+            ));
+        };
+        if row.desired != "armed" {
+            return Err(state_error(
+                "state.supervision_disabled",
+                format!(
+                    "supervision {} of run {} is {}, not armed",
+                    row.supervision_id, plan.instance_id, row.desired
+                ),
+            ));
+        }
+        // Consume the wake slot the driver read: a NEWER wake that arrived
+        // while the driver was classifying stays pending for the next pass
+        // (never lost, never double-counted).
+        if plan.consumed_all {
+            tx.execute(
+                "DELETE FROM supervision_triggers WHERE instance_id = ?1",
+                params![plan.instance_id],
+            )
+            .map_err(|err| StateError::from_sqlite("commit_supervision_check: consume all", err))?;
+        } else if plan.consumed_seq > 0 {
+            tx.execute(
+                "DELETE FROM supervision_triggers WHERE instance_id = ?1 AND trigger_seq = ?2",
+                params![plan.instance_id, plan.consumed_seq],
+            )
+            .map_err(|err| StateError::from_sqlite("commit_supervision_check: consume", err))?;
+        }
+        // The meaningful-progress marker moves ONLY when the observed
+        // evidence differs: a heartbeat, a read or a rendered status is not
+        // progress, so the absence-of-evidence timeout can actually fire.
+        let (marker, progress_at, source) = if plan.marker != row.progress_marker {
+            (
+                plan.marker.clone(),
+                plan.at.clone(),
+                plan.marker_source.to_string(),
+            )
+        } else {
+            (
+                row.progress_marker.clone(),
+                row.progress_at.clone(),
+                row.progress_source.clone(),
+            )
+        };
+        // One continuation report per absence window.
+        let (reports, open, since) = if plan.eligible && !row.continuation_open {
+            (row.continuation_reports + 1, true, plan.at.clone())
+        } else if plan.eligible {
+            (
+                row.continuation_reports,
+                true,
+                row.continuation_since.clone(),
+            )
+        } else {
+            (row.continuation_reports, false, String::new())
+        };
+        tx.execute(
+            "UPDATE supervisions
+                SET checks = checks + 1, last_check_at = ?2, last_check_class = ?3,
+                    last_check_reason = ?4, last_check_trigger = ?5, next_check_at = ?6,
+                    next_check_unix = ?7, next_check_reason = ?8, progress_marker = ?9,
+                    progress_at = ?10, progress_source = ?11, continuation_reports = ?12,
+                    continuation_open = ?13, continuation_since = ?14, updated_at = ?2
+              WHERE instance_id = ?1",
+            params![
+                plan.instance_id,
+                plan.at,
+                plan.class,
+                plan.reason,
+                plan.trigger,
+                time::rfc3339_from_unix(plan.next_check_unix),
+                plan.next_check_unix,
+                plan.next_check_reason,
+                marker,
+                progress_at,
+                source,
+                reports,
+                if open { 1 } else { 0 },
+                since
+            ],
+        )
+        .map_err(|err| StateError::from_sqlite("commit_supervision_check: update", err))?;
+        let updated: Option<SupervisionRow> = tx
+            .query_row(
+                format!("{} WHERE instance_id = ?1", supervision_select_sql()).as_str(),
+                params![plan.instance_id],
+                supervision_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("commit_supervision_check: reread", err))?;
+        let Some(updated) = updated else {
+            return Err(state_error(
+                "state.corrupt",
+                "the supervision row vanished inside its own transaction",
+            ));
+        };
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("commit_supervision_check: commit", err))?;
+        Ok(updated)
+    }
+
+    /// The durable driver cursor (event cursor + last tick time).
+    pub fn supervision_runtime(&self) -> Result<SupervisionRuntime, StateError> {
+        let conn = self.lock("supervision_runtime")?;
+        conn.query_row(
+            "SELECT event_cursor, last_tick_at FROM supervision_runtime WHERE id = 1",
+            [],
+            |row| {
+                Ok(SupervisionRuntime {
+                    event_cursor: row.get(0)?,
+                    last_tick_at: row.get(1)?,
+                })
+            },
+        )
+        .map_err(|err| StateError::from_sqlite("supervision_runtime: read", err))
+    }
+
+    /// Persist the driver cursor.
+    pub fn set_supervision_runtime(&self, event_cursor: i64, at: &str) -> Result<(), StateError> {
+        let outcome = self.set_supervision_runtime_inner(event_cursor, at);
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn set_supervision_runtime_inner(&self, event_cursor: i64, at: &str) -> Result<(), StateError> {
+        self.ensure_writable()?;
+        let conn = self.lock("set_supervision_runtime")?;
+        conn.execute(
+            "UPDATE supervision_runtime
+                SET event_cursor = CASE WHEN event_cursor > ?1 THEN event_cursor ELSE ?1 END,
+                    last_tick_at = ?2
+              WHERE id = 1",
+            params![event_cursor, at],
+        )
+        .map_err(|err| StateError::from_sqlite("set_supervision_runtime: update", err))?;
+        Ok(())
+    }
+
+    /// Fold the durable semantic events after `cursor` into the per-run wake
+    /// slots. Bounded (at most `WAKE_MAX_ROWS` rows per pass); a cursor that
+    /// retention moved past — or a folded event whose audit row was pruned —
+    /// reports `lost`, and every armed run then gets a fresh snapshot wake
+    /// instead of an incremental one.
+    pub fn fold_supervision_events(
+        &self,
+        cursor: i64,
+        at: &str,
+    ) -> Result<SupervisionFold, StateError> {
+        let outcome = self.fold_supervision_events_inner(cursor, at);
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn fold_supervision_events_inner(
+        &self,
+        cursor: i64,
+        at: &str,
+    ) -> Result<SupervisionFold, StateError> {
+        let mut conn = self.lock("fold_supervision_events")?;
+        let armed: Vec<String> = {
+            let mut statement = conn
+                .prepare("SELECT instance_id FROM supervisions WHERE desired = 'armed' ORDER BY instance_id")
+                .map_err(|err| StateError::from_sqlite("fold: armed prepare", err))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|err| StateError::from_sqlite("fold: armed query", err))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|err| StateError::from_sqlite("fold: armed row", err))?);
+            }
+            out
+        };
+        if armed.is_empty() {
+            return Ok(SupervisionFold {
+                cursor,
+                lost: false,
+                folded: 0,
+                runs: Vec::new(),
+            });
+        }
+        let bounds: (Option<i64>, Option<i64>) = conn
+            .query_row("SELECT MAX(seq), MIN(seq) FROM events", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(|err| StateError::from_sqlite("fold: bounds", err))?;
+        let (max_seq, min_seq) = bounds;
+        let max_seq = max_seq.unwrap_or(0);
+        // Retention moved past the cursor: the events between were pruned and
+        // can never be folded incrementally.
+        let mut lost = match min_seq {
+            Some(min) => min > cursor + 1,
+            None => cursor > 0,
+        };
+        let rows: Vec<(i64, String, String)> = {
+            let mut statement = conn
+                .prepare("SELECT seq, event, data FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2")
+                .map_err(|err| StateError::from_sqlite("fold: events prepare", err))?;
+            let rows = statement
+                .query_map(
+                    params![cursor, crate::supervision::WAKE_MAX_ROWS as i64],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|err| StateError::from_sqlite("fold: events query", err))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|err| StateError::from_sqlite("fold: events row", err))?);
+            }
+            out
+        };
+        let mut new_cursor = cursor;
+        let mut folded = 0usize;
+        let mut runs: Vec<String> = Vec::new();
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("fold: begin", err))?;
+        for (seq, event, data) in &rows {
+            if *seq > new_cursor {
+                new_cursor = *seq;
+            }
+            if event != "journal.appended" {
+                continue;
+            }
+            let audit_seq = Val::parse_json(data)
+                .ok()
+                .and_then(|data| data.get("seq").and_then(Val::as_int));
+            let Some(audit_seq) = audit_seq else {
+                lost = true;
+                continue;
+            };
+            let audit: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT action, target FROM audit WHERE seq = ?1",
+                    params![audit_seq],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|err| StateError::from_sqlite("fold: audit read", err))?;
+            let Some((action, target)) = audit else {
+                // The audit row this event named was pruned: the incremental
+                // fold cannot attribute it, so fall back to a fresh snapshot.
+                lost = true;
+                continue;
+            };
+            let Some(run) = supervision_run_of_target(&target) else {
+                continue;
+            };
+            if !armed.iter().any(|armed_run| armed_run == run) {
+                continue;
+            }
+            let class = supervision_wake_class(&action);
+            let run = run.to_string();
+            if Self::fold_trigger_locked(&tx, &run, class, *seq, at)? {
+                folded += 1;
+                if !runs.contains(&run) {
+                    runs.push(run);
+                }
+            }
+        }
+        if lost {
+            let snapshot_seq = max_seq + 1;
+            for run in &armed {
+                if Self::fold_trigger_locked(&tx, run, "snapshot", snapshot_seq, at)? {
+                    folded += 1;
+                    if !runs.contains(run) {
+                        runs.push(run.clone());
+                    }
+                }
+            }
+        }
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("fold: commit", err))?;
+        Ok(SupervisionFold {
+            cursor: new_cursor,
+            lost,
+            folded,
+            runs,
+        })
+    }
+}
+
+/// The `(step id, step kind)` pairs of one committed bound-input line; an
+/// unreadable line yields no steps (the classification then holds the run).
+fn bound_steps_of(request_line: &str) -> Vec<(String, String)> {
+    let Ok(doc) = Val::parse_json(request_line) else {
+        return Vec::new();
+    };
+    doc.get("steps")
+        .and_then(Val::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .filter_map(|step| {
+                    let id = step.get("id").and_then(Val::as_str)?;
+                    let kind = step.get("kind").and_then(Val::as_str).unwrap_or("");
+                    Some((id.to_string(), kind.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Run migration m0011 in one transaction (issue #95: supervised
+/// reconciliation: the durable authorization, the ONE pending wake slot per
+/// run and the driver cursor).
+fn run_m0011(conn: &mut Connection) -> Result<(), StateError> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| StateError::from_sqlite("migrate m0011: begin", err))?;
+    let checksum = sha256_hex(M0011_SQL.as_bytes());
+    tx.execute_batch(M0011_SQL)
+        .map_err(|err| StateError::from_sqlite("migrate m0011", err))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (migration_id, applies_from, applies_to, checksum, applied_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            M0011_ID,
+            M0011_APPLIES_FROM,
+            M0011_APPLIES_TO,
+            checksum,
+            time::rfc3339_now()
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("migrate m0011: bookkeeping", err))?;
+    tx.pragma_update(None, "user_version", M0011_APPLIES_TO)
+        .map_err(|err| StateError::from_sqlite("migrate m0011: user_version", err))?;
+    tx.commit()
+        .map_err(|err| StateError::from_sqlite("migrate m0011: commit", err))?;
+    Ok(())
+}
+
+/// Supervision tables added by m0011 (issue #95), purely additive: the
+/// durable authorization of one run, the ONE pending wake slot per run and
+/// the one-row driver cursor.
+const M0011_SQL: &str = "\
+CREATE TABLE supervisions (
+    instance_id TEXT PRIMARY KEY,
+    supervision_id TEXT NOT NULL,
+    desired TEXT NOT NULL CHECK (desired IN ('armed', 'disabled')),
+    owner_generation INTEGER NOT NULL,
+    run_generation INTEGER NOT NULL,
+    authorization_digest TEXT NOT NULL,
+    approved_boundary TEXT NOT NULL,
+    check_interval_secs INTEGER NOT NULL,
+    progress_timeout_secs INTEGER NOT NULL,
+    progress_marker TEXT NOT NULL DEFAULT '',
+    progress_at TEXT NOT NULL DEFAULT '',
+    progress_source TEXT NOT NULL DEFAULT '',
+    checks INTEGER NOT NULL DEFAULT 0,
+    continuation_reports INTEGER NOT NULL DEFAULT 0,
+    continuation_open INTEGER NOT NULL DEFAULT 0,
+    continuation_since TEXT NOT NULL DEFAULT '',
+    last_check_at TEXT NOT NULL DEFAULT '',
+    last_check_class TEXT NOT NULL DEFAULT '',
+    last_check_reason TEXT NOT NULL DEFAULT '',
+    last_check_trigger TEXT NOT NULL DEFAULT '',
+    next_check_at TEXT NOT NULL DEFAULT '',
+    next_check_unix INTEGER NOT NULL DEFAULT 0,
+    next_check_reason TEXT NOT NULL DEFAULT '',
+    armed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE supervision_triggers (
+    instance_id TEXT PRIMARY KEY,
+    trigger TEXT NOT NULL,
+    trigger_seq INTEGER NOT NULL,
+    folded INTEGER NOT NULL DEFAULT 1,
+    first_at TEXT NOT NULL,
+    last_at TEXT NOT NULL
+);
+CREATE TABLE supervision_runtime (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    event_cursor INTEGER NOT NULL DEFAULT 0,
+    last_tick_at TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO supervision_runtime (id, event_cursor, last_tick_at) VALUES (1, 0, '');
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11080,10 +12359,12 @@ mod tests {
         assert_eq!(grant.status, "active");
         assert_eq!(grant.state_epoch, 1);
         assert_eq!(state.current_epoch().expect("epoch"), 1);
-        assert_eq!(SCHEMA_VERSION, 10);
+        assert_eq!(SCHEMA_VERSION, 11);
         {
-            let conn = state.lock("test: m0005..m0010 bookkeeping").expect("lock");
-            for migration_id in [M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID, M0010_ID] {
+            let conn = state.lock("test: m0005..m0011 bookkeeping").expect("lock");
+            for migration_id in [
+                M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID, M0010_ID, M0011_ID,
+            ] {
                 let recorded: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?1",
