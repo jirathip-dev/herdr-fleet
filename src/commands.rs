@@ -495,6 +495,9 @@ fn parse_board(args: &[&String]) -> Result<Invocation, ParseError> {
         daemon_action: None,
         service_action: None,
         lane_action: None,
+        // The board surface is not a queue submission (issue #85): the field
+        // exists on every initializer so the merged struct has one shape.
+        queue_action: None,
     })
 }
 
