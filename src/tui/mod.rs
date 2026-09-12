@@ -21,6 +21,7 @@
 //! never appear here; they stay dynamic in profile configuration elsewhere.
 
 pub mod board;
+pub mod live;
 pub mod session;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -111,10 +112,15 @@ pub enum Stage {
     CiWaiting,
     /// A required check failed; one diagnosed repair may be applicable.
     CiFailure,
+    /// The run is stopped on a recorded terminal blocker.
+    Blocked,
     /// The worker reported completion; external delivery is not verified.
     WorkerReportedDone,
     /// Waiting on a human-only approval (for example a production gate).
     HumanOnlyGate,
+    /// The run's recorded facts were invalidated (for example by an epoch
+    /// rotation); this is not progress and never delivery.
+    Invalidated,
     /// External readback verified the delivery (for example a merge commit).
     VerifiedMerge,
     /// The required capability is not available; this is not progress.
@@ -129,8 +135,10 @@ impl Stage {
             Self::Implementing | Self::Review | Self::CiWaiting => StageGroup::InProgress,
             Self::FixesRequested
             | Self::CiFailure
+            | Self::Blocked
             | Self::WorkerReportedDone
-            | Self::HumanOnlyGate => StageGroup::NeedsAttention,
+            | Self::HumanOnlyGate
+            | Self::Invalidated => StageGroup::NeedsAttention,
             Self::VerifiedMerge => StageGroup::Verified,
         }
     }
@@ -149,8 +157,10 @@ impl Stage {
             Self::FixesRequested => "Fixes requested",
             Self::CiWaiting => "CI waiting",
             Self::CiFailure => "CI failure",
+            Self::Blocked => "Blocked",
             Self::WorkerReportedDone => "Worker-reported done",
             Self::HumanOnlyGate => "Human-only gate",
+            Self::Invalidated => "Invalidated",
             Self::VerifiedMerge => "Verified merge",
             Self::UnsupportedStep => "Unsupported step",
         }
@@ -200,6 +210,12 @@ pub enum EvidenceKind {
     Ci,
     /// A human gate or approval record.
     Gate,
+    /// A recorded evidence reference the source does not classify (its
+    /// durable identifier, displayed as recorded).
+    Reference,
+    /// The row's recorded verification verdict (derived by the read model
+    /// from the newest recorded review evidence).
+    Verification,
 }
 
 impl EvidenceKind {
@@ -209,6 +225,8 @@ impl EvidenceKind {
             Self::Review => "review",
             Self::Ci => "ci",
             Self::Gate => "gate",
+            Self::Reference => "ref",
+            Self::Verification => "verification",
         }
     }
 }
@@ -283,14 +301,20 @@ impl IssueKey {
 pub struct RunKey {
     /// Run identifier.
     pub run: String,
-    /// Attempt number within that run (1-based as reported).
-    pub attempt: u32,
+    /// Attempt number within that run, when the source numbers attempts.
+    /// `None` when it does not: the read model numbers no attempts (several
+    /// attempts under one issue are several runs), so one is never invented.
+    pub attempt: Option<u32>,
 }
 
 impl RunKey {
-    /// `run-0001 attempt 2` display label.
+    /// `run-0001 attempt 2`, or the bare run identifier when the source
+    /// recorded no attempt number.
     pub fn label(&self) -> String {
-        format!("{} attempt {}", self.run, self.attempt)
+        match self.attempt {
+            Some(attempt) => format!("{} attempt {}", self.run, attempt),
+            None => self.run.clone(),
+        }
     }
 }
 
@@ -414,14 +438,18 @@ pub enum BoardState {
 }
 
 /// Bounded pagination of the board read.
+///
+/// `count` and `total_rows` are `None` while the source reports that more
+/// rows exist beyond the bounded read: the totals are unknown then and are
+/// never guessed. The renderer says so explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Page {
     /// 1-based page number.
     pub current: u64,
-    /// Total number of pages.
-    pub count: u64,
-    /// Total number of rows across all pages.
-    pub total_rows: u64,
+    /// Total number of pages, when the source can report it.
+    pub count: Option<u64>,
+    /// Total number of rows across all pages, when the source can report it.
+    pub total_rows: Option<u64>,
 }
 
 /// Explicit typed view model: everything the surface renders.
@@ -616,8 +644,10 @@ mod tests {
             Stage::FixesRequested,
             Stage::CiWaiting,
             Stage::CiFailure,
+            Stage::Blocked,
             Stage::WorkerReportedDone,
             Stage::HumanOnlyGate,
+            Stage::Invalidated,
             Stage::VerifiedMerge,
             Stage::UnsupportedStep,
         ];
@@ -629,6 +659,26 @@ mod tests {
             StageGroup::NeedsAttention
         );
         assert_eq!(Stage::VerifiedMerge.group(), StageGroup::Verified);
+        assert_eq!(Stage::Blocked.group(), StageGroup::NeedsAttention);
+        assert_eq!(Stage::Invalidated.group(), StageGroup::NeedsAttention);
+    }
+
+    #[test]
+    fn run_labels_omit_an_unrecorded_attempt_number() {
+        let numbered = RunKey {
+            run: "run-0001".to_string(),
+            attempt: Some(2),
+        };
+        assert_eq!(numbered.label(), "run-0001 attempt 2");
+        let unnumbered = RunKey {
+            run: "run-0001".to_string(),
+            attempt: None,
+        };
+        assert_eq!(
+            unnumbered.label(),
+            "run-0001",
+            "an unrecorded attempt number is never invented"
+        );
     }
 
     #[test]

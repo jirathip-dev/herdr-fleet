@@ -182,6 +182,16 @@ fn source_line(view: &BoardView, palette: &Palette) -> Line<'static> {
     } else {
         palette.accent
     };
+    // Unknown totals (a bounded read that reported more rows) are stated as
+    // unknown, never filled in with a guess.
+    let page = match view.page.count {
+        Some(count) => format!("page {}/{}", view.page.current, count),
+        None => format!("page {}/?", view.page.current),
+    };
+    let rows = match view.page.total_rows {
+        Some(total) => format!("{total} rows"),
+        None => format!("{}+ rows", view.rows.len()),
+    };
     Line::from(vec![
         Span::styled("source: ", palette.muted),
         Span::raw(clip(&view.source, 64)),
@@ -190,9 +200,9 @@ fn source_line(view: &BoardView, palette: &Palette) -> Line<'static> {
         Span::raw(" | "),
         Span::raw(view.freshness.completeness_label()),
         Span::raw(" | "),
-        Span::raw(format!("page {}/{}", view.page.current, view.page.count)),
+        Span::raw(page),
         Span::raw(" | "),
-        Span::raw(format!("{} rows", view.page.total_rows)),
+        Span::raw(rows),
     ])
 }
 
@@ -255,7 +265,14 @@ fn notice_lines(view: &BoardView, palette: &Palette) -> Vec<Line<'static>> {
             palette.warn,
         )],
         BoardState::Offline => vec![Line::styled(
-            "warning: source is offline; showing last known data (no fresh reads)",
+            match view.state_note.as_deref() {
+                Some(note) => format!(
+                    "warning: source is offline; showing last known data (no fresh reads): {}",
+                    clip(note, 64)
+                ),
+                None => "warning: source is offline; showing last known data (no fresh reads)"
+                    .to_string(),
+            },
             palette.alert,
         )],
         BoardState::NoAccess => vec![Line::styled(
@@ -343,8 +360,8 @@ fn narrow_row_line(
     let marker = if selected { "> " } else { "  " };
     let mut text = format!("{marker}#{} {}", row.issue.issue, row.issue.repository);
     text.push_str(&format!(" | {}", row.stage.label()));
-    if let Some(run) = &row.run {
-        text.push_str(&format!(" | attempt {}", run.attempt));
+    if let Some(attempt) = row.run.as_ref().and_then(|run| run.attempt) {
+        text.push_str(&format!(" | attempt {attempt}"));
     }
     if let Some(owner) = &row.owner {
         text.push_str(&format!(" | {}", clip(owner, 24)));
@@ -397,7 +414,8 @@ fn detail_lines(
     let attempt = row
         .run
         .as_ref()
-        .map(|run| run.attempt.to_string())
+        .and_then(|run| run.attempt)
+        .map(|attempt| attempt.to_string())
         .unwrap_or_else(|| "-".to_string());
 
     let head = format!(
@@ -444,8 +462,8 @@ fn detail_lines(
 
 fn selection_label(selection: &super::Selection) -> String {
     let mut label = selection.issue.label();
-    if let Some(run) = &selection.run {
-        label.push_str(&format!(" (attempt {})", run.attempt));
+    if let Some(attempt) = selection.run.as_ref().and_then(|run| run.attempt) {
+        label.push_str(&format!(" (attempt {attempt})"));
     }
     label
 }
