@@ -31,7 +31,9 @@ use crate::queue_preview::{
     Boundary, IssueId, PlannedStep, QueuePreview, QueueRequest, SelectedIssue, confirm, digest_of,
     holds as preview_holds, preview_queue,
 };
-use crate::state::{QueueSubmissionItemRow, QueueSubmissionRow, State, SubmissionVerdict};
+use crate::state::{
+    QueueAdvanceRow, QueueSubmissionItemRow, QueueSubmissionRow, State, SubmissionVerdict,
+};
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The submission document schema id (module-local, exactly like the #84
@@ -53,7 +55,22 @@ pub const CAP_MAX: usize = 65_536;
 /// The statement every submission document renders: what a committed
 /// submission did and did NOT do. A submission admits runs; it never claims
 /// a step executed.
-pub const STATEMENT: &str = "submission admission only: admitted items own a durable run record and no workflow step has been executed; waiting and refused items are not running, and this is not a completed implementation";
+pub const STATEMENT: &str = "submission admission only: admitted items own a durable run record and no workflow step has been executed; a waiting item can be admitted later only by the ONE verified delivery that advances this queue cursor (issue #96, under the same admission and ownership checks), refused items are not running, and this is not a completed implementation";
+
+/// The queue-cursor advance vocabulary (issue #96): the durable continuation
+/// from one verified delivery to the next eligible approved issue of the
+/// SAME already-authorized submission. Holds reuse the admission vocabulary
+/// (`refusal.admission.*`, `preview.*`, `submission.*`) verbatim, so one hold
+/// language spans the preview, the submission and the advance.
+pub mod advance {
+    /// A required dependency is not part of the submission's selected set:
+    /// this queue can never settle it, so the dependent stays held.
+    pub const DEPENDENCY_UNRESOLVED: &str = "queue.dependency_unresolved";
+    /// A required dependency is selected but its delivery is not verified
+    /// yet: the dependent stays held — never dispatched and never marked
+    /// done from an unmet dependency.
+    pub const DEPENDENCY_UNSETTLED: &str = "queue.dependency_unsettled";
+}
 
 /// Submission-local stable codes (the `submission.*` namespace). Admission
 /// holds reuse the #84 `preview.*` codes and the lifecycle
@@ -1261,11 +1278,113 @@ fn grant_binding_refusal(
     Ok(None)
 }
 
+/// The `advance` block of a submission document (issue #96): the durable
+/// queue-cursor state — one row per consumed verified delivery, the cursor,
+/// and the CURRENT hold (if any). A read reports committed rows only; it
+/// never re-derives the cursor or hides a hold.
+pub fn advance_doc(advances: &[QueueAdvanceRow]) -> Val {
+    let mut dispatched = 0i64;
+    let mut held: Option<&QueueAdvanceRow> = None;
+    let mut rows: Vec<Val> = Vec::new();
+    let mut cursor = 0i64;
+    for row in advances {
+        if row.next_instance_id.is_some() {
+            dispatched += 1;
+        }
+        if row.reason.is_some() {
+            held = Some(row);
+        }
+        cursor = cursor.max(row.delivered_ordinal);
+        rows.push(object(vec![
+            ("delivered_ordinal", integer(row.delivered_ordinal)),
+            ("delivered_work_item", string(&row.delivered_work_item)),
+            ("delivered_head", string(&row.delivered_head)),
+            ("evidence_id", string(&row.evidence_id)),
+            (
+                "next_ordinal",
+                row.next_ordinal.map(integer).unwrap_or_else(null),
+            ),
+            (
+                "next_work_item",
+                row.next_work_item
+                    .as_deref()
+                    .map(string)
+                    .unwrap_or_else(null),
+            ),
+            (
+                "next_instance_id",
+                row.next_instance_id
+                    .as_deref()
+                    .map(string)
+                    .unwrap_or_else(null),
+            ),
+            (
+                "reason",
+                row.reason.as_deref().map(string).unwrap_or_else(null),
+            ),
+            (
+                "message",
+                row.message.as_deref().map(string).unwrap_or_else(null),
+            ),
+            ("at", string(&row.at)),
+        ]));
+    }
+    let held_doc = match held {
+        Some(row) => object(vec![
+            (
+                "next_ordinal",
+                row.next_ordinal.map(integer).unwrap_or_else(null),
+            ),
+            (
+                "next_work_item",
+                row.next_work_item
+                    .as_deref()
+                    .map(string)
+                    .unwrap_or_else(null),
+            ),
+            (
+                "reason",
+                row.reason.as_deref().map(string).unwrap_or_else(null),
+            ),
+            (
+                "message",
+                row.message.as_deref().map(string).unwrap_or_else(null),
+            ),
+            ("at", string(&row.at)),
+        ]),
+        None => null(),
+    };
+    object(vec![
+        ("cursor_ordinal", integer(cursor)),
+        ("consumed", integer(advances.len() as i64)),
+        ("dispatched", integer(dispatched)),
+        (
+            "last",
+            match advances.last() {
+                Some(row) => object(vec![
+                    ("delivered_ordinal", integer(row.delivered_ordinal)),
+                    ("delivered_work_item", string(&row.delivered_work_item)),
+                    ("delivered_head", string(&row.delivered_head)),
+                    ("at", string(&row.at)),
+                ]),
+                None => null(),
+            },
+        ),
+        ("held", held_doc),
+        ("rows", Val::Arr(rows)),
+    ])
+}
+
 /// Render the committed submission document. The SAME function serves the
 /// submit response, the `queue.status` readback and restart reconciliation,
 /// so all three agree byte for byte (after canonicalization) — they are one
-/// pure projection of the committed rows.
-pub fn submission_doc(row: &QueueSubmissionRow, items: &[QueueSubmissionItemRow]) -> Val {
+/// pure projection of the committed rows (items plus the issue #96 advance
+/// rows).
+pub fn submission_doc(
+    row: &QueueSubmissionRow,
+    items: &[QueueSubmissionItemRow],
+    advances: &[QueueAdvanceRow],
+) -> Val {
     let mut admitted = 0i64;
     let mut waiting = 0i64;
     let mut refused = 0i64;
@@ -1384,6 +1503,7 @@ pub fn submission_doc(row: &QueueSubmissionRow, items: &[QueueSubmissionItemRow]
             ]),
         ),
         ("items", Val::Arr(items_doc)),
+        ("advance", advance_doc(advances)),
         ("steps", Val::Arr(steps_doc)),
         ("statement", string(STATEMENT)),
         ("created_at", string(&row.created_at)),
@@ -1500,6 +1620,29 @@ pub fn render_human(doc: &Val) -> String {
             let reason = item.get("reason").and_then(Val::as_str).unwrap_or("-");
             let instance = item.get("instance_id").and_then(Val::as_str).unwrap_or("-");
             lines.push(format!("  {id}: {status} ({reason}) run={instance}"));
+        }
+    }
+    // Issue #96: the durable queue cursor and the current hold, if any.
+    if let Some(advance) = doc.get("advance") {
+        lines.push(format!(
+            "advance: cursor {} · consumed {} · dispatched {}",
+            advance
+                .get("cursor_ordinal")
+                .and_then(Val::as_int)
+                .unwrap_or(0),
+            advance.get("consumed").and_then(Val::as_int).unwrap_or(0),
+            advance.get("dispatched").and_then(Val::as_int).unwrap_or(0),
+        ));
+        if let Some(held) = advance.get("held")
+            && !matches!(held, Val::Null)
+        {
+            lines.push(format!(
+                "  held: {} ({})",
+                held.get("next_work_item")
+                    .and_then(Val::as_str)
+                    .unwrap_or("-"),
+                held.get("reason").and_then(Val::as_str).unwrap_or("-"),
+            ));
         }
     }
     lines.push(format!(

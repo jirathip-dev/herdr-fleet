@@ -349,12 +349,13 @@ clears a repository/fleet-level hold or bypasses a gate.
   marker (the run's control rows) and logs whether the control committed
   (`reconcile.run-control`); no control is ever repeated.
 
-## Supervision method (issue #95)
+## Supervision method (issue #95) + queue continuation (issue #96)
 
 - Supervision is a daemon-owned reconciliation driver, NOT another agent
   and NOT a scheduler: routine checks make no inference requests, and
   nothing on this surface spawns, prompts, resumes, retries, mutates Git or
-  clears a hold. `supervision.status` is the only method it adds.
+  clears a hold. `supervision.status` is the only method it adds, and issue
+  #96 adds no method at all: the continuation rides on the SAME driver.
 - Arming is part of the run's submission, never a separate call:
   `queue.submit` accepts an OPTIONAL `params.supervision`
   (`hf-supervision-authorization/v1`: `desired` in the closed set
@@ -398,10 +399,28 @@ clears a repository/fleet-level hold or bypasses a gate.
   continuation window. Only a recorded observation that is genuinely older
   than the explicit `progress_timeout_secs` policy is `continuation-eligible`
   with reason `supervision.progress_timeout`.
-- `continuation-eligible` is a REPORT for a later slice: supervision never
-  continues work, and an idle/done agent alone is neither completion (a
+- `continuation-eligible` is a REPORT: supervision never continues work on
+  a stalled run, and an idle/done agent alone is neither completion (a
   `done` run without passing review evidence stays unknown) nor permission
   to resume (a paused run is never eligible).
+- **Completion-to-next-work (issue #96)**: a fresh VERIFIED delivery of an
+  armed run — reviewed `pass` with every named check `passed` at one exact
+  head, bound to the run's own workflow/policy pins, no durable hold and no
+  in-flight step claim — completes that run (`done`) and advances its
+  already-authorized queue cursor EXACTLY ONCE, admitting the next eligible
+  approved item of the SAME committed submission through the same
+  guard-verifying admission path (the same approved caps and occupancy
+  attestation), armed with the delivering run's supervision authorization.
+  The consumption is keyed to the delivered membership item
+  (`queue_advances`, m0012) and is durable across restarts: a duplicate
+  delivery event, a replayed reconciliation or a crash can only observe the
+  recorded row and never dispatch twice. A declared dependency that is not
+  delivered and verified holds the dependent with its reason recorded
+  (`queue.dependency_unsettled` / `queue.dependency_unresolved`), never
+  dispatches it and never marks it done; a hold is re-evaluated as later
+  deliveries settle it and the superseding dispatch is recorded on the older
+  delivery row. Nothing else is eligible: only items of that submission, no
+  new issue creation, no speculative chain, and no LLM in the loop.
 
 ## Responses: `hf-rpc-response/v1`
 
