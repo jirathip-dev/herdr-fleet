@@ -1000,7 +1000,10 @@ fn submission_commits_membership_and_unique_ownership_transactionally() {
     assert_eq!(err.code, "state.submission_exists", "{}", err.message);
 
     // The rendered document is a pure projection of the committed rows.
-    let doc = qx::submission_doc(&persisted, &persisted_items);
+    let advances = state
+        .queue_advance_rows(&persisted.submission_id)
+        .expect("advances");
+    let doc = qx::submission_doc(&persisted, &persisted_items, &advances);
     let admission = doc.get("admission").expect("admission");
     assert_eq!(admission.get("admitted").and_then(Val::as_int), Some(2));
     assert_eq!(admission.get("waiting").and_then(Val::as_int), Some(0));

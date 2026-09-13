@@ -75,8 +75,8 @@ facts the binary was built against:
 ```console
 canter 0.1.0
 canter: typed, plan-first companion CLI for operating Herdr coding-agent fleets (read-only core; no daemon, no live fleet mutations)
-state schema version: 11
-migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4, m0005_lane_replacements_v5, m0006_lane_checkpoints_v6, m0007_lane_successors_v7, m0008_lane_replacement_profiles_v8, m0009_queue_submissions_v9, m0010_run_controls_v10, m0011_supervision_v11
+state schema version: 12
+migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4, m0005_lane_replacements_v5, m0006_lane_checkpoints_v6, m0007_lane_successors_v7, m0008_lane_replacement_profiles_v8, m0009_queue_submissions_v9, m0010_run_controls_v10, m0011_supervision_v11, m0012_queue_advances_v12
 document schema families: hf-config/v1, hf-policy/v1, hf-output/v1, hf-error/v1, ...
 ```
 
@@ -365,7 +365,7 @@ prints and the daemon speaks conforms to the versioned corpus in
 [docs/contracts/README.md](docs/contracts/README.md) — schema registry,
 spec-cli/config/plans/capabilities, spec-daemon/state/workflow, capability-map,
 compatibility, and benchmarks. `canter --version` prints the exact schema
-facts a build binds (`state schema version: 11`; migration chain m0001–m0011;
+facts a build binds (`state schema version: 12`; migration chain m0001–m0012;
 18 document schema families from `hf-config/v1` to `hf-board/v1`).
 
 **Command surface** — mirrors `canter --help` on the release binary
@@ -391,7 +391,7 @@ exactly (one line per shipped command; 23 subcommands):
 | `run resume --run RUN_ID --digest HEX64 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]` | Resume exactly the named run with its engine-minted digest (fresh eligibility re-derived; no other run's pause is ever cleared). |
 | `run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]` | Authorize ONE bounded re-dispatch of ONE diagnosed step of the run (invalid/revoked/stale/succeeded/exhausted retries refuse). |
 | `run status --run RUN_ID [--socket PATH] [--config PATH] [--json]` | Read one run's control state back read-only (active / pause_requested / paused + live boundary). |
-| `supervision status --run RUN_ID [--socket PATH] [--config PATH] [--json]` | Read one supervised run's versioned `hf-supervision/v1` status back read-only (class/reason/eligibility, freshness, last check, next eligible check; supervision is armed by `queue submit --supervise arm` and evaluation never continues work). |
+| `supervision status --run RUN_ID [--socket PATH] [--config PATH] [--json]` | Read one supervised run's versioned `hf-supervision/v1` status back read-only (class/reason/eligibility, freshness, last check, next eligible check; supervision is armed by `queue submit --supervise arm`; a verified delivery each advances the authorized queue once and admits the next eligible approved issue under the existing admission checks, and nothing else is ever continued). |
 | `service doctor [--config PATH] [--json]` | Check the daemon environment read-only (platform, config, socket state, unit placement). |
 | `service install-plan [--config PATH] [--json]` | Render the per-user launchd/systemd unit text + install steps (never installs). |
 | `service status-plan [--config PATH] [--json]` | Render the status/verification steps for the unit (never queries the service manager). |

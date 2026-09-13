@@ -30,7 +30,7 @@ use crate::time;
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The schema version this binary understands (also `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// Bounded-retention defaults (rows kept besides the chain genesis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,6 +380,16 @@ pub struct QueueSubmissionRow {
     pub boundary_caps: String,
     /// Canonical bound-input document (the exact digest document).
     pub request_line: String,
+    /// Approved global concurrency cap (the admission input the advance
+    /// re-applies against live counts).
+    pub caps_global: i64,
+    /// Approved per-repository concurrency cap.
+    pub caps_per_repository: i64,
+    /// Approved per-harness concurrency cap.
+    pub caps_per_harness: i64,
+    /// Attested same-harness occupancy the submission committed under;
+    /// `None` = unknown (never admitted).
+    pub harness_lanes: Option<i64>,
     /// Committed at (RFC3339 UTC).
     pub created_at: String,
 }
@@ -408,6 +418,41 @@ pub struct QueueSubmissionItemRow {
     /// The bound run when the item was admitted (started or explicitly
     /// resumed); `None` for waiting/refused items.
     pub instance_id: Option<String>,
+    /// The grant id the item was presented with (the exact approval the
+    /// advance re-verifies under the guard); `''` when none was presented.
+    pub grant_id: String,
+}
+
+/// One durable queue-advance row (issue #96): ONE consumed verified delivery
+/// of one submission item. `(submission_id, delivered_ordinal)` is the
+/// idempotency key — the delivery event can be consumed exactly once, so a
+/// duplicate event, a replayed check or a crash/restart can never dispatch
+/// twice. The row records the dispatch (`next_*`, `next_instance_id`) or the
+/// recorded hold (`reason`/`message`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueAdvanceRow {
+    /// The already-authorized submission whose cursor moved.
+    pub submission_id: String,
+    /// Ordinal of the delivered membership item (the idempotency key).
+    pub delivered_ordinal: i64,
+    /// Stable work-item id of the delivered issue.
+    pub delivered_work_item: String,
+    /// The delivered head (40-hex) of the verified delivery.
+    pub delivered_head: String,
+    /// The review-evidence row that carried the verdict.
+    pub evidence_id: String,
+    /// Ordinal of the considered next item (`None` = nothing left).
+    pub next_ordinal: Option<i64>,
+    /// Stable work-item id of the considered next item.
+    pub next_work_item: Option<String>,
+    /// The dispatched run when the next item was admitted.
+    pub next_instance_id: Option<String>,
+    /// The stable hold code when the next item was held.
+    pub reason: Option<String>,
+    /// Bounded human message of the hold.
+    pub message: Option<String>,
+    /// Recorded at (RFC3339 UTC).
+    pub at: String,
 }
 
 /// One unique work-ownership row (issue #85): the live owner of one
@@ -602,6 +647,319 @@ impl FanoutSlots<'_> {
         self.admitted_repository += 1;
         self.admitted_harness += 1;
     }
+}
+
+/// The guard-verified context of ONE membership admission: the live facts
+/// the shared decision re-derives (ownership snapshots, counted
+/// same-repository lanes) plus the inputs the approved submission bound.
+struct QueueAdmission<'a> {
+    repository: &'a str,
+    submission_id: &'a str,
+    epoch: i64,
+    at: &'a str,
+    workflow_id: &'a str,
+    workflow_hash: &'a str,
+    ownership: &'a BTreeMap<i64, OwnedRunSnapshot>,
+    repository_lanes: &'a [(i64, String)],
+}
+
+/// One membership item's admission inputs.
+struct QueueAdmissionItem<'a> {
+    issue_number: i64,
+    issue_revision: &'a str,
+    work_item: &'a str,
+    grant_id: Option<&'a str>,
+    resume_digest: Option<&'a str>,
+}
+
+/// Decide one membership item under the caller's transaction guard, and
+/// commit its effect when it is admitted: live ownership, the presented
+/// grant's status/epoch/expiry/binding, the fan-out capacity and the declared
+/// scope overlap are re-derived from live rows HERE, before any write, and an
+/// admitted item commits its run row plus its unique ownership row in the
+/// same transaction. Shared by the #85 submission transaction and the #96
+/// verified-delivery advance, so both admit through ONE code path.
+fn admit_queue_item_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    ctx: &QueueAdmission<'_>,
+    item: &QueueAdmissionItem<'_>,
+    slots: &mut FanoutSlots<'_>,
+) -> Result<AdmissionDecision, StateError> {
+    let scope = format!("worktrees/issues/{}", item.issue_number);
+    if let Some(run) = ctx.ownership.get(&item.issue_number) {
+        // An owner that appeared after the preview moved the verdict: only
+        // an explicit engine-authorized resume of a still-paused run admits
+        // an owned item; every other owned item is refused without any
+        // effect.
+        let authorized = match (item.resume_digest, run.paused) {
+            (Some(presented), true) => {
+                crate::engine::authorize_resume(&run.resume_digest, presented).is_ok()
+            }
+            _ => false,
+        };
+        if authorized {
+            let affected = tx
+                .execute(
+                    "UPDATE instances SET paused = 0, resume_digest = '',
+                            status = 'running', updated_at = ?2
+                      WHERE instance_id = ?1 AND paused = 1",
+                    params![run.instance_id, ctx.at],
+                )
+                .map_err(|err| StateError::from_sqlite("admit_queue_item: resume", err))?;
+            if affected == 1 {
+                return Ok(AdmissionDecision::Admitted {
+                    instance_id: run.instance_id.clone(),
+                });
+            }
+            return Ok(AdmissionDecision::Refused {
+                code: crate::queue_executor::codes::PAUSED,
+                message: "the run left its paused state while the submission committed; \
+                     no implicit state change is applied"
+                    .to_string(),
+            });
+        }
+        if run.paused {
+            return Ok(AdmissionDecision::Refused {
+                code: crate::queue_executor::codes::PAUSED,
+                message: format!(
+                    "run {} is paused and stays paused: a paused fleet is resumed only \
+                     with a separate explicit engine-minted resume authorization",
+                    run.instance_id
+                ),
+            });
+        }
+        if run.issue_revision != item.issue_revision {
+            return Ok(AdmissionDecision::Refused {
+                code: crate::queue_preview::holds::REVISION_STALE,
+                message: format!(
+                    "run {} recorded revision {}; the selected revision {} is not the \
+                     bound spec revision",
+                    run.instance_id, run.issue_revision, item.issue_revision
+                ),
+            });
+        }
+        return Ok(AdmissionDecision::Refused {
+            code: crate::queue_executor::codes::ALREADY_OWNED,
+            message: format!(
+                "run {} already owns this issue; a duplicate submission never \
+                 creates a second owner",
+                run.instance_id
+            ),
+        });
+    }
+    // No live owner: re-verify the presented grant under the guard (status,
+    // epoch and expiry are the volatile facts).
+    let grant_id = item.grant_id.unwrap_or_default();
+    let grant: Option<GrantBinding> = tx
+        .query_row(
+            "SELECT repository, issue_number, issue_revision, workflow_hash, phase,
+                    scope, caps, expires_at, state_epoch, policy_hash, status
+               FROM grants WHERE grant_id = ?1",
+            params![grant_id],
+            |row| {
+                Ok(GrantBinding {
+                    repository: row.get(0)?,
+                    issue_number: row.get(1)?,
+                    issue_revision: row.get(2)?,
+                    workflow_hash: row.get(3)?,
+                    phase: row.get(4)?,
+                    scope: row.get(5)?,
+                    caps: row.get(6)?,
+                    expires_at: row.get(7)?,
+                    state_epoch: row.get(8)?,
+                    policy_hash: row.get(9)?,
+                    status: row.get(10)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("admit_queue_item: grant", err))?;
+    let Some(grant) = grant else {
+        return Ok(AdmissionDecision::Refused {
+            code: crate::mutation::code::GRANT_INACTIVE,
+            message: format!(
+                "no grant {grant_id:?} exists; the presented grant is refused before \
+                 any effect"
+            ),
+        });
+    };
+    if grant.status != "active" {
+        return Ok(AdmissionDecision::Refused {
+            code: crate::mutation::code::GRANT_INACTIVE,
+            message: format!(
+                "grant {grant_id} is {}; a revoked or invalidated grant refuses this \
+                 item before any effect",
+                grant.status
+            ),
+        });
+    }
+    if grant.state_epoch != ctx.epoch {
+        return Ok(AdmissionDecision::Refused {
+            code: crate::mutation::code::EPOCH_STALE,
+            message: format!(
+                "grant {grant_id} was issued under epoch {}; grants die with their \
+                 epoch",
+                grant.state_epoch
+            ),
+        });
+    }
+    if crate::mutation::is_expired(&grant.expires_at, ctx.at) {
+        return Ok(AdmissionDecision::Refused {
+            code: crate::mutation::code::GRANT_EXPIRED,
+            message: format!("grant {grant_id} expired at {}", grant.expires_at),
+        });
+    }
+    if grant.repository != ctx.repository
+        || grant.issue_number != item.issue_number
+        || grant.issue_revision != item.issue_revision
+    {
+        return Ok(AdmissionDecision::Refused {
+            code: crate::queue_executor::codes::GRANT,
+            message: format!(
+                "grant {grant_id} binds {}#{}@{}, not the selected {scope}",
+                grant.repository, grant.issue_number, grant.issue_revision
+            ),
+        });
+    }
+    if grant.workflow_hash != ctx.workflow_hash {
+        return Ok(AdmissionDecision::Refused {
+            code: crate::mutation::code::WORKFLOW_CHANGED,
+            message: format!(
+                "grant {grant_id} binds workflow {}; the submission binds {}",
+                grant.workflow_hash, ctx.workflow_hash
+            ),
+        });
+    }
+    if grant.scope != scope {
+        return Ok(AdmissionDecision::Refused {
+            code: crate::queue_executor::codes::GRANT,
+            message: format!(
+                "grant {grant_id} declares scope {:?}; the reviewed planned scope is \
+                 {scope:?}",
+                grant.scope
+            ),
+        });
+    }
+    if let Some((code, message)) = slots.hold() {
+        return Ok(AdmissionDecision::Waiting { code, message });
+    }
+    if ctx.repository_lanes.iter().any(|(lane_issue, lane_scope)| {
+        *lane_issue != item.issue_number && crate::lifecycle::paths_overlap(&scope, lane_scope)
+    }) {
+        return Ok(AdmissionDecision::Waiting {
+            code: crate::lifecycle::code::MONOREPO_OVERLAP,
+            message: format!(
+                "the planned scope {scope:?} overlaps a concurrent lane scope in {:?}; \
+                 the item waits",
+                ctx.repository
+            ),
+        });
+    }
+    // Admitted: one run row plus one unique ownership row, both inside this
+    // transaction.
+    let derived = format!("hf-queue-run/v1|{}|{}", ctx.submission_id, item.work_item);
+    let run_id = format!(
+        "run-{}",
+        &crate::canonical::sha256_hex(derived.as_bytes())[..16]
+    );
+    tx.execute(
+        "INSERT INTO instances (instance_id, repository, state_epoch, status,
+                workflow_id, workflow_hash, policy_hash, grant_id, issue_number,
+                issue_revision, phase, scope, caps, current_node, normal_rounds,
+                recovery_rounds, human_queue, terminal_blockers, paused,
+                resume_digest, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 'new', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, '', 0, 0,
+                 0, 0, 0, '', ?13, ?13)",
+        params![
+            run_id,
+            ctx.repository,
+            ctx.epoch,
+            ctx.workflow_id,
+            grant.workflow_hash,
+            grant.policy_hash,
+            grant_id,
+            item.issue_number,
+            item.issue_revision,
+            grant.phase,
+            grant.scope,
+            grant.caps,
+            ctx.at
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("admit_queue_item: instance", err))?;
+    let prior: Option<String> = tx
+        .query_row(
+            "SELECT instance_id FROM queue_ownership
+              WHERE repository = ?1 AND issue_number = ?2",
+            params![ctx.repository, item.issue_number],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("admit_queue_item: ownership read", err))?;
+    match prior {
+        None => {
+            tx.execute(
+                "INSERT INTO queue_ownership (repository, issue_number, work_item,
+                        submission_id, instance_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    ctx.repository,
+                    item.issue_number,
+                    item.work_item,
+                    ctx.submission_id,
+                    run_id,
+                    ctx.at
+                ],
+            )
+            .map_err(|err| StateError::from_sqlite("admit_queue_item: ownership insert", err))?;
+        }
+        Some(prior_instance) => {
+            // A prior owner that left the owned set is historical (the row is
+            // replaced); a live one is a hard conflict that rolls the whole
+            // transaction back.
+            let still_owned: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM instances
+                      WHERE instance_id = ?1
+                        AND status IN ('new', 'running', 'paused', 'human_queue',
+                                       'blocked')",
+                    params![prior_instance],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|err| {
+                    StateError::from_sqlite("admit_queue_item: ownership recheck", err)
+                })?;
+            if still_owned.is_some() {
+                return Err(state_error(
+                    "state.ownership_conflict",
+                    format!(
+                        "issue {} of {} already has a live owner ({prior_instance}); \
+                         a duplicate owner is refused",
+                        item.issue_number, ctx.repository
+                    ),
+                ));
+            }
+            tx.execute(
+                "UPDATE queue_ownership SET work_item = ?3, submission_id = ?4,
+                        instance_id = ?5, created_at = ?6
+                  WHERE repository = ?1 AND issue_number = ?2",
+                params![
+                    ctx.repository,
+                    item.issue_number,
+                    item.work_item,
+                    ctx.submission_id,
+                    run_id,
+                    ctx.at
+                ],
+            )
+            .map_err(|err| StateError::from_sqlite("admit_queue_item: ownership update", err))?;
+        }
+    }
+    slots.consume();
+    Ok(AdmissionDecision::Admitted {
+        instance_id: run_id,
+    })
 }
 
 /// The admission decision of one membership item, decided inside the
@@ -1063,6 +1421,10 @@ impl State {
         if user_version == M0011_APPLIES_FROM {
             run_m0011(&mut conn)?;
             user_version = M0011_APPLIES_TO;
+        }
+        if user_version == M0012_APPLIES_FROM {
+            run_m0012(&mut conn)?;
+            user_version = M0012_APPLIES_TO;
         }
         match user_version {
             v if v == SCHEMA_VERSION => {
@@ -2443,30 +2805,9 @@ impl State {
         let conn = self.lock("queue_submission_by_id")?;
         let row = conn
             .query_row(
-                "SELECT submission_id, repository, state_epoch, digest, role_key,
-                        role_revision, workflow_id, workflow_hash, boundary_phase,
-                        integration_branch, completion_branch, boundary_caps,
-                        request_line, created_at
-                   FROM queue_submissions WHERE submission_id = ?1",
+                format!("{} WHERE submission_id = ?1", queue_submission_select_sql()).as_str(),
                 params![submission_id],
-                |row| {
-                    Ok(QueueSubmissionRow {
-                        submission_id: row.get(0)?,
-                        repository: row.get(1)?,
-                        state_epoch: row.get(2)?,
-                        digest: row.get(3)?,
-                        role_key: row.get(4)?,
-                        role_revision: row.get(5)?,
-                        workflow_id: row.get(6)?,
-                        workflow_hash: row.get(7)?,
-                        boundary_phase: row.get(8)?,
-                        integration_branch: row.get(9)?,
-                        completion_branch: row.get(10)?,
-                        boundary_caps: row.get(11)?,
-                        request_line: row.get(12)?,
-                        created_at: row.get(13)?,
-                    })
-                },
+                queue_submission_row_from,
             )
             .optional()
             .map_err(|err| StateError::from_sqlite("queue_submission_by_id: query", err))?;
@@ -2476,7 +2817,7 @@ impl State {
         let mut statement = conn
             .prepare(
                 "SELECT submission_id, ordinal, work_item, issue_number, issue_revision,
-                        status, reason, message, instance_id
+                        status, reason, message, instance_id, grant_id
                    FROM queue_submission_items WHERE submission_id = ?1 ORDER BY ordinal",
             )
             .map_err(|err| StateError::from_sqlite("queue_submission_by_id: prepare", err))?;
@@ -2492,6 +2833,7 @@ impl State {
                     reason: row.get(6)?,
                     message: row.get(7)?,
                     instance_id: row.get(8)?,
+                    grant_id: row.get(9)?,
                 })
             })
             .map_err(|err| StateError::from_sqlite("queue_submission_by_id: query_map", err))?;
@@ -2532,6 +2874,17 @@ impl State {
             out.push(row.map_err(|err| StateError::from_sqlite("queue_ownership_rows: row", err))?);
         }
         Ok(out)
+    }
+
+    /// Every durable queue-advance row of one submission, oldest delivery
+    /// first (issue #96; read-only — the queue readback and the focused tests
+    /// read this).
+    pub fn queue_advance_rows(
+        &self,
+        submission_id: &str,
+    ) -> Result<Vec<QueueAdvanceRow>, StateError> {
+        let conn = self.lock("queue_advance_rows")?;
+        queue_advance_rows_locked(&conn, submission_id)
     }
 
     /// Commit ONE durable queue submission in a single transaction (issue
@@ -2667,310 +3020,39 @@ impl State {
         };
         let mut items: Vec<QueueSubmissionItemRow> = Vec::new();
         for item in &plan.items {
-            let scope = format!("worktrees/issues/{}", item.issue_number);
             // Decide the item under the guard. The presented verdict is a
             // fail-closed hint; ownership, grant status/expiry, overlap and
-            // capacity are re-derived from live rows here, before any write.
-            let decision: AdmissionDecision = 'decide: {
-                match &item.verdict {
-                    SubmissionVerdict::Refused { code, message } => {
-                        break 'decide AdmissionDecision::Refused {
-                            code,
-                            message: message.clone(),
-                        };
-                    }
-                    SubmissionVerdict::Waiting { code, message } => {
-                        break 'decide AdmissionDecision::Waiting {
-                            code,
-                            message: message.clone(),
-                        };
-                    }
-                    SubmissionVerdict::Approved => {}
-                }
-                if let Some(run) = owned.get(&item.issue_number) {
-                    // An owner that appeared after the preview moved the
-                    // verdict: only an explicit engine-authorized resume of a
-                    // still-paused run admits an owned item; every other
-                    // owned item is refused without any effect.
-                    let authorized = match (&item.resume_digest, run.paused) {
-                        (Some(presented), true) => {
-                            crate::engine::authorize_resume(&run.resume_digest, presented).is_ok()
-                        }
-                        _ => false,
-                    };
-                    if authorized {
-                        let affected = tx
-                            .execute(
-                                "UPDATE instances SET paused = 0, resume_digest = '',
-                                        status = 'running', updated_at = ?2
-                                  WHERE instance_id = ?1 AND paused = 1",
-                                params![run.instance_id, plan.at],
-                            )
-                            .map_err(|err| {
-                                StateError::from_sqlite("submit_queue_run: resume", err)
-                            })?;
-                        if affected == 1 {
-                            break 'decide AdmissionDecision::Admitted {
-                                instance_id: run.instance_id.clone(),
-                            };
-                        }
-                        break 'decide AdmissionDecision::Refused {
-                            code: crate::queue_executor::codes::PAUSED,
-                            message:
-                                "the run left its paused state while the submission committed; \
-                                      no implicit state change is applied"
-                                    .to_string(),
-                        };
-                    }
-                    if run.paused {
-                        break 'decide AdmissionDecision::Refused {
-                            code: crate::queue_executor::codes::PAUSED,
-                            message: format!(
-                                "run {} is paused and stays paused: a paused fleet is resumed only \
-                                 with a separate explicit engine-minted resume authorization",
-                                run.instance_id
-                            ),
-                        };
-                    }
-                    if run.issue_revision != item.issue_revision {
-                        break 'decide AdmissionDecision::Refused {
-                            code: crate::queue_preview::holds::REVISION_STALE,
-                            message: format!(
-                                "run {} recorded revision {}; the selected revision {} is not the \
-                                 bound spec revision",
-                                run.instance_id, run.issue_revision, item.issue_revision
-                            ),
-                        };
-                    }
-                    break 'decide AdmissionDecision::Refused {
-                        code: crate::queue_executor::codes::ALREADY_OWNED,
-                        message: format!(
-                            "run {} already owns this issue; a duplicate submission never \
-                             creates a second owner",
-                            run.instance_id
-                        ),
-                    };
-                }
-                // No live owner: re-verify the presented grant under the
-                // guard (status, epoch and expiry are the volatile facts).
-                let grant_id = item.grant_id.as_deref().unwrap_or_default();
-                let grant: Option<GrantBinding> = tx
-                    .query_row(
-                        "SELECT repository, issue_number, issue_revision, workflow_hash, phase,
-                                scope, caps, expires_at, state_epoch, policy_hash, status
-                           FROM grants WHERE grant_id = ?1",
-                        params![grant_id],
-                        |row| {
-                            Ok(GrantBinding {
-                                repository: row.get(0)?,
-                                issue_number: row.get(1)?,
-                                issue_revision: row.get(2)?,
-                                workflow_hash: row.get(3)?,
-                                phase: row.get(4)?,
-                                scope: row.get(5)?,
-                                caps: row.get(6)?,
-                                expires_at: row.get(7)?,
-                                state_epoch: row.get(8)?,
-                                policy_hash: row.get(9)?,
-                                status: row.get(10)?,
-                            })
-                        },
-                    )
-                    .optional()
-                    .map_err(|err| StateError::from_sqlite("submit_queue_run: grant", err))?;
-                let Some(grant) = grant else {
-                    break 'decide AdmissionDecision::Refused {
-                        code: crate::mutation::code::GRANT_INACTIVE,
-                        message: format!(
-                            "no grant {grant_id:?} exists; the presented grant is refused before \
-                             any effect"
-                        ),
-                    };
-                };
-                if grant.status != "active" {
-                    break 'decide AdmissionDecision::Refused {
-                        code: crate::mutation::code::GRANT_INACTIVE,
-                        message: format!(
-                            "grant {grant_id} is {}; a revoked or invalidated grant refuses this \
-                             item before any effect",
-                            grant.status
-                        ),
-                    };
-                }
-                if grant.state_epoch != epoch {
-                    break 'decide AdmissionDecision::Refused {
-                        code: crate::mutation::code::EPOCH_STALE,
-                        message: format!(
-                            "grant {grant_id} was issued under epoch {}; grants die with their \
-                             epoch",
-                            grant.state_epoch
-                        ),
-                    };
-                }
-                if crate::mutation::is_expired(&grant.expires_at, &plan.at) {
-                    break 'decide AdmissionDecision::Refused {
-                        code: crate::mutation::code::GRANT_EXPIRED,
-                        message: format!("grant {grant_id} expired at {}", grant.expires_at),
-                    };
-                }
-                if grant.repository != plan.repository
-                    || grant.issue_number != item.issue_number
-                    || grant.issue_revision != item.issue_revision
-                {
-                    break 'decide AdmissionDecision::Refused {
-                        code: crate::queue_executor::codes::GRANT,
-                        message: format!(
-                            "grant {grant_id} binds {}#{}@{}, not the selected {scope}",
-                            grant.repository, grant.issue_number, grant.issue_revision
-                        ),
-                    };
-                }
-                if grant.workflow_hash != plan.workflow_hash {
-                    break 'decide AdmissionDecision::Refused {
-                        code: crate::mutation::code::WORKFLOW_CHANGED,
-                        message: format!(
-                            "grant {grant_id} binds workflow {}; the submission binds {}",
-                            grant.workflow_hash, plan.workflow_hash
-                        ),
-                    };
-                }
-                if grant.scope != scope {
-                    break 'decide AdmissionDecision::Refused {
-                        code: crate::queue_executor::codes::GRANT,
-                        message: format!(
-                            "grant {grant_id} declares scope {:?}; the reviewed planned scope is \
-                             {scope:?}",
-                            grant.scope
-                        ),
-                    };
-                }
-                if let Some((code, message)) = slots.hold() {
-                    break 'decide AdmissionDecision::Waiting { code, message };
-                }
-                if repository_lanes.iter().any(|(lane_issue, lane_scope)| {
-                    *lane_issue != item.issue_number
-                        && crate::lifecycle::paths_overlap(&scope, lane_scope)
-                }) {
-                    break 'decide AdmissionDecision::Waiting {
-                        code: crate::lifecycle::code::MONOREPO_OVERLAP,
-                        message: format!(
-                            "the planned scope {scope:?} overlaps a concurrent lane scope in {:?}; \
-                             the item waits",
-                            plan.repository
-                        ),
-                    };
-                }
-                // Admitted: one run row plus one unique ownership row, both
-                // inside this transaction.
-                let derived = format!("hf-queue-run/v1|{}|{}", plan.submission_id, item.work_item);
-                let run_id = format!(
-                    "run-{}",
-                    &crate::canonical::sha256_hex(derived.as_bytes())[..16]
-                );
-                tx.execute(
-                    "INSERT INTO instances (instance_id, repository, state_epoch, status,
-                            workflow_id, workflow_hash, policy_hash, grant_id, issue_number,
-                            issue_revision, phase, scope, caps, current_node, normal_rounds,
-                            recovery_rounds, human_queue, terminal_blockers, paused,
-                            resume_digest, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, 'new', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, '', 0, 0,
-                             0, 0, 0, '', ?13, ?13)",
-                    params![
-                        run_id,
-                        plan.repository,
+            // capacity are re-derived from live rows by the shared admission
+            // helper (the SAME code path the #96 advance admits through).
+            let decision: AdmissionDecision = match &item.verdict {
+                SubmissionVerdict::Refused { code, message } => AdmissionDecision::Refused {
+                    code,
+                    message: message.clone(),
+                },
+                SubmissionVerdict::Waiting { code, message } => AdmissionDecision::Waiting {
+                    code,
+                    message: message.clone(),
+                },
+                SubmissionVerdict::Approved => {
+                    let admission = QueueAdmission {
+                        repository: &plan.repository,
+                        submission_id: &plan.submission_id,
                         epoch,
-                        plan.workflow_id,
-                        grant.workflow_hash,
-                        grant.policy_hash,
-                        grant_id,
-                        item.issue_number,
-                        item.issue_revision,
-                        grant.phase,
-                        grant.scope,
-                        grant.caps,
-                        plan.at
-                    ],
-                )
-                .map_err(|err| StateError::from_sqlite("submit_queue_run: instance", err))?;
-                let prior: Option<String> = tx
-                    .query_row(
-                        "SELECT instance_id FROM queue_ownership
-                          WHERE repository = ?1 AND issue_number = ?2",
-                        params![plan.repository, item.issue_number],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(|err| {
-                        StateError::from_sqlite("submit_queue_run: ownership read", err)
-                    })?;
-                match prior {
-                    None => {
-                        tx.execute(
-                            "INSERT INTO queue_ownership (repository, issue_number, work_item,
-                                    submission_id, instance_id, created_at)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                            params![
-                                plan.repository,
-                                item.issue_number,
-                                item.work_item,
-                                plan.submission_id,
-                                run_id,
-                                plan.at
-                            ],
-                        )
-                        .map_err(|err| {
-                            StateError::from_sqlite("submit_queue_run: ownership insert", err)
-                        })?;
-                    }
-                    Some(prior_instance) => {
-                        // A prior owner that left the owned set is historical
-                        // (the row is replaced); a live one is a hard
-                        // conflict that rolls the whole submission back.
-                        let still_owned: Option<i64> = tx
-                            .query_row(
-                                "SELECT 1 FROM instances
-                                  WHERE instance_id = ?1
-                                    AND status IN ('new', 'running', 'paused', 'human_queue',
-                                                   'blocked')",
-                                params![prior_instance],
-                                |row| row.get(0),
-                            )
-                            .optional()
-                            .map_err(|err| {
-                                StateError::from_sqlite("submit_queue_run: ownership recheck", err)
-                            })?;
-                        if still_owned.is_some() {
-                            return Err(state_error(
-                                "state.ownership_conflict",
-                                format!(
-                                    "issue {} of {} already has a live owner ({prior_instance}); \
-                                     a duplicate owner is refused",
-                                    item.issue_number, plan.repository
-                                ),
-                            ));
-                        }
-                        tx.execute(
-                            "UPDATE queue_ownership SET work_item = ?3, submission_id = ?4,
-                                    instance_id = ?5, created_at = ?6
-                              WHERE repository = ?1 AND issue_number = ?2",
-                            params![
-                                plan.repository,
-                                item.issue_number,
-                                item.work_item,
-                                plan.submission_id,
-                                run_id,
-                                plan.at
-                            ],
-                        )
-                        .map_err(|err| {
-                            StateError::from_sqlite("submit_queue_run: ownership update", err)
-                        })?;
-                    }
+                        at: &plan.at,
+                        workflow_id: &plan.workflow_id,
+                        workflow_hash: &plan.workflow_hash,
+                        ownership: &owned,
+                        repository_lanes: &repository_lanes,
+                    };
+                    let candidate = QueueAdmissionItem {
+                        issue_number: item.issue_number,
+                        issue_revision: &item.issue_revision,
+                        work_item: &item.work_item,
+                        grant_id: item.grant_id.as_deref(),
+                        resume_digest: item.resume_digest.as_deref(),
+                    };
+                    admit_queue_item_in_tx(&tx, &admission, &candidate, &mut slots)?
                 }
-                slots.consume();
-                break 'decide AdmissionDecision::Admitted {
-                    instance_id: run_id,
-                };
             };
             let (status, reason, message, instance_id) = match decision {
                 AdmissionDecision::Admitted { instance_id } => {
@@ -2999,14 +3081,18 @@ impl State {
                 reason,
                 message,
                 instance_id,
+                // The presented grant binding persists with the item so the
+                // #96 advance re-verifies the SAME approval under the guard.
+                grant_id: item.grant_id.clone().unwrap_or_default(),
             });
         }
         tx.execute(
             "INSERT INTO queue_submissions (submission_id, repository, state_epoch, digest,
                     role_key, role_revision, workflow_id, workflow_hash, boundary_phase,
                     integration_branch, completion_branch, boundary_caps, request_line,
-                    created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    caps_global, caps_per_repository, caps_per_harness, harness_lanes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                     ?18)",
             params![
                 plan.submission_id,
                 plan.repository,
@@ -3023,6 +3109,10 @@ impl State {
                     plan.boundary_caps.iter().map(|cap| string(cap)).collect()
                 )),
                 plan.request_line,
+                plan.admission_caps.global as i64,
+                plan.admission_caps.per_repository as i64,
+                plan.admission_caps.per_harness as i64,
+                plan.harness_lanes,
                 plan.at
             ],
         )
@@ -3030,8 +3120,9 @@ impl State {
         for item in &items {
             tx.execute(
                 "INSERT INTO queue_submission_items (submission_id, ordinal, work_item,
-                        issue_number, issue_revision, status, reason, message, instance_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        issue_number, issue_revision, status, reason, message, instance_id,
+                        grant_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     item.submission_id,
                     item.ordinal,
@@ -3041,7 +3132,8 @@ impl State {
                     item.status,
                     item.reason,
                     item.message,
-                    item.instance_id
+                    item.instance_id,
+                    item.grant_id
                 ],
             )
             .map_err(|err| StateError::from_sqlite("submit_queue_run: item", err))?;
@@ -3091,6 +3183,10 @@ impl State {
                 plan.boundary_caps.iter().map(|cap| string(cap)).collect(),
             )),
             request_line: plan.request_line.clone(),
+            caps_global: plan.admission_caps.global as i64,
+            caps_per_repository: plan.admission_caps.per_repository as i64,
+            caps_per_harness: plan.admission_caps.per_harness as i64,
+            harness_lanes: plan.harness_lanes,
             created_at: plan.at.clone(),
         };
         Ok((submission, items))
@@ -8910,9 +9006,23 @@ const M0011_ID: &str = "m0011_supervision_v11";
 const M0011_APPLIES_FROM: i64 = 10;
 const M0011_APPLIES_TO: i64 = 11;
 
+/// Migration m0012 (issue #96: bounded continuation to the next eligible
+/// issue). Purely additive: the persisted per-item grant binding of a queue
+/// membership item (the advance re-verifies the SAME presented grant under
+/// the guard), the approved admission inputs the submission committed under
+/// (caps + the attested same-harness occupancy: the advance re-applies the
+/// approved inputs against live counts), and the `queue_advances` rows — one
+/// consumed verified delivery per submission item, the durable cursor and
+/// the recorded hold. No existing table or row is touched, so stored grants,
+/// instances, lane records, submissions and supervisions are never
+/// reinterpreted.
+const M0012_ID: &str = "m0012_queue_advances_v12";
+const M0012_APPLIES_FROM: i64 = 11;
+const M0012_APPLIES_TO: i64 = 12;
+
 /// Ordered migration chain (id, applies_from, applies_to). The runner in
 /// [`State::open`] applies every pending migration before serving.
-const MIGRATIONS: [(&str, i64, i64); 11] = [
+const MIGRATIONS: [(&str, i64, i64); 12] = [
     (M0001_ID, M0001_APPLIES_FROM, M0001_APPLIES_TO),
     (M0002_ID, M0002_APPLIES_FROM, M0002_APPLIES_TO),
     (M0003_ID, M0003_APPLIES_FROM, M0003_APPLIES_TO),
@@ -8924,6 +9034,7 @@ const MIGRATIONS: [(&str, i64, i64); 11] = [
     (M0009_ID, M0009_APPLIES_FROM, M0009_APPLIES_TO),
     (M0010_ID, M0010_APPLIES_FROM, M0010_APPLIES_TO),
     (M0011_ID, M0011_APPLIES_FROM, M0011_APPLIES_TO),
+    (M0012_ID, M0012_APPLIES_FROM, M0012_APPLIES_TO),
 ];
 
 /// Ordered migration-chain identifiers (`m0001`..`m0011`), exposed for the
@@ -8933,7 +9044,7 @@ const MIGRATIONS: [(&str, i64, i64); 11] = [
 pub fn migration_chain_ids() -> &'static [&'static str] {
     const IDS: [&str; MIGRATIONS.len()] = [
         M0001_ID, M0002_ID, M0003_ID, M0004_ID, M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID,
-        M0010_ID, M0011_ID,
+        M0010_ID, M0011_ID, M0012_ID,
     ];
     &IDS
 }
@@ -10372,7 +10483,24 @@ pub struct SupervisionRuntime {
     pub last_tick_at: String,
 }
 
-/// The recorded-evidence snapshot of one supervised run: everything the
+/// One committed queue membership of a supervised run (issue #96): the item
+/// of the already-authorized submission the run was admitted from. The
+/// advance is keyed to its ordinal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueItemRef {
+    /// The committed submission the run belongs to.
+    pub submission_id: String,
+    /// Membership ordinal (the advance's idempotency key).
+    pub ordinal: i64,
+    /// Stable work-item id of the issue.
+    pub work_item: String,
+    /// Issue number within the submission's repository.
+    pub issue_number: i64,
+    /// Recorded item status (`admitted` | `waiting` | `refused`).
+    pub status: String,
+}
+
+/// The recorded evidence snapshot of one supervised run: exactly the facts a
 /// classification reads, re-read from durable rows under ONE guard. Nothing
 /// here is inferred from activity or from the caller.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10399,6 +10527,12 @@ pub struct SupervisionEvidence {
     pub in_flight: Option<String>,
     /// The stored meaningful-progress observation time ('' when none).
     pub progress_at: String,
+    /// The committed queue membership of this run, when the run was admitted
+    /// from a submission (issue #96). `None` = no advance is ever possible.
+    pub item: Option<QueueItemRef>,
+    /// The NEWEST recorded review-evidence row, when one exists (the same
+    /// row the board read model and the merge gate read).
+    pub newest_evidence: Option<EvidenceRow>,
 }
 
 /// The plan of one committed supervision check (built by the driver from the
@@ -10433,6 +10567,12 @@ pub struct SupervisionCheckPlan {
     pub next_check_unix: i64,
     /// Why the next check is eligible.
     pub next_check_reason: &'static str,
+    /// The fresh VERIFIED delivery of this run, when the recorded evidence
+    /// carries one (issue #96): the ONE continuation effect of a committed
+    /// check — the transaction re-verifies it under the guard and advances
+    /// the queue cursor exactly once per delivered item. `None` = the check
+    /// has no effect beyond its own durable record.
+    pub advance: Option<crate::supervision::VerifiedDelivery>,
 }
 
 /// The outcome of one bounded event-fold pass.
@@ -10630,6 +10770,669 @@ fn arm_supervision_in_tx(
         .optional()
         .map_err(|err| StateError::from_sqlite("arm_supervision: reread", err))?;
     row.ok_or_else(|| state_error("state.supervision_invalid", "supervision row missing"))
+}
+
+// ---------------------------------------------------------------------------
+// Queue cursor advance (issue #96): completion-to-next-work for one
+// already-authorized queue, keyed to the verified delivery that triggers it.
+// ---------------------------------------------------------------------------
+
+/// One queue-submission row as the advance reads it (the shared projection).
+fn queue_submission_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueSubmissionRow> {
+    Ok(QueueSubmissionRow {
+        submission_id: row.get(0)?,
+        repository: row.get(1)?,
+        state_epoch: row.get(2)?,
+        digest: row.get(3)?,
+        role_key: row.get(4)?,
+        role_revision: row.get(5)?,
+        workflow_id: row.get(6)?,
+        workflow_hash: row.get(7)?,
+        boundary_phase: row.get(8)?,
+        integration_branch: row.get(9)?,
+        completion_branch: row.get(10)?,
+        boundary_caps: row.get(11)?,
+        request_line: row.get(12)?,
+        caps_global: row.get(13)?,
+        caps_per_repository: row.get(14)?,
+        caps_per_harness: row.get(15)?,
+        harness_lanes: row.get(16)?,
+        created_at: row.get(17)?,
+    })
+}
+
+/// The submission-row projection (`queue_submission_row_from` order).
+fn queue_submission_select_sql() -> &'static str {
+    "SELECT submission_id, repository, state_epoch, digest, role_key,
+            role_revision, workflow_id, workflow_hash, boundary_phase,
+            integration_branch, completion_branch, boundary_caps,
+            request_line, caps_global, caps_per_repository, caps_per_harness,
+            harness_lanes, created_at
+       FROM queue_submissions"
+}
+
+/// The durable queue-advance rows of one submission, oldest delivery first.
+fn queue_advance_rows_locked(
+    conn: &Connection,
+    submission_id: &str,
+) -> Result<Vec<QueueAdvanceRow>, StateError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT submission_id, delivered_ordinal, delivered_work_item, delivered_head,
+                    evidence_id, next_ordinal, next_work_item, next_instance_id, reason,
+                    message, at
+               FROM queue_advances WHERE submission_id = ?1 ORDER BY delivered_ordinal",
+        )
+        .map_err(|err| StateError::from_sqlite("queue_advance_rows: prepare", err))?;
+    let rows = statement
+        .query_map(params![submission_id], advance_row_from)
+        .map_err(|err| StateError::from_sqlite("queue_advance_rows: query", err))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|err| StateError::from_sqlite("queue_advance_rows: row", err))?);
+    }
+    Ok(out)
+}
+
+/// One queue-advance row as the read API returns it.
+fn advance_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueAdvanceRow> {
+    Ok(QueueAdvanceRow {
+        submission_id: row.get(0)?,
+        delivered_ordinal: row.get(1)?,
+        delivered_work_item: row.get(2)?,
+        delivered_head: row.get(3)?,
+        evidence_id: row.get(4)?,
+        next_ordinal: row.get(5)?,
+        next_work_item: row.get(6)?,
+        next_instance_id: row.get(7)?,
+        reason: row.get(8)?,
+        message: row.get(9)?,
+        at: row.get(10)?,
+    })
+}
+
+/// The NEWEST recorded review-evidence row of one run, read on the caller's
+/// guard (the same ordering the board read model and the merge gate use).
+fn newest_evidence_locked(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<Option<EvidenceRow>, StateError> {
+    conn.query_row(
+        "SELECT evidence_id, instance_id, repository, feature_head, integration_base,
+                workflow_hash, policy_hash, verdict, reviewer, checks, created_at
+           FROM evidence WHERE instance_id = ?1
+          ORDER BY created_at DESC, evidence_id DESC LIMIT 1",
+        params![instance_id],
+        evidence_row_from,
+    )
+    .optional()
+    .map_err(|err| StateError::from_sqlite("newest_evidence", err))
+}
+
+/// Whether one run's RECORDED evidence is a fresh VERIFIED delivery, re-read
+/// under the caller's guard. The same predicate `supervision::verified_delivery`
+/// applies to the driver's snapshot, minus the plan's exact-evidence binding:
+/// the run must not be held (paused, blocked, human queue, invalidated,
+/// terminal blocker), its epoch must be live, and its newest review evidence
+/// must be a `pass` with every named check `passed` at one exact head bound
+/// to the run's own workflow and policy pins.
+fn delivery_verified_locked(
+    conn: &Connection,
+    run: &InstanceRow,
+) -> Result<Option<EvidenceRow>, StateError> {
+    if run.paused
+        || run.pause_requested
+        || run.human_queue
+        || run.status == "blocked"
+        || run.status == "invalidated"
+        || run.terminal_blockers > 0
+    {
+        return Ok(None);
+    }
+    if run.state_epoch != current_epoch_locked(conn)? {
+        return Ok(None);
+    }
+    // A step claim still in flight means the run is mid-effect.
+    if in_flight_steps_locked(conn)?
+        .iter()
+        .any(|(named, _)| named == &run.instance_id || named == "*")
+    {
+        return Ok(None);
+    }
+    let Some(newest) = newest_evidence_locked(conn, &run.instance_id)? else {
+        return Ok(None);
+    };
+    if newest.verdict != "pass" {
+        return Ok(None);
+    }
+    let view = crate::mutation::EvidenceView {
+        evidence_id: newest.evidence_id.clone(),
+        feature_head: newest.feature_head.clone(),
+        integration_base: newest.integration_base.clone(),
+        workflow_hash: newest.workflow_hash.clone(),
+        policy_hash: newest.policy_hash.clone(),
+        verdict: newest.verdict.clone(),
+        reviewer: newest.reviewer.clone(),
+        checks: newest.checks.clone(),
+        created_at: newest.created_at.clone(),
+    };
+    if !crate::mutation::evidence_checks_passed(&view)
+        .map_err(|err| state_error("state.evidence_invalid", err.message))?
+    {
+        return Ok(None);
+    }
+    if newest.workflow_hash != run.workflow_hash || newest.policy_hash != run.policy_hash {
+        return Ok(None);
+    }
+    if !crate::formats::is_hex40(&newest.feature_head) {
+        return Ok(None);
+    }
+    Ok(Some(newest))
+}
+
+/// The declared dependencies of one selection item of a committed submission:
+/// `(issue number, required issue numbers)` per selected issue, parsed from
+/// the canonical bound-input document. A requirement outside the submission's
+/// repository can never be settled by this queue.
+fn bound_selected_dependencies(request_line: &str, repository: &str) -> Vec<(i64, Vec<i64>)> {
+    let Ok(request) = Val::parse_json(request_line) else {
+        return Vec::new();
+    };
+    let Some(Val::Arr(selected)) = request.get("selected") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for issue in selected {
+        let Some(id) = issue.get("id").and_then(Val::as_str) else {
+            continue;
+        };
+        let Ok(identity) = crate::queue_preview::IssueId::parse(id, repository) else {
+            continue;
+        };
+        let requires = issue
+            .get("requires")
+            .and_then(Val::as_array)
+            .map(|requires| {
+                requires
+                    .iter()
+                    .filter_map(Val::as_str)
+                    .filter_map(|text| {
+                        crate::queue_preview::IssueId::parse(text, repository)
+                            .ok()
+                            .filter(|dependency| dependency.repository == identity.repository)
+                            .map(|dependency| dependency.number)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push((identity.number, requires));
+    }
+    out
+}
+
+/// Whether one dependency issue of a submission is DELIVERED AND VERIFIED:
+/// its membership item must be admitted, its run must carry a fresh verified
+/// delivery, and nothing about it may be inferred from a label. Any doubt is
+/// an unmet dependency (a held dependent), never a settled one.
+fn dependency_met_locked(
+    conn: &Connection,
+    items: &[QueueSubmissionItemRow],
+    dependency: i64,
+) -> Result<bool, StateError> {
+    let Some(item) = items.iter().find(|item| item.issue_number == dependency) else {
+        // Not part of the selected set: only a committed membership can
+        // prove delivery, so an unselected requirement is never met.
+        return Ok(false);
+    };
+    let Some(instance_id) = item.instance_id.as_deref() else {
+        return Ok(false);
+    };
+    let run: Option<InstanceRow> = conn
+        .query_row(
+            format!("{} WHERE instance_id = ?1", instance_select_sql()).as_str(),
+            params![instance_id],
+            instance_row_from,
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("dependency_met: run", err))?;
+    let Some(run) = run else {
+        return Ok(false);
+    };
+    Ok(delivery_verified_locked(conn, &run)?.is_some())
+}
+
+/// One submission's queue cursor state as the transaction reads it.
+struct QueueAdvanceAttempt {
+    /// The first not-yet-dispatched approved item, in membership order.
+    candidate: Option<QueueSubmissionItemRow>,
+    /// Its unmet dependency, when one is declared and unmet.
+    unmet_dependency: Option<i64>,
+    /// Whether an advance row for this delivery already exists.
+    recorded: Option<QueueAdvanceRow>,
+}
+
+/// Re-read the durable facts ONE advance decision needs: the existing
+/// consumption of this delivery (the idempotency fence), the candidate item
+/// and its dependency state. Pure reads only.
+fn queue_advance_attempt_locked(
+    tx: &rusqlite::Transaction<'_>,
+    delivery: &crate::supervision::VerifiedDelivery,
+    repository: &str,
+    request_line: &str,
+    items: &[QueueSubmissionItemRow],
+) -> Result<QueueAdvanceAttempt, StateError> {
+    let recorded: Option<QueueAdvanceRow> = tx
+        .query_row(
+            "SELECT submission_id, delivered_ordinal, delivered_work_item, delivered_head,
+                    evidence_id, next_ordinal, next_work_item, next_instance_id, reason,
+                    message, at
+               FROM queue_advances WHERE submission_id = ?1 AND delivered_ordinal = ?2",
+            params![delivery.submission_id, delivery.item_ordinal],
+            advance_row_from,
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("queue_advance: recorded", err))?;
+    let candidate = items.iter().find(|item| item.status == "waiting").cloned();
+    let dependencies = bound_selected_dependencies(request_line, repository);
+    let requires = candidate
+        .as_ref()
+        .and_then(|candidate| {
+            dependencies
+                .iter()
+                .find(|(number, _)| *number == candidate.issue_number)
+                .map(|(_, requires)| requires.clone())
+        })
+        .unwrap_or_default();
+    let mut unmet: Option<i64> = None;
+    for dependency in &requires {
+        if !dependency_met_locked(tx, items, *dependency)? {
+            unmet = Some(*dependency);
+            break;
+        }
+    }
+    Ok(QueueAdvanceAttempt {
+        candidate,
+        unmet_dependency: unmet,
+        recorded,
+    })
+}
+
+/// Commit the queue-cursor advance of ONE fresh verified delivery (issue
+/// #96) inside the caller's transaction, atomically with the reconciliation
+/// that recognized it.
+///
+/// The plan was built from an earlier snapshot, so everything is re-read and
+/// re-verified here before any write: the run still exists and its DELIVERY is
+/// still the fresh verified delivery the plan claims (`delivered_head` +
+/// `evidence_id` included), the run is still the admitted membership item of
+/// the named submission, and the delivery has not been consumed yet. ONE
+/// consumption per delivered issue, ever: a duplicate delivery event, a
+/// replayed check or a crash and restart can only ever observe the recorded
+/// row. The candidate is the first `waiting` item in membership order; its
+/// declared dependencies must each be delivered and verified, otherwise the
+/// item is HELD with the reason recorded (never dispatched, never marked
+/// done). An admitted candidate is created through the SAME admission helper
+/// the submission used, with the same approved caps and occupancy
+/// attestation, and is armed with the delivering run's supervision
+/// authorization so the queue keeps continuing.
+fn advance_queue_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    delivery: &crate::supervision::VerifiedDelivery,
+    delivering_instance: &str,
+    at: &str,
+) -> Result<(), StateError> {
+    // 1. Re-verify the delivery itself, under this guard.
+    let run: Option<InstanceRow> = tx
+        .query_row(
+            format!("{} WHERE instance_id = ?1", instance_select_sql()).as_str(),
+            params![delivering_instance],
+            instance_row_from,
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("queue_advance: run", err))?;
+    let Some(run) = run else {
+        return Ok(());
+    };
+    let Some(newest) = delivery_verified_locked(tx, &run)? else {
+        return Ok(());
+    };
+    if newest.evidence_id != delivery.evidence_id || newest.feature_head != delivery.feature_head {
+        // A newer (or different) evidence row moved the delivery: the plan is
+        // stale and the next reconciliation re-derives it. Nothing advances.
+        return Ok(());
+    }
+    // 2. The run must still be the ADMITTED membership item named by the plan.
+    let item: Option<(String, i64, String)> = tx
+        .query_row(
+            "SELECT submission_id, ordinal, work_item FROM queue_submission_items
+              WHERE submission_id = ?1 AND ordinal = ?2 AND instance_id = ?3
+                AND status = 'admitted'",
+            params![
+                delivery.submission_id,
+                delivery.item_ordinal,
+                delivering_instance
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("queue_advance: item", err))?;
+    let Some((submission_id, _, work_item)) = item else {
+        return Ok(());
+    };
+    if work_item != delivery.work_item {
+        return Ok(());
+    }
+    // 3. The submission must still exist and be readable (its approved
+    //    admission inputs are re-applied below).
+    let submission: Option<QueueSubmissionRow> = tx
+        .query_row(
+            format!("{} WHERE submission_id = ?1", queue_submission_select_sql()).as_str(),
+            params![submission_id],
+            queue_submission_row_from,
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("queue_advance: submission", err))?;
+    let Some(submission) = submission else {
+        return Ok(());
+    };
+    let mut statement = tx
+        .prepare(
+            "SELECT submission_id, ordinal, work_item, issue_number, issue_revision,
+                    status, reason, message, instance_id, grant_id
+               FROM queue_submission_items WHERE submission_id = ?1 ORDER BY ordinal",
+        )
+        .map_err(|err| StateError::from_sqlite("queue_advance: items", err))?;
+    let rows = statement
+        .query_map(params![submission_id], |row| {
+            Ok(QueueSubmissionItemRow {
+                submission_id: row.get(0)?,
+                ordinal: row.get(1)?,
+                work_item: row.get(2)?,
+                issue_number: row.get(3)?,
+                issue_revision: row.get(4)?,
+                status: row.get(5)?,
+                reason: row.get(6)?,
+                message: row.get(7)?,
+                instance_id: row.get(8)?,
+                grant_id: row.get(9)?,
+            })
+        })
+        .map_err(|err| StateError::from_sqlite("queue_advance: items query", err))?;
+    let mut items: Vec<QueueSubmissionItemRow> = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|err| StateError::from_sqlite("queue_advance: items row", err))?);
+    }
+    drop(statement);
+    // 4. The idempotency fence + the candidate: a consumed delivery with a
+    //    dispatch (or an exhausted queue) is final; a recorded HOLD is
+    //    re-evaluated, because its reason is observed state that can settle.
+    let attempt = queue_advance_attempt_locked(
+        tx,
+        delivery,
+        &submission.repository,
+        &submission.request_line,
+        &items,
+    )?;
+    if let Some(recorded) = &attempt.recorded {
+        if recorded.next_instance_id.is_some() {
+            return Ok(());
+        }
+        if recorded.reason.is_none() {
+            // Exhausted: nothing was left to dispatch then, and a later
+            // delivery owns any further cursor move.
+            return Ok(());
+        }
+    }
+    // The verified delivery COMPLETES the delivering run: the queue's
+    // continuation is completion-to-next-work, and the freed slot is what
+    // lets the next approved issue be admitted at all. Idempotent by
+    // construction (a done run stays done) and atomic with the cursor move.
+    tx.execute(
+        "UPDATE instances SET status = 'done', updated_at = ?2
+          WHERE instance_id = ?1 AND status NOT IN ('done', 'invalidated')",
+        params![delivering_instance, at],
+    )
+    .map_err(|err| StateError::from_sqlite("queue_advance: complete", err))?;
+    let (next_ordinal, next_work_item, next_instance_id, reason, message) = match &attempt.candidate
+    {
+        None => (None, None, None, None, None),
+        Some(candidate) => {
+            if let Some(dependency) = attempt.unmet_dependency {
+                let in_set = items.iter().any(|item| item.issue_number == dependency);
+                let (code, message) = if in_set {
+                    (
+                        crate::queue_executor::advance::DEPENDENCY_UNSETTLED,
+                        format!(
+                            "issue {} declares the dependency #{dependency}, whose delivery is \
+                             not verified yet; the item stays held and is never dispatched or \
+                             marked done from an unmet dependency",
+                            candidate.issue_number
+                        ),
+                    )
+                } else {
+                    (
+                        crate::queue_executor::advance::DEPENDENCY_UNRESOLVED,
+                        format!(
+                            "issue {} declares the dependency #{dependency}, which is not part \
+                             of this submission's selected set; this queue can never settle it, \
+                             so the item stays held",
+                            candidate.issue_number
+                        ),
+                    )
+                };
+                (
+                    Some(candidate.ordinal),
+                    Some(candidate.work_item.clone()),
+                    None,
+                    Some(code.to_string()),
+                    Some(message),
+                )
+            } else {
+                // Re-apply the approved admission inputs against live counts:
+                // the SAME caps and occupancy attestation the submission
+                // committed under, and the SAME guard-verifying helper.
+                let epoch = current_epoch_locked(tx)?;
+                let counted_global: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM instances
+                          WHERE status IN ('new', 'running', 'human_queue', 'blocked')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|err| StateError::from_sqlite("queue_advance: counted", err))?;
+                let mut statement = tx
+                    .prepare(
+                        "SELECT issue_number, scope FROM instances
+                          WHERE repository = ?1
+                            AND status IN ('new', 'running', 'human_queue', 'blocked')",
+                    )
+                    .map_err(|err| StateError::from_sqlite("queue_advance: lanes", err))?;
+                let rows = statement
+                    .query_map(params![submission.repository], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|err| StateError::from_sqlite("queue_advance: lanes query", err))?;
+                let mut repository_lanes: Vec<(i64, String)> = Vec::new();
+                for row in rows {
+                    repository_lanes.push(
+                        row.map_err(|err| {
+                            StateError::from_sqlite("queue_advance: lanes row", err)
+                        })?,
+                    );
+                }
+                drop(statement);
+                let mut owned: BTreeMap<i64, OwnedRunSnapshot> = BTreeMap::new();
+                let mut statement = tx
+                    .prepare(
+                        "SELECT issue_number, instance_id, issue_revision, paused, resume_digest
+                           FROM instances
+                          WHERE repository = ?1
+                            AND status IN ('new', 'running', 'paused', 'human_queue', 'blocked')",
+                    )
+                    .map_err(|err| StateError::from_sqlite("queue_advance: owned", err))?;
+                let rows = statement
+                    .query_map(params![submission.repository], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            OwnedRunSnapshot {
+                                instance_id: row.get(1)?,
+                                issue_revision: row.get(2)?,
+                                paused: row.get::<_, i64>(3)? != 0,
+                                resume_digest: row.get(4)?,
+                            },
+                        ))
+                    })
+                    .map_err(|err| StateError::from_sqlite("queue_advance: owned query", err))?;
+                for row in rows {
+                    let (issue_number, snapshot) = row
+                        .map_err(|err| StateError::from_sqlite("queue_advance: owned row", err))?;
+                    owned.entry(issue_number).or_insert(snapshot);
+                }
+                drop(statement);
+                let caps = crate::lifecycle::ConcurrencyCaps {
+                    global: usize::try_from(submission.caps_global).unwrap_or(0),
+                    per_repository: usize::try_from(submission.caps_per_repository).unwrap_or(0),
+                    per_harness: usize::try_from(submission.caps_per_harness).unwrap_or(0),
+                };
+                let mut slots = FanoutSlots {
+                    caps: &caps,
+                    counted_global,
+                    counted_repository: repository_lanes.len() as i64,
+                    harness_lanes: submission.harness_lanes,
+                    admitted_global: 0,
+                    admitted_repository: 0,
+                    admitted_harness: 0,
+                };
+                let admission = QueueAdmission {
+                    repository: &submission.repository,
+                    submission_id: &submission.submission_id,
+                    epoch,
+                    at,
+                    workflow_id: &submission.workflow_id,
+                    workflow_hash: &submission.workflow_hash,
+                    ownership: &owned,
+                    repository_lanes: &repository_lanes,
+                };
+                let candidate_item = QueueAdmissionItem {
+                    issue_number: candidate.issue_number,
+                    issue_revision: &candidate.issue_revision,
+                    work_item: &candidate.work_item,
+                    grant_id: Some(candidate.grant_id.as_str()).filter(|grant| !grant.is_empty()),
+                    resume_digest: None,
+                };
+                match admit_queue_item_in_tx(tx, &admission, &candidate_item, &mut slots)? {
+                    AdmissionDecision::Admitted { instance_id } => {
+                        tx.execute(
+                            "UPDATE queue_submission_items
+                                SET status = 'admitted', reason = NULL, message = NULL,
+                                    instance_id = ?3
+                              WHERE submission_id = ?1 AND ordinal = ?2",
+                            params![submission.submission_id, candidate.ordinal, instance_id],
+                        )
+                        .map_err(|err| StateError::from_sqlite("queue_advance: item admit", err))?;
+                        // A recorded hold that named THIS item is settled by
+                        // the dispatch that superseded it: the older delivery
+                        // row keeps its consumption key and now records the
+                        // dispatch, so a read can never report a stale hold.
+                        tx.execute(
+                            "UPDATE queue_advances
+                                SET next_instance_id = ?3, reason = NULL, message = NULL,
+                                    at = ?4
+                              WHERE submission_id = ?1 AND next_ordinal = ?2
+                                AND next_instance_id IS NULL",
+                            params![submission.submission_id, candidate.ordinal, instance_id, at],
+                        )
+                        .map_err(|err| {
+                            StateError::from_sqlite("queue_advance: hold settled", err)
+                        })?;
+                        // Arm the dispatched run with the SAME supervision
+                        // authorization that is driving this queue, so the
+                        // continuation keeps going without a conductor.
+                        let source: Option<SupervisionRow> = tx
+                            .query_row(
+                                format!("{} WHERE instance_id = ?1", supervision_select_sql())
+                                    .as_str(),
+                                params![delivering_instance],
+                                supervision_row_from,
+                            )
+                            .optional()
+                            .map_err(|err| {
+                                StateError::from_sqlite("queue_advance: supervision", err)
+                            })?;
+                        if let Some(source) = source {
+                            arm_supervision_in_tx(
+                                tx,
+                                &instance_id,
+                                &SupervisionAuthorizationPlan {
+                                    desired: source.desired.clone(),
+                                    check_interval_secs: source.check_interval_secs,
+                                    progress_timeout_secs: source.progress_timeout_secs,
+                                },
+                                &source.authorization_digest,
+                                &source.approved_boundary,
+                                submission.state_epoch,
+                                at,
+                            )?;
+                        }
+                        (
+                            Some(candidate.ordinal),
+                            Some(candidate.work_item.clone()),
+                            Some(instance_id),
+                            None,
+                            None,
+                        )
+                    }
+                    AdmissionDecision::Waiting { code, message } => (
+                        Some(candidate.ordinal),
+                        Some(candidate.work_item.clone()),
+                        None,
+                        Some(code.to_string()),
+                        Some(message),
+                    ),
+                    AdmissionDecision::Refused { code, message } => (
+                        Some(candidate.ordinal),
+                        Some(candidate.work_item.clone()),
+                        None,
+                        Some(code.to_string()),
+                        Some(message),
+                    ),
+                }
+            }
+        }
+    };
+    // 5. Record the consumption of this delivery: the durable idempotency
+    //    key, the cursor and the outcome. A held row is updated in place when
+    //    its reason settles (the row is keyed to the delivery, so the update
+    //    can never become a second dispatch) and a dispatched row is final.
+    tx.execute(
+        "INSERT INTO queue_advances (submission_id, delivered_ordinal, delivered_work_item,
+                delivered_head, evidence_id, next_ordinal, next_work_item, next_instance_id,
+                reason, message, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(submission_id, delivered_ordinal) DO UPDATE SET
+                next_ordinal = excluded.next_ordinal,
+                next_work_item = excluded.next_work_item,
+                next_instance_id = COALESCE(queue_advances.next_instance_id,
+                                           excluded.next_instance_id),
+                reason = excluded.reason,
+                message = excluded.message,
+                at = excluded.at",
+        params![
+            submission.submission_id,
+            delivery.item_ordinal,
+            delivery.work_item,
+            delivery.feature_head,
+            delivery.evidence_id,
+            next_ordinal,
+            next_work_item,
+            next_instance_id,
+            reason,
+            message,
+            at
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("queue_advance: record", err))?;
+    Ok(())
 }
 
 impl State {
@@ -10942,26 +11745,50 @@ impl State {
         };
         let mut statement = conn
             .prepare(
-                "SELECT i.submission_id, s.digest, s.request_line
+                "SELECT i.submission_id, s.digest, s.request_line, i.ordinal, i.work_item,
+                        i.issue_number, i.status
                    FROM queue_submission_items i
                    JOIN queue_submissions s ON s.submission_id = i.submission_id
                   WHERE i.instance_id = ?1 AND i.status = 'admitted'",
             )
             .map_err(|err| StateError::from_sqlite("supervision_evidence: submission", err))?;
-        let submission: Option<(String, String, String)> = statement
+        let submission: Option<(String, String, String, i64, String, i64, String)> = statement
             .query_row(params![instance_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
             })
             .optional()
             .map_err(|err| StateError::from_sqlite("supervision_evidence: submission row", err))?;
         drop(statement);
-        let (submission_id, submission_digest, steps) = match submission {
-            Some((submission_id, digest, request_line)) => (
-                Some(submission_id),
+        let (submission_id, submission_digest, steps, item) = match submission {
+            Some((
+                submission_id,
+                digest,
+                request_line,
+                ordinal,
+                work_item,
+                issue_number,
+                status,
+            )) => (
+                Some(submission_id.clone()),
                 Some(digest),
                 bound_steps_of(&request_line),
+                Some(QueueItemRef {
+                    submission_id,
+                    ordinal,
+                    work_item,
+                    issue_number,
+                    status,
+                }),
             ),
-            None => (None, None, Vec::new()),
+            None => (None, None, Vec::new(), None),
         };
         let ownership_instance: Option<String> = conn
             .query_row(
@@ -11011,6 +11838,19 @@ impl State {
             .into_iter()
             .find(|(run, _)| run == instance_id || run == "*")
             .map(|(_, step)| step);
+        // Issue #96: the NEWEST recorded review-evidence row (the same row
+        // the board read model and the merge gate read).
+        let newest_evidence: Option<EvidenceRow> = conn
+            .query_row(
+                "SELECT evidence_id, instance_id, repository, feature_head, integration_base,
+                        workflow_hash, policy_hash, verdict, reviewer, checks, created_at
+                   FROM evidence WHERE instance_id = ?1
+                  ORDER BY created_at DESC, evidence_id DESC LIMIT 1",
+                params![instance_id],
+                evidence_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("supervision_evidence: newest", err))?;
         Ok(Some(SupervisionEvidence {
             run,
             ownership_instance,
@@ -11022,6 +11862,8 @@ impl State {
             verdicts,
             in_flight,
             progress_at: row.progress_at,
+            item,
+            newest_evidence,
         }))
     }
 
@@ -11216,6 +12058,16 @@ impl State {
                 "the supervision row vanished inside its own transaction",
             ));
         };
+        // Issue #96: the ONE bounded continuation effect — a fresh verified
+        // delivery of this run advances the already-authorized queue cursor
+        // and admits the next eligible approved issue ATOMICALLY with the
+        // reconciliation that recognized it. The whole advance re-reads the
+        // delivery, the membership and the idempotency fence under this same
+        // guard (see `advance_queue_in_tx`); a refusal inside it rolls the
+        // check back rather than committing a half an advance.
+        if let Some(delivery) = &plan.advance {
+            advance_queue_in_tx(&tx, delivery, &plan.instance_id, &plan.at)?;
+        }
         tx.commit()
             .map_err(|err| StateError::from_sqlite("commit_supervision_check: commit", err))?;
         Ok(updated)
@@ -11499,6 +12351,68 @@ CREATE TABLE supervision_runtime (
     last_tick_at TEXT NOT NULL DEFAULT ''
 );
 INSERT INTO supervision_runtime (id, event_cursor, last_tick_at) VALUES (1, 0, '');
+";
+
+/// Run the m0012 migration (issue #96): the queue-advance tables and the
+/// persisted admission inputs / per-item grant bindings they re-verify.
+fn run_m0012(conn: &mut Connection) -> Result<(), StateError> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| StateError::from_sqlite("migrate m0012: begin", err))?;
+    let checksum = sha256_hex(M0012_SQL.as_bytes());
+    tx.execute_batch(M0012_SQL)
+        .map_err(|err| StateError::from_sqlite("migrate m0012", err))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (migration_id, applies_from, applies_to, checksum, applied_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            M0012_ID,
+            M0012_APPLIES_FROM,
+            M0012_APPLIES_TO,
+            checksum,
+            time::rfc3339_now()
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("migrate m0012: bookkeeping", err))?;
+    tx.pragma_update(None, "user_version", M0012_APPLIES_TO)
+        .map_err(|err| StateError::from_sqlite("migrate m0012: user_version", err))?;
+    tx.commit()
+        .map_err(|err| StateError::from_sqlite("migrate m0012: commit", err))?;
+    Ok(())
+}
+
+/// Queue-advance tables added by m0012 (issue #96), purely additive.
+///
+/// `queue_submission_items.grant_id` persists the grant the item was
+/// admitted against, so the advance re-verifies the SAME presented approval
+/// under the guard instead of inventing a grant. `queue_submissions`
+/// persists the approved admission inputs (caps + the attested same-harness
+/// occupancy), so the advance re-applies exactly the approved fan-out
+/// bounds against live counts. `queue_advances` records ONE consumed
+/// verified delivery per submission item: `delivered_ordinal` is the
+/// idempotency key (a duplicate delivery event, a replayed check or a crash
+/// and restart can never consume it twice), `next_instance_id` names the
+/// dispatched run of the outcome, and `reason`/`message` record a hold.
+const M0012_SQL: &str = "\
+ALTER TABLE queue_submission_items ADD COLUMN grant_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE queue_submissions ADD COLUMN caps_global INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE queue_submissions ADD COLUMN caps_per_repository INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE queue_submissions ADD COLUMN caps_per_harness INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE queue_submissions ADD COLUMN harness_lanes INTEGER;
+CREATE TABLE queue_advances (
+    submission_id TEXT NOT NULL,
+    delivered_ordinal INTEGER NOT NULL,
+    delivered_work_item TEXT NOT NULL,
+    delivered_head TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    next_ordinal INTEGER,
+    next_work_item TEXT,
+    next_instance_id TEXT,
+    reason TEXT,
+    message TEXT,
+    at TEXT NOT NULL,
+    PRIMARY KEY (submission_id, delivered_ordinal)
+);
 ";
 
 #[cfg(test)]
@@ -12359,11 +13273,11 @@ mod tests {
         assert_eq!(grant.status, "active");
         assert_eq!(grant.state_epoch, 1);
         assert_eq!(state.current_epoch().expect("epoch"), 1);
-        assert_eq!(SCHEMA_VERSION, 11);
+        assert_eq!(SCHEMA_VERSION, 12);
         {
-            let conn = state.lock("test: m0005..m0011 bookkeeping").expect("lock");
+            let conn = state.lock("test: m0005..m0012 bookkeeping").expect("lock");
             for migration_id in [
-                M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID, M0010_ID, M0011_ID,
+                M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID, M0010_ID, M0011_ID, M0012_ID,
             ] {
                 let recorded: i64 = conn
                     .query_row(
@@ -12379,6 +13293,87 @@ mod tests {
                 .expect("user_version");
             assert_eq!(version, SCHEMA_VERSION);
         }
+    }
+
+    #[test]
+    fn queue_advance_dependencies_parse_and_unselected_requirements_are_never_met() {
+        let path = temp_db("queue-advance-dependencies.db");
+        let state = State::open(&path, Retention::default()).expect("open");
+        // The declared edges come from the committed bound-input document: a
+        // bare reference resolves against the submission's repository and a
+        // foreign-repository requirement is reported as outside this queue.
+        let request = object(vec![
+            ("schema", string("hf-queue-preview/v1")),
+            ("repository", string("example-org/widgets")),
+            (
+                "selected",
+                Val::Arr(vec![
+                    object(vec![
+                        ("id", string("example-org/widgets#5")),
+                        ("revision", string(&"a".repeat(40))),
+                        ("requires", Val::Arr(vec![])),
+                    ]),
+                    object(vec![
+                        ("id", string("example-org/widgets#6")),
+                        ("revision", string(&"a".repeat(40))),
+                        (
+                            "requires",
+                            Val::Arr(vec![
+                                string("#5"),
+                                string("other-org/elsewhere#9"),
+                                string("example-org/widgets#5"),
+                            ]),
+                        ),
+                    ]),
+                ]),
+            ),
+        ]);
+        let parsed = bound_selected_dependencies(&canonical_text(&request), "example-org/widgets");
+        assert_eq!(
+            parsed,
+            vec![(5, vec![]), (6, vec![5, 5])],
+            "cross-repository requirements cannot be settled by this queue and are dropped"
+        );
+        assert_eq!(
+            bound_selected_dependencies("not json", "example-org/widgets"),
+            Vec::new(),
+            "an unreadable bound document never invents an edge"
+        );
+        let item = |number: i64, status: &str, instance_id: Option<&str>| QueueSubmissionItemRow {
+            submission_id: "qs_0123456789abcdef".to_string(),
+            ordinal: number - 5,
+            work_item: format!("wi_{number:016}"),
+            issue_number: number,
+            issue_revision: "a".repeat(40),
+            status: status.to_string(),
+            reason: None,
+            message: None,
+            instance_id: instance_id.map(str::to_string),
+            grant_id: String::new(),
+        };
+        let conn = state
+            .lock("test: queue-advance dependencies")
+            .expect("lock");
+        // A requirement outside the selected set is never met...
+        assert!(
+            !dependency_met_locked(&conn, &[item(5, "waiting", None)], 9).expect("read"),
+            "an unselected requirement can never be settled by this submission"
+        );
+        // ...and neither is a selected requirement with no run, or a run
+        // without a verified delivery.
+        assert!(
+            !dependency_met_locked(&conn, &[item(5, "waiting", None)], 5).expect("read"),
+            "a waiting item is not a delivered one"
+        );
+        assert!(
+            !dependency_met_locked(
+                &conn,
+                &[item(5, "admitted", Some("run-0000000000000000"))],
+                5
+            )
+            .expect("read"),
+            "a missing run is not a delivery"
+        );
     }
 
     #[test]

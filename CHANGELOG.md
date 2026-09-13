@@ -503,6 +503,41 @@ release process activates (docs/RELEASING.md), then semver applies.
   (`state`/`since`/`reports`). A read can no longer re-classify to a
   friendlier class and hide a committed counter.
 
+### Added (issue #96 — Bounded continuation to the next eligible issue)
+
+- A fresh VERIFIED delivery of an authorized run now advances its
+  already-authorized queue cursor and admits the next eligible approved
+  issue, atomically with the reconciliation that recognized it: the SAME
+  #95 event/timer driver and the SAME #85 admission helper (no parallel
+  scheduler, no LLM, no conductor prompt). A delivery is the recorded
+  evidence contract, never a label: reviewed `pass` with every named check
+  `passed` at one exact head bound to the run's own workflow/policy pins,
+  with no durable hold (paused, blocked, human queue, invalidated, terminal
+  blocker) and no in-flight step claim; the verified delivery also completes
+  the delivering run (`done`), which is what frees the slot the next issue
+  is admitted into.
+- Duplicate delivery events, replayed reconciliations and crash/restarts can
+  never dispatch twice: `queue_advances` (m0012) records ONE consumed
+  delivery per membership item (`(submission_id, delivered_ordinal)` is the
+  durable idempotency key, keyed to the delivered issue and its recorded
+  head), the dispatched item's run is created through the same
+  guard-verifying admission path under the same approved caps and occupancy
+  attestation, and the consumed record is immutable — a replay can only
+  observe it. `queue.status` (and the queued document) renders the committed
+  cursor: consumed/dispatched counts, the rows, and the current hold.
+- Dependency holds never fabricate completion: an issue whose declared
+  dependencies are not delivered and verified is HELD with its stable reason
+  recorded (`queue.dependency_unsettled` / `queue.dependency_unresolved`),
+  never dispatched and never marked done; a hold is re-evaluated as later
+  deliveries settle it, and the dispatch that supersedes it is recorded on
+  the older delivery row so a read never reports a stale hold.
+- Existing safeguards stay authoritative: a paused or invalidated run never
+  auto-advances (no cursor row is written), a failure verdict is a terminal
+  hold, terminal holds stick, and a run with no supervision authorization is
+  never evaluated at all. Only items of the SAME committed submission are
+  eligible — no scope expansion, no new issue creation and no speculative
+  prerequisite chain.
+
 ### Added (issue #78 — CLI preview / request / inspect for one explicit lane handoff)
 
 - The thin CLI lane surface over the completed daemon handoff path

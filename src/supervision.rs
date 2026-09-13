@@ -10,9 +10,21 @@
 //!   authorization binds the approved preview digest, so a run whose
 //!   recorded binding no longer matches (unapproved/drifted plan) is
 //!   classified `unknown`/held and is never eligible.
-//! - The driver **evaluates and reports**. It never spawns, prompts,
-//!   resumes, retries, mutates Git or clears a hold: `continuation-eligible`
-//!   is a REPORT for a later slice (#96), not an action.
+//! - The driver **evaluates and reports**, and performs exactly ONE bounded
+//!   continuation effect (issue #96): when the recorded evidence of an
+//!   authorized run is a fresh VERIFIED delivery (reviewed `pass` with every
+//!   named check `passed` at the recorded delivered head, bound to the run's
+//!   own workflow/policy pins), the driver advances that run's
+//!   already-authorized queue cursor — once per delivered issue — and admits
+//!   the next eligible approved issue of the SAME committed submission under
+//!   the existing admission and ownership checks. It never spawns, prompts,
+//!   resumes, retries, mutates Git or clears a hold: the admitted run is a
+//!   durable run record and no workflow step is executed. `continuation-eligible`
+//!   stays a REPORT for a later slice.
+//! - A duplicate delivery event, a replayed check or a crash/restart never
+//!   duplicates a dispatch: the advance is keyed to the delivered issue
+//!   (one consumption per submission item, ever) and the cursor is derived
+//!   from the durable advance rows.
 //! - Every classification is derived from **recorded evidence** re-read from
 //!   the daemon state (run row, ownership, committed submission, bound step
 //!   spine, recorded step attempts with their typed outcome codes, review
@@ -103,7 +115,7 @@ pub const TRIGGERS: [&str; 7] = [
 
 /// The statement every supervision document carries: what this surface does
 /// and provably does NOT do.
-pub const STATEMENT: &str = "evaluation only: one explicitly authorized run is classified from recorded evidence (never inferred from activity); supervision never continues work, spawns, prompts, resumes a pause, authorizes a retry, mutates Git or clears a hold, and NO harness/LLM/process effect occurs in this slice";
+pub const STATEMENT: &str = "supervision only: one explicitly authorized run is classified from recorded evidence (never inferred from activity); a fresh verified reviewed-and-CI-green delivery of that run advances its already-authorized queue cursor exactly once and admits the next eligible approved issue of the same committed submission as a durable run record under the existing admission and ownership checks (no workflow step is executed), and supervision never otherwise continues work, spawns, prompts, resumes a pause, authorizes a retry, mutates Git or clears a hold, so no harness/LLM/process effect occurs";
 
 /// Default bounded timer fallback cadence (seconds).
 pub const DEFAULT_CHECK_INTERVAL_SECS: i64 = 60;
@@ -497,6 +509,89 @@ fn newest_verdict(evidence: &SupervisionEvidence) -> &str {
 /// eligible.
 pub fn authorization_bound(evidence: &SupervisionEvidence, authorization_digest: &str) -> bool {
     evidence.submission_digest.as_deref() == Some(authorization_digest)
+}
+
+/// One run whose recorded evidence is a fresh VERIFIED delivery (issue #96):
+/// the reviewed `pass` plus every named check `passed` at one recorded
+/// delivered head, bound to the run's own membership item of an
+/// already-authorized submission. This is the durable binding a queue-cursor
+/// advance is keyed to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedDelivery {
+    /// The committed submission the delivered run was admitted from.
+    pub submission_id: String,
+    /// Membership ordinal of the delivered issue (the idempotency key).
+    pub item_ordinal: i64,
+    /// Stable work-item id of the delivered issue.
+    pub work_item: String,
+    /// The delivered head (40-hex) the review and checks were recorded at.
+    pub feature_head: String,
+    /// The review-evidence row that carries the verdict (the delivery event).
+    pub evidence_id: String,
+}
+
+/// Derive the fresh VERIFIED delivery of one run from its recorded evidence
+/// (issue #96). `None` when the run carries a durable hold (paused, blocked,
+/// human queue, invalidated, terminal blocker), has no committed submission
+/// membership, or when its newest recorded review evidence is not a `pass`
+/// with every named check `passed` at one exact head bound to the run's own
+/// workflow and policy pins. Pure: no clock, no lock, no write.
+///
+/// The contract is the existing board/merge evidence contract (`verified`
+/// requires recorded review evidence that is still current; the merge gate
+/// requires verdict `pass` plus every named check `passed`), never a label:
+/// a `done` status alone is not a verified delivery, and a newer failure
+/// verdict (which is the newest row) hides any older pass.
+pub fn verified_delivery(evidence: &SupervisionEvidence) -> Option<VerifiedDelivery> {
+    let run = &evidence.run;
+    // Durable holds first: a held run is never a delivery event.
+    if run.paused
+        || run.pause_requested
+        || run.human_queue
+        || run.status == "blocked"
+        || run.status == "invalidated"
+        || run.terminal_blockers > 0
+    {
+        return None;
+    }
+    // A step claim still in flight means the run is mid-effect: it is not a
+    // completed delivery yet.
+    if evidence.in_flight.is_some() {
+        return None;
+    }
+    let item = evidence.item.as_ref()?;
+    let newest = evidence.newest_evidence.as_ref()?;
+    if newest.verdict != "pass" {
+        return None;
+    }
+    let view = crate::mutation::EvidenceView {
+        evidence_id: newest.evidence_id.clone(),
+        feature_head: newest.feature_head.clone(),
+        integration_base: newest.integration_base.clone(),
+        workflow_hash: newest.workflow_hash.clone(),
+        policy_hash: newest.policy_hash.clone(),
+        verdict: newest.verdict.clone(),
+        reviewer: newest.reviewer.clone(),
+        checks: newest.checks.clone(),
+        created_at: newest.created_at.clone(),
+    };
+    if !crate::mutation::evidence_checks_passed(&view).ok()? {
+        return None;
+    }
+    // The evidence must be bound to THIS run's pins and name one exact head.
+    if newest.workflow_hash != run.workflow_hash || newest.policy_hash != run.policy_hash {
+        return None;
+    }
+    if !crate::formats::is_hex40(&newest.feature_head) {
+        return None;
+    }
+    Some(VerifiedDelivery {
+        submission_id: item.submission_id.clone(),
+        item_ordinal: item.ordinal,
+        work_item: item.work_item.clone(),
+        feature_head: newest.feature_head.clone(),
+        evidence_id: newest.evidence_id.clone(),
+    })
 }
 
 /// The next step's latest recorded outcome, or `None` when the step has
@@ -1278,6 +1373,15 @@ pub fn check_plan(
     };
     let verdict = classify(evidence, &row.authorization_digest, &policy, now_unix);
     let (marker, source) = progress_observation(evidence, &row.progress_at);
+    // Issue #96: the fresh verified delivery of this run (if any) is the ONE
+    // continuation effect of a check — the intent rides on the plan and the
+    // commit transaction re-verifies it under the guard before it advances
+    // the queue cursor. An unapproved plan is never a delivery.
+    let advance = if authorization_bound(evidence, &row.authorization_digest) {
+        verified_delivery(evidence)
+    } else {
+        None
+    };
     let trigger_label: &'static str = if boot {
         "boot"
     } else {
@@ -1304,6 +1408,7 @@ pub fn check_plan(
         marker_source: source,
         next_check_unix: next_check_unix(now_unix, &policy),
         next_check_reason: codes::RECENT_PROGRESS,
+        advance,
     }
 }
 
@@ -1530,6 +1635,8 @@ mod tests {
             verdicts: Vec::new(),
             in_flight: None,
             progress_at: progress_at.to_string(),
+            item: None,
+            newest_evidence: None,
         }
     }
 
@@ -1869,6 +1976,7 @@ mod tests {
                 marker_source: "state",
                 next_check_unix: next_unix,
                 next_check_reason: codes::RECENT_PROGRESS,
+                advance: None,
             };
         state
             .commit_supervision_check(&check(armed_at + 10, 0, "boot"))
@@ -1961,6 +2069,7 @@ mod tests {
                 marker_source: "state",
                 next_check_unix: now_unix + 10,
                 next_check_reason: codes::RECENT_PROGRESS,
+                advance: None,
             }
         };
         let first = state
@@ -2221,6 +2330,7 @@ mod tests {
             marker_source: "state",
             next_check_unix: now_unix + 10,
             next_check_reason: codes::RECENT_PROGRESS,
+            advance: None,
         };
         let first = state
             .commit_supervision_check(&plan(1_800_000_000, true, "continuation-eligible"))
