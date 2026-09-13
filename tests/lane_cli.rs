@@ -15,10 +15,10 @@
 //! method log) or on the durable state (journal seq), and every JSON
 //! assertion parses the documented `hf-output/v1` envelope.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -185,7 +185,10 @@ impl Fixture {
         command.spawn().expect("spawn daemon")
     }
 
-    fn cli_stdin(&self, args: &[&str], stdin: Option<&str>) -> Output {
+    /// One CLI invocation's `Command`, with the fixture's isolated state and
+    /// the workspace adapter on PATH. `piped_stdin` mirrors the harness shape
+    /// the call sites need (a TTY is never involved).
+    fn cli_command(&self, args: &[&str], piped_stdin: bool) -> Command {
         let mut command = Command::new(bin());
         command
             .args(args)
@@ -193,20 +196,23 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", self.dir.join("config-home"))
             .env("HOME", &self.dir)
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .stdin(match stdin {
-                Some(_) => Stdio::piped(),
-                None => Stdio::null(),
+            .stdin(if piped_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().expect("spawn cli");
+        command
+    }
+
+    fn cli_stdin(&self, args: &[&str], stdin: Option<&str>) -> Output {
+        let mut child = self
+            .cli_command(args, stdin.is_some())
+            .spawn()
+            .expect("spawn cli");
         if let Some(text) = stdin {
-            child
-                .stdin
-                .as_mut()
-                .expect("stdin")
-                .write_all(text.as_bytes())
-                .expect("write stdin");
+            write_stdin(child.stdin.as_mut().expect("stdin"), text);
         }
         child.wait_with_output().expect("cli output")
     }
@@ -234,6 +240,20 @@ impl Fixture {
         }
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         self.cli_stdin(&refs, stdin)
+    }
+}
+
+/// Write one CLI invocation's piped stdin. JSON mode never consumes stdin
+/// (the refusal is typed, never a prompt), so the child may already have
+/// exited when this write runs — the ordering rust-ubuntu CI reported as
+/// `write stdin: Broken pipe`. A closed pipe is that expected ordering and is
+/// never a product failure; every assertion inspects the child's `Output`
+/// instead. Any other error stays loud.
+fn write_stdin(stdin: &mut ChildStdin, text: &str) {
+    match stdin.write_all(text.as_bytes()) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::BrokenPipe => {}
+        Err(err) => panic!("write stdin: {err}"),
     }
 }
 
@@ -1535,6 +1555,49 @@ fn json_mode_never_prompts_and_human_and_json_agree() {
         "the human rendering carries the intended pair"
     );
     shutdown(daemon);
+}
+
+/// Deterministic bite for the stdin-ordering repair in [`write_stdin`]: the
+/// unauthorized JSON request exits without ever consuming stdin, so a harness
+/// write can land after the child is gone (rust-ubuntu CI reported exactly
+/// that as `write stdin: Broken pipe`). Waiting for the refusal's exit first
+/// makes that ordering certain instead of racy; the write stays a no-op and
+/// the typed refusal is unchanged.
+#[test]
+fn a_stdin_write_after_the_json_refusal_exit_is_not_a_harness_failure() {
+    let mut fixture = Fixture::new("json-stdin-ordering");
+    fixture.write_config(HARNESS_KEY, PROVIDER, MODEL, None);
+    fixture.write_fake_workspace();
+    // No daemon: an unauthorized JSON request is refused before any socket
+    // use, so the refusal itself is what this ordering test pins.
+    let mut args: Vec<String> = vec!["lane".to_string(), "request".to_string()];
+    args.extend(plan_args("lane-cli-9", "implementer"));
+    args.push("--json".to_string());
+    args.push("--socket".to_string());
+    args.push(fixture.socket.display().to_string());
+    if let Some(config) = &fixture.config_path {
+        args.push("--config".to_string());
+        args.push(config.display().to_string());
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut child = fixture.cli_command(&refs, true).spawn().expect("spawn cli");
+    // Hold the write end first: `wait` closes a still-owned stdin. The child
+    // has certainly exited by the time the write below runs.
+    let mut stdin = child.stdin.take().expect("stdin");
+    let status = child.wait().expect("wait cli");
+    assert_eq!(status.code(), Some(2), "the JSON refusal is typed");
+    write_stdin(&mut stdin, "not-a-digest\n");
+    let output = child.wait_with_output().expect("cli output");
+    assert_eq!(exit_of(&output), 2, "{}", stderr_text(&output));
+    assert_eq!(
+        error_code(&stdout_json(&output)),
+        "usage.confirmation_required"
+    );
+    assert!(
+        !stderr_text(&output).contains("type the plan digest"),
+        "JSON mode never prompts: {}",
+        stderr_text(&output)
+    );
 }
 
 // ---------------------------------------------------------------------------
