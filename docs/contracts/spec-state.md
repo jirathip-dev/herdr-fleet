@@ -421,6 +421,36 @@ to journal fails closed — the mutation does not start.
   audit row was pruned) reports a loss and falls back to a fresh snapshot
   wake for every armed run.
 
+## Queue-advance additions (issue #96)
+
+- **Tables (m0012/schema v12, purely additive)**: `queue_advances` (one row
+  per consumed verified delivery of one membership item: the delivered
+  ordinal/work-item/head and the evidence id, the considered next item, the
+  dispatched run when one was admitted, or the recorded hold reason and
+  message; `PRIMARY KEY (submission_id, delivered_ordinal)` is the durable
+  idempotency key) plus the persisted admission inputs the advance
+  re-applies (`queue_submission_items.grant_id` — the exact presented grant
+  binding — and `queue_submissions.caps_global`/`caps_per_repository`/
+  `caps_per_harness`/`harness_lanes`). No existing table or row is touched.
+- **Completion-to-next-work**: a fresh verified delivery (reviewed `pass`
+  with every named check `passed` at one exact head bound to the run's own
+  workflow/policy pins, no durable hold, no in-flight step, live epoch)
+  completes the delivering run and advances that submission's cursor exactly
+  once; the candidate is the first `waiting` item in membership order and is
+  admitted through the SAME guard-verifying helper, caps and occupancy
+  attestation the submission used, armed with the delivering run's
+  supervision authorization so the queue keeps continuing.
+- **Dependency holds**: every declared requirement of the candidate must be
+  delivered and verified — a requirement that is selected but not delivered
+  is `queue.dependency_unsettled`, one outside the selected set is
+  `queue.dependency_unresolved`; either way the dependent stays `waiting`
+  with the reason recorded and is never dispatched or marked done. A
+  recorded hold is re-evaluated on later reconciliations and settled in
+  place once a dispatch supersedes it.
+- **Refusals do not advance**: a paused/invalidated/blocked/human-queued run
+  is never a delivery (no cursor row is written), a failed verdict hides any
+  older pass, a non-current evidence row refuses the planned advance, and an
+  unapproved plan is never a delivery.
 ## Fixture map
 
 Accept: `migration.valid.json` (0→1, checksummed), `audit.valid.jsonl`

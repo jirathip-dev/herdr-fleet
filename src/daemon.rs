@@ -2564,7 +2564,10 @@ fn method_queue_submit(shared: &Arc<Shared>, request: &Request) -> String {
             // "committed, unresolved" restart window (reconciled from the
             // commit marker, never re-executed).
             crash_point("queue.after-commit");
-            let doc = crate::queue_executor::submission_doc(&row, &items);
+            let advances = guard
+                .queue_advance_rows(&row.submission_id)
+                .unwrap_or_default();
+            let doc = crate::queue_executor::submission_doc(&row, &items, &advances);
             resolve_mutation_on(
                 &guard,
                 &shared.log,
@@ -2612,10 +2615,15 @@ fn method_queue_status(shared: &Arc<Shared>, request: &Request) -> String {
     };
     match shared.lock_state() {
         Ok(state) => match state.queue_submission_by_id(submission_id) {
-            Ok(Some((row, items))) => ok_response(
-                &request.id,
-                crate::queue_executor::submission_doc(&row, &items),
-            ),
+            Ok(Some((row, items))) => {
+                let advances = state
+                    .queue_advance_rows(&row.submission_id)
+                    .unwrap_or_default();
+                ok_response(
+                    &request.id,
+                    crate::queue_executor::submission_doc(&row, &items, &advances),
+                )
+            }
             Ok(None) => err_response(
                 &request.id,
                 "state.not_found",
@@ -7191,7 +7199,10 @@ fn reconcile_queue_submission(
         );
         return Ok(());
     }
-    let doc = crate::queue_executor::submission_doc(&row, &items);
+    let advances = state
+        .queue_advance_rows(&row.submission_id)
+        .unwrap_or_default();
+    let doc = crate::queue_executor::submission_doc(&row, &items, &advances);
     let mut admitted = 0i64;
     let mut waiting = 0i64;
     let mut refused = 0i64;
@@ -7204,13 +7215,18 @@ fn reconcile_queue_submission(
             }
         }
     }
+    let cursor = doc
+        .get("advance")
+        .and_then(|advance| advance.get("cursor_ordinal"))
+        .and_then(Val::as_int)
+        .unwrap_or(0);
     log.write(
         "info",
         "reconcile.queue.submit",
         &format!(
             "submission {submission_id} was committed before the interrupt ({admitted} admitted \
-             / {waiting} waiting / {refused} refused); the durable readback is verified against \
-             its digest binding and no effect is repeated"
+             / {waiting} waiting / {refused} refused, advance cursor {cursor}); the durable \
+             readback is verified against its digest binding and no effect is repeated"
         ),
     );
     Ok(())
