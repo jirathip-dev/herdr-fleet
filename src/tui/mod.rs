@@ -24,6 +24,7 @@ pub mod board;
 pub mod live;
 pub mod operator;
 pub mod session;
+pub mod supervision;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
@@ -269,7 +270,7 @@ impl Freshness {
     }
 }
 
-fn age_label(secs: u64) -> String {
+pub(crate) fn age_label(secs: u64) -> String {
     if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {

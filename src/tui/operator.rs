@@ -33,7 +33,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -51,6 +51,7 @@ use crate::time::unix_now;
 use crate::value::{Val, object, string};
 
 use super::live::LiveBoard;
+use super::supervision::SupervisionPanel;
 use super::{Action, BoardView, ColorMode, ReadModel, UiState, clip, handle_key as board_key};
 
 /// The statement the authorization screen shows: what the action does and
@@ -142,7 +143,7 @@ pub struct ScreenLine {
 }
 
 impl ScreenLine {
-    fn new(tone: Tone, text: impl Into<String>) -> Self {
+    pub(crate) fn new(tone: Tone, text: impl Into<String>) -> Self {
         ScreenLine {
             text: text.into(),
             tone,
@@ -162,6 +163,10 @@ pub enum Screen {
     Authorize,
     /// The outcome: what was requested and what the daemon observed.
     Outcome,
+    /// The compact supervision status of the selected run plus the two
+    /// guarded continuation controls (issue #97): read-only status, the
+    /// run-scoped hold (`h`) and the authorized continue (`u`).
+    Supervision,
 }
 
 /// One typed notice: a stable code plus a bounded human message.
@@ -175,7 +180,7 @@ pub struct Notice {
 }
 
 impl Notice {
-    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Notice {
             code: code.into(),
             message: message.into(),
@@ -298,6 +303,7 @@ pub struct OperatorConsole<'a> {
     notice: Option<Notice>,
     preview: Option<PreviewFacts>,
     attempt: Option<Attempt>,
+    supervision: SupervisionPanel,
 }
 
 impl<'a> OperatorConsole<'a> {
@@ -322,7 +328,14 @@ impl<'a> OperatorConsole<'a> {
             notice: None,
             preview: None,
             attempt: None,
+            supervision: SupervisionPanel::new(),
         }
+    }
+
+    /// The supervision panel (issue #97): the compact status of the selected
+    /// run plus the guarded continuation controls.
+    pub fn supervision(&self) -> &SupervisionPanel {
+        &self.supervision
     }
 
     /// The screen currently shown.
@@ -366,9 +379,18 @@ impl<'a> OperatorConsole<'a> {
     /// work item; `Enter` continues the preview to the authorization screen
     /// when at least one selected item is eligible; `Space` sets the
     /// authorization box; the authorization screen's `Enter` is the ONLY key
-    /// that starts work. `b`/`Esc` navigate back (never forward) and always
-    /// clear the authorization box; `q` quits.
+    /// that starts work. `s` opens the compact supervision status and the
+    /// guarded continuation controls of the selected run (issue #97). `b`/`Esc`
+    /// navigate back (never forward) and always clear the authorization box;
+    /// `q` quits.
+    ///
+    /// Only `Press` events are handled: an autorepeat or release event never
+    /// effects anything on any screen (a held key cannot commit a control the
+    /// operator did not confirm).
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if key.kind != KeyEventKind::Press {
+            return None;
+        }
         match self.screen {
             Screen::Board => self.board_key(key),
             Screen::Preview => match key.code {
@@ -420,17 +442,79 @@ impl<'a> OperatorConsole<'a> {
                 }
                 _ => None,
             },
+            Screen::Supervision => self.supervision_key(key),
         }
     }
 
-    /// The board screen: board navigation plus `p` (open the exact preview).
+    /// The supervision screen (issue #97): back/quit are the console's; every
+    /// other key belongs to the panel, whose confirmation state machine owns
+    /// both effects. A confirmation is cancelled (`b`/`Esc`) before it can
+    /// leave the screen, so no navigation can ever carry an approval away.
+    fn supervision_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('b') if !self.supervision.confirming() => {
+                self.back();
+                Some(Action::Redraw)
+            }
+            KeyCode::Char('q') => Some(Action::Quit),
+            _ => self.supervision.handle_key(&self.socket, key),
+        }
+    }
+
+    /// The board screen: board navigation plus `p` (open the exact preview)
+    /// and `s` (open the compact supervision status/controls).
     fn board_key(&mut self, key: KeyEvent) -> Option<Action> {
         if key.code == KeyCode::Char('p') {
             self.request_preview();
             return Some(Action::Redraw);
         }
+        if key.code == KeyCode::Char('s') {
+            self.open_supervision();
+            return Some(Action::Redraw);
+        }
         let view = self.board.snapshot();
         board_key(&mut self.ui, &view, key)
+    }
+
+    /// Open the compact supervision status for the SELECTED run (issue #97).
+    ///
+    /// The status addresses exactly one run identity, so a selection that
+    /// carries no recorded attempt refuses typed instead of inventing a
+    /// target; the reads themselves are the daemon's typed services.
+    pub fn open_supervision(&mut self) {
+        match self.selected_run() {
+            Some(run) => self.open_supervision_run(&run),
+            None => {
+                self.notice = Some(Notice::new(
+                    crate::tui::supervision::CODE_NO_RUN,
+                    "select a recorded run on the board first (Up/Down), then press s: the status \
+                     addresses exactly one run identity",
+                ));
+                self.screen = Screen::Board;
+            }
+        }
+    }
+
+    /// Open the supervision screen for ONE explicit run identity.
+    ///
+    /// The `s` key resolves the board selection into this call; an embedder
+    /// that already addressed a run may call it directly. It reads the
+    /// daemon's typed status services (read-only) and changes only this
+    /// surface's screen — it never effects anything on the run.
+    pub fn open_supervision_run(&mut self, run: &str) {
+        self.supervision.read(&self.socket, run);
+        self.scroll = 0;
+        self.notice = None;
+        self.screen = Screen::Supervision;
+    }
+
+    /// The run identity of the current board selection, when it has one.
+    pub fn selected_run(&self) -> Option<String> {
+        self.ui
+            .selected
+            .as_ref()
+            .and_then(|selection| selection.run.as_ref())
+            .map(|run| run.run.clone())
     }
 
     /// Back/cancel: the screen-appropriate step backwards. Never forward,
@@ -453,6 +537,13 @@ impl<'a> OperatorConsole<'a> {
                 self.scroll = 0;
                 self.preview = None;
                 self.attempt = None;
+            }
+            Screen::Supervision => {
+                // The board strip keeps the last compact status of the run it
+                // was read for; the confirmation state is cleared by the
+                // panel's own key handling before this point.
+                self.screen = Screen::Board;
+                self.scroll = 0;
             }
         }
         self.checked = false;
@@ -826,6 +917,7 @@ impl<'a> OperatorConsole<'a> {
             Screen::Preview => self.preview_lines(width),
             Screen::Authorize => self.authorize_lines(width),
             Screen::Outcome => self.outcome_lines(width),
+            Screen::Supervision => self.supervision.lines(width),
         };
         // A typed notice (a hold, a refusal, a readback failure) is never
         // invisible: on every screen it renders as the line after the
@@ -1231,28 +1323,34 @@ impl ReadModel for OperatorConsole<'_> {
 
 /// Render the operator surface into the frame.
 ///
-/// On the board screen the board renderer draws and an operator notice, when
-/// one exists, replaces the footer row; every other screen renders its own
-/// bounded lines.
+/// On the board screen the board renderer draws and the bottom row carries the
+/// supervision strip of the selected run (issue #97) — or the typed notice,
+/// which always wins because it reports why an action refused. Every other
+/// screen renders its own bounded lines; the supervision screen scrolls with
+/// the panel's own offset.
 pub fn draw(console: &OperatorConsole<'_>, mode: ColorMode, frame: &mut ratatui::Frame) {
     let area = frame.area();
     match console.screen() {
         Screen::Board => {
             let view = console.snapshot();
             super::board::draw(&view, console.ui_state(), mode, frame);
-            if let Some(notice) = console.notice_line(area.width as usize)
-                && area.height > 0
-            {
+            if area.height > 0 {
                 let strip = Rect {
                     x: area.x,
                     y: area.y + area.height - 1,
                     width: area.width,
                     height: 1,
                 };
+                let line = match console.notice_line(area.width as usize) {
+                    Some(notice) => notice,
+                    None => console
+                        .supervision
+                        .strip(console.selected_run().as_deref(), area.width as usize),
+                };
                 frame.render_widget(
                     Paragraph::new(Line::from(Span::styled(
-                        notice.text,
-                        style_of(notice.tone, mode),
+                        line.text,
+                        style_of(line.tone, mode),
                     ))),
                     strip,
                 );
@@ -1268,7 +1366,11 @@ pub fn draw(console: &OperatorConsole<'_>, mode: ColorMode, frame: &mut ratatui:
                     })
                     .collect::<Vec<Line<'static>>>(),
             );
-            frame.render_widget(Paragraph::new(text).scroll((console.scroll, 0)), area);
+            let scroll = match console.screen() {
+                Screen::Supervision => console.supervision.scroll(),
+                _ => console.scroll,
+            };
+            frame.render_widget(Paragraph::new(text).scroll((scroll, 0)), area);
         }
     }
 }
@@ -1308,7 +1410,7 @@ fn style_of(tone: Tone, mode: ColorMode) -> Style {
 /// Classify one transport/daemon failure. A `client.*` code (other than a
 /// connect failure, where no request was sent) and the claim-in-flight codes
 /// leave the outcome unknown; everything else is a definite no-effect.
-fn failure_outcome(code: &str, message: &str) -> AttemptOutcome {
+pub(crate) fn failure_outcome(code: &str, message: &str) -> AttemptOutcome {
     let uncertain = (code.starts_with("client.") && code != "client.connect")
         || code == "state.claim_reused"
         || code == "state.claim_incomplete";
