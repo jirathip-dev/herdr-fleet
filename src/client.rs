@@ -52,17 +52,35 @@ pub struct Response {
 impl Connection {
     /// Open a connection to the daemon socket.
     pub fn open(socket_path: &Path) -> Result<Connection, RpcError> {
-        let writer = UnixStream::connect(socket_path)
+        let stream = UnixStream::connect(socket_path)
             .map_err(|err| client_error("client.connect", format!("{err}")))?;
-        writer
-            .set_read_timeout(Some(std::time::Duration::from_secs(15)))
-            .map_err(|err| client_error("client.connect", format!("set timeout: {err}")))?;
-        let reader_stream = writer
+        Self::from_stream(stream)
+    }
+
+    /// Wrap one ALREADY CONNECTED stream as a connection.
+    ///
+    /// `client.connect` keeps exactly one meaning on this surface: the
+    /// `connect` call itself failed, so no request was sent (the operator
+    /// classifies that as a definite no-effect). A failure of the best-effort
+    /// bounded-read setup is NOT that: it happens after the connection was
+    /// established (on Darwin the kernel refuses `SO_RCVTIMEO` with EINVAL on
+    /// a unix socket whose peer has already closed, which is exactly the
+    /// accept-and-drop window), it says nothing about whether the request
+    /// reaches the peer, and reporting it as `client.connect` would claim
+    /// "nothing was sent" for a live connection. The setup therefore
+    /// continues; the request path classifies honestly (`client.write`,
+    /// `client.closed`, `client.read` — all unconfirmed classes), and a
+    /// peer-closed socket reads EOF immediately, so nothing blocks.
+    fn from_stream(stream: UnixStream) -> Result<Connection, RpcError> {
+        // Best effort by contract: the 15s bound is a liveness improvement,
+        // never a precondition for speaking to the daemon.
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+        let reader_stream = stream
             .try_clone()
             .map_err(|err| client_error("client.connect", err.to_string()))?;
         Ok(Connection {
             reader: BufReader::new(reader_stream),
-            writer,
+            writer: stream,
         })
     }
 
@@ -243,5 +261,40 @@ mod tests {
         // No daemon at this path; open fails with a typed client error.
         let err = Connection::open(&path).expect_err("absent socket must fail");
         assert!(err.code.starts_with("client."));
+    }
+
+    #[test]
+    fn a_peer_that_closed_during_setup_is_never_reported_as_a_connect_failure() {
+        // The safety invariant of the operator path (#91): an attempt that may
+        // have reached the peer is UNKNOWN, never "nothing was sent". A peer
+        // that accepts the connection and drops it between the `connect` and
+        // the bounded-read setup makes Darwin refuse `SO_RCVTIMEO` with EINVAL
+        // (probed deterministically); that failure must not abort the
+        // connection with `client.connect`, whose contract is "no request was
+        // sent" (src/tui/operator.rs::failure_outcome classifies it as a
+        // definite no-effect). An established connection whose peer is gone is
+        // a TRANSPORT outcome, so the request path decides.
+        let (client, peer) = UnixStream::pair().expect("socketpair");
+        drop(peer);
+        let mut connection = Connection::from_stream(client).expect(
+            "an established connection is never discarded because the best-effort timeout setup \
+             failed",
+        );
+        // Either the write itself fails, or the write is accepted and the read
+        // is what fails: both are client.* transport classes, and neither may
+        // ever be the no-request class.
+        if let Err(err) = connection.send_request("cccccccccccccccc", "status", None) {
+            assert!(
+                err.code.starts_with("client.") && err.code != "client.connect",
+                "a post-connect transport failure is never the no-request class: {err:?}"
+            );
+        }
+        let read = connection
+            .read_response()
+            .expect_err("a closed peer never answers");
+        assert!(
+            read.code.starts_with("client.") && read.code != "client.connect",
+            "an unconfirmed response is a transport class, never the no-request class: {read:?}"
+        );
     }
 }

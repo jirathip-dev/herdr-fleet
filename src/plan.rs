@@ -131,7 +131,11 @@ fn doctrine_steps(repository: &Repository, issue_number: u64) -> Vec<PlanStep> {
 /// The workflow hash for the built-in doctrine workflow: derived from the
 /// canonical serialization of the spine definition (id + step ids/kinds)
 /// when no config pin supplies one.
-fn doctrine_workflow_hash(steps: &[PlanStep]) -> String {
+///
+/// Public because the queue-run producer (issue #91, `canter queue
+/// preview`) binds the same derived hash into the bound-input document the
+/// preview and the submission consume: one derivation, never a second copy.
+pub fn doctrine_workflow_hash(steps: &[PlanStep]) -> String {
     let definition = object(vec![
         ("workflow_id", string(DOCTRINE_WORKFLOW_ID)),
         (
@@ -162,6 +166,95 @@ fn steps_value(steps: &[PlanStep]) -> Val {
             })
             .collect(),
     )
+}
+
+/// The declared executable step spine of one queue run: the doctrine step
+/// spine with every step's binding parameters resolved from the reviewed
+/// run inputs.
+///
+/// This is the spine the queue-run producer (issue #91, `canter queue
+/// preview`) binds into the `hf-queue-preview/v1` bound-input document the
+/// operator surface previews, authorizes and submits: an unresolved step
+/// (`params: null`) is refused by the preview and by the submission, so no
+/// step is ever emitted unresolved.
+///
+/// Deterministic and single-sourced: the kinds and their order are the
+/// doctrine spine [`render_plan`] renders (checkout, worktree_create,
+/// harness_start, prompt, collect_outcome, review_evidence, merge,
+/// cleanup). Issue-scoped kinds carry one step per selected issue, id
+/// `p<index>-<issue>` (never a step that silently binds the wrong issue);
+/// the run-wide kinds (checkout, harness_start) appear once. Steps are
+/// emitted grouped by kind in doctrine order, and each step's params carry
+/// the exact reviewed binding (the integration ref, the harness key, the
+/// per-issue work-item identity and worktree scope).
+///
+/// `issues` is the reviewed selected set; callers pass it sorted and
+/// deduplicated. The caller also enforces the executable step bound
+/// (`queue_preview::STEPS_MAX`) — the spine grows by six steps per issue.
+pub fn queue_run_steps(
+    repository: &str,
+    integration_branch: &str,
+    harness_key: &str,
+    issues: &[u64],
+) -> Vec<PlanStep> {
+    let mut steps = vec![PlanStep {
+        id: "p1".to_string(),
+        kind: "checkout".to_string(),
+        params: Some(object(vec![("ref", string(integration_branch))])),
+    }];
+    for number in issues {
+        steps.push(PlanStep {
+            id: format!("p2-{number}"),
+            kind: "worktree_create".to_string(),
+            params: Some(object(vec![(
+                "scope",
+                string(&format!("worktrees/issues/{number}")),
+            )])),
+        });
+    }
+    steps.push(PlanStep {
+        id: "p3".to_string(),
+        kind: "harness_start".to_string(),
+        params: Some(object(vec![("harness", string(harness_key))])),
+    });
+    for number in issues {
+        let work_item = string(&format!("{repository}#{number}"));
+        steps.push(PlanStep {
+            id: format!("p4-{number}"),
+            kind: "prompt".to_string(),
+            params: Some(object(vec![
+                ("harness", string(harness_key)),
+                ("work_item", work_item.clone()),
+            ])),
+        });
+        steps.push(PlanStep {
+            id: format!("p5-{number}"),
+            kind: "collect_outcome".to_string(),
+            params: Some(object(vec![("work_item", work_item.clone())])),
+        });
+        steps.push(PlanStep {
+            id: format!("p6-{number}"),
+            kind: "review_evidence".to_string(),
+            params: Some(object(vec![("work_item", work_item.clone())])),
+        });
+        steps.push(PlanStep {
+            id: format!("p7-{number}"),
+            kind: "merge".to_string(),
+            params: Some(object(vec![
+                ("work_item", work_item.clone()),
+                ("ref", string(integration_branch)),
+            ])),
+        });
+        steps.push(PlanStep {
+            id: format!("p8-{number}"),
+            kind: "cleanup".to_string(),
+            params: Some(object(vec![
+                ("work_item", work_item),
+                ("scope", string(&format!("worktrees/issues/{number}"))),
+            ])),
+        });
+    }
+    steps
 }
 
 /// Build the plan document with a concrete plan id.
@@ -389,5 +482,128 @@ mod tests {
         let plan = render_plan(&input).expect("render");
         let verdict: Verdict = validate_doc(Family::Plan, &plan.doc);
         assert!(verdict.is_accepted());
+    }
+
+    #[test]
+    fn queue_run_steps_resolve_every_step_and_stay_deterministic() {
+        // Issue #91: the queue-run producer binds this spine into the
+        // bound-input document; the preview and the submission refuse an
+        // unresolved step, so every emitted step carries its params.
+        let one = queue_run_steps("example-org/widgets", "staging", "lane-1", &[5]);
+        assert_eq!(one.len(), 8, "the single-issue spine is the doctrine spine");
+        assert!(
+            one.iter().all(|step| step.params.is_some()),
+            "no step is emitted unresolved"
+        );
+        let kinds: Vec<&str> = one.iter().map(|step| step.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "checkout",
+                "worktree_create",
+                "harness_start",
+                "prompt",
+                "collect_outcome",
+                "review_evidence",
+                "merge",
+                "cleanup",
+            ],
+            "the kind order stays the doctrine order"
+        );
+        let ids: Vec<&str> = one.iter().map(|step| step.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["p1", "p2-5", "p3", "p4-5", "p5-5", "p6-5", "p7-5", "p8-5"]
+        );
+        // Issue-scoped kinds carry the exact per-issue binding.
+        let worktree = one
+            .iter()
+            .find(|step| step.id == "p2-5")
+            .expect("worktree step");
+        assert_eq!(
+            worktree
+                .params
+                .as_ref()
+                .and_then(|params| params.get("scope"))
+                .and_then(Val::as_str),
+            Some("worktrees/issues/5")
+        );
+        let prompt = one
+            .iter()
+            .find(|step| step.id == "p4-5")
+            .expect("prompt step");
+        assert_eq!(
+            prompt
+                .params
+                .as_ref()
+                .and_then(|params| params.get("work_item"))
+                .and_then(Val::as_str),
+            Some("example-org/widgets#5")
+        );
+
+        // Deterministic: identical inputs, byte-identical steps.
+        let again = queue_run_steps("example-org/widgets", "staging", "lane-1", &[5]);
+        assert_eq!(
+            canonical_bytes(&steps_value(&one)),
+            canonical_bytes(&steps_value(&again)),
+            "same inputs, same spine bytes"
+        );
+
+        // Two issues: one issue-scoped step set per issue, unique ids, and
+        // not a silent rebinding of the first issue's steps.
+        let two = queue_run_steps("example-org/widgets", "staging", "lane-1", &[5, 6]);
+        assert_eq!(two.len(), 14, "two issues carry two issue-scoped sets");
+        let mut seen: Vec<&str> = two.iter().map(|step| step.id.as_str()).collect();
+        let count = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), count, "every step id is unique");
+        assert!(two.iter().all(|step| step.params.is_some()));
+    }
+
+    #[test]
+    fn queue_run_steps_bind_the_configured_workflow_hash_derivation() {
+        // The producer's fallback hash IS `plan::doctrine_workflow_hash` over
+        // its own declared spine — one derivation, never a second copy: a
+        // 64-hex lowercase digest that is a pure function of the declared
+        // step labels (id + kind), stable across parameter updates.
+        let spine = queue_run_steps("example-org/widgets", "staging", "lane-1", &[5]);
+        let derived = doctrine_workflow_hash(&spine);
+        assert_eq!(derived.len(), 64);
+        assert!(
+            derived
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        );
+        assert_eq!(
+            derived,
+            doctrine_workflow_hash(&queue_run_steps(
+                "example-org/widgets",
+                "staging",
+                "lane-1",
+                &[5]
+            )),
+            "the derivation is deterministic"
+        );
+        assert_eq!(
+            derived,
+            doctrine_workflow_hash(&queue_run_steps(
+                "example-org/widgets",
+                "integration",
+                "lane-1",
+                &[5]
+            )),
+            "binding parameters are not part of the workflow hash (labels are)"
+        );
+        assert_ne!(
+            derived,
+            doctrine_workflow_hash(&queue_run_steps(
+                "example-org/widgets",
+                "staging",
+                "lane-1",
+                &[6]
+            )),
+            "a different declared spine derives a different hash"
+        );
     }
 }

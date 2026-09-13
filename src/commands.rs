@@ -29,9 +29,13 @@ use crate::observe::{
     HERDR_MINIMUM, Observation, acceptance_revision, gh_issue_text, observe_all, observe_herdr,
     probe_gh_auth, probe_version,
 };
-use crate::plan::{DOCTRINE_WORKFLOW_ID, PlanInput, render_plan};
+use crate::plan::{
+    DOCTRINE_WORKFLOW_ID, PlanInput, doctrine_workflow_hash, queue_run_steps, render_plan,
+};
+use crate::queue_preview::{Boundary, PlannedStep, QueueRequest, SelectedIssue};
 use crate::service::{self, LAUNCHD_LABEL, SYSTEMD_UNIT_NAME};
 use crate::state::{Retention, State};
+use crate::tui::operator::{OperatorConsole, PresentedRun};
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// Top-level usage text (also the `--help` output body).
@@ -54,7 +58,7 @@ USAGE:
     canter status [--config PATH] [--json]
     canter plan <repository> <issue> [--revision HEX40] [--config PATH] [--json]
     canter capabilities [--json]
-    canter board [--config PATH]
+    canter board [--plan FILE --caps G/R/H [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]...] [--config PATH]
     canter daemon run [--socket PATH] [--config PATH]
     canter daemon status [--config PATH] [--json]
     canter lane preview --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY] [--socket PATH] [--config PATH] [--json]
@@ -62,6 +66,7 @@ USAGE:
     canter lane status (--replacement RP_ID | --lane ID --generation N) [--socket PATH] [--config PATH] [--json]
     canter queue submit --request FILE --confirm-digest HEX64 [--epoch N] [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]... [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--supervise arm|off] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter queue status --submission QS_ID [--socket PATH] [--config PATH] [--json]
+    canter queue preview --repository KEY --harness KEY --host HOST --issue N=HEX40... --caps G/R/H [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--boundary-phase PHASE] [--integration-branch B] [--completion-branch B] [--out FILE] [--socket PATH] [--config PATH] [--json]
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run resume --run RUN_ID --digest HEX64 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
@@ -88,8 +93,9 @@ COMMANDS:
     daemon           Run or probe the single-writer state daemon.
     lane             Preview, request, or inspect ONE explicit lane handoff
                      (preview/status are read-only; request records intent).
-    queue            Submit one approved selected-issue run, or read one
-                     committed submission back (status is read-only).
+    queue            Preview one reviewed run (the plan producer), submit one
+                     approved selected-issue run, or read one committed
+                     submission back (preview/status are read-only).
     run              Pause, resume, retry, or inspect exactly ONE run
                      (pause/resume/retry are typed controls; status is
                      read-only; the surface is run-scoped only).
@@ -117,6 +123,11 @@ pub struct Invocation {
     pub config_path: Option<PathBuf>,
     /// Per-command arguments (plan only).
     pub plan: Option<PlanArgs>,
+    /// Presented reviewed run of the interactive `board` surface (issue
+    /// #91): the bound-input document plus the operator's presented
+    /// observations. `None` = the read-only board with no run to present
+    /// (preview/authorization refuse typed).
+    pub board: Option<BoardArgs>,
     /// Config subcommand kind (`init`/`validate`/`show`).
     pub config_action: Option<ConfigAction>,
     /// Daemon subcommand (`run`/`status`).
@@ -208,6 +219,10 @@ pub enum QueueAction {
     Submit(QueueSubmitArgs),
     /// Read one committed submission (read-only): `queue status`.
     Status(QueueStatusArgs),
+    /// Render the effect-free preview of one reviewed run and produce the
+    /// bound-input document (read-only; the plan producer of the operator
+    /// path, issue #91): `queue preview`.
+    Preview(QueuePreviewArgs),
 }
 
 /// Supervision subcommands (issue #95): the versioned status read of
@@ -270,6 +285,68 @@ pub struct QueueStatusArgs {
     pub submission: String,
     /// Explicit daemon socket override.
     pub socket: Option<String>,
+}
+
+/// `queue preview`: the reviewed run inputs of one deterministic preview
+/// render — the plan producer of the operator path (issue #91).
+///
+/// The preview is effect-free and reads only the recorded state; the bound-
+/// input document it renders IS the material `queue submit --request` and
+/// `board --plan` consume (its sha256 is the preview digest an approval
+/// binds).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuePreviewArgs {
+    /// Configured repository key or `owner/name` identity.
+    pub repository: String,
+    /// Selected issues with their exact 40-hex spec revisions (`N=HEX40`).
+    pub selected: Vec<(u64, String)>,
+    /// Configured harness key whose reviewed role binding is re-observed.
+    pub harness: String,
+    /// Explicit target host identity token.
+    pub host: String,
+    /// Presented host availability; `None` = unknown (a hold).
+    pub host_available: Option<bool>,
+    /// Presented same-harness occupancy; `None` = unknown (a hold).
+    pub harness_lanes: Option<i64>,
+    /// Presented fan-out concurrency caps (the admission axes).
+    pub caps: crate::lifecycle::ConcurrencyCaps,
+    /// Allowed completion boundary phase (a closed grant phase); `None`
+    /// renders the doctrine default (`merge`).
+    pub boundary_phase: Option<String>,
+    /// Integration branch of the allowed boundary; `None` renders the
+    /// configured repository branch (or `staging`).
+    pub integration_branch: Option<String>,
+    /// Completion branch of the allowed boundary; `None` renders the
+    /// integration branch.
+    pub completion_branch: Option<String>,
+    /// `--out PATH`: write the bound-input document (the exact
+    /// `--request`/`--plan` material) to this path.
+    pub out: Option<PathBuf>,
+    /// Explicit daemon socket override (path derivation only).
+    pub socket: Option<String>,
+}
+
+/// `board`: the reviewed run presented to the interactive operator surface
+/// (issue #91).
+///
+/// The plan is the bound-input document `queue submit --request` reads (the
+/// same reviewed material `canter queue preview` produces); the remaining
+/// fields are the operator's presented observations — attested, never
+/// measured or inferred by the surface, and unknown stays a hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoardArgs {
+    /// Path of the reviewed bound-input document.
+    pub plan_path: PathBuf,
+    /// Presented host availability; `None` = unknown (a hold).
+    pub host_available: Option<bool>,
+    /// Presented same-harness occupancy; `None` = unknown (a hold).
+    pub harness_lanes: Option<i64>,
+    /// Presented fan-out concurrency caps.
+    pub caps: crate::lifecycle::ConcurrencyCaps,
+    /// Presented per-issue grant bindings (`REF=GRANT_ID`).
+    pub grants: Vec<(String, String)>,
+    /// Presented resume authorizations (`INSTANCE=DIGEST`).
+    pub resume: Vec<(String, String)>,
 }
 
 /// Daemon subcommands (issue #5).
@@ -553,6 +630,7 @@ fn parse_flag_command(name: &str, args: &[&String]) -> Result<Invocation, ParseE
         command: name.to_string(),
         json,
         config_path,
+        board: None,
         plan: None,
         config_action: None,
         daemon_action: None,
@@ -564,16 +642,32 @@ fn parse_flag_command(name: &str, args: &[&String]) -> Result<Invocation, ParseE
     })
 }
 
-/// `board`: the interactive operator surface (`--config PATH` only).
+/// `board`: the interactive operator surface (issue #91: the reachable
+/// operator authority path).
 ///
 /// `board` renders into the invoking terminal, so it deliberately accepts no
 /// `--json`: the refusal is typed at parse time, and a malformed invocation
 /// touches nothing (no config, no state store, no terminal). `--config` is
 /// honoured because a configured `daemon.socket` is what lets the daemon
 /// paths be derived on hosts without `XDG_RUNTIME_DIR` — the board reads the
-/// same state store the daemon writes.
+/// same state store the daemon writes, and the operator submits through the
+/// same derived socket.
+///
+/// `--plan PATH` presents one reviewed run (the bound-input document
+/// `queue submit --request` reads, as produced by `canter queue preview`)
+/// together with the operator's presented observations: the axis the CLI
+/// presents with `--host-available`/`--harness-lanes`/`--caps`/`--grant`/
+/// `--resume` on `queue submit`. Without `--plan` the board stays the
+/// read-only surface: nothing can be previewed or authorized, and every
+/// authority action refuses typed.
 fn parse_board(args: &[&String]) -> Result<Invocation, ParseError> {
     let mut config_path: Option<PathBuf> = None;
+    let mut plan_path: Option<PathBuf> = None;
+    let mut host_available: Option<bool> = None;
+    let mut harness_lanes: Option<i64> = None;
+    let mut caps: Option<crate::lifecycle::ConcurrencyCaps> = None;
+    let mut grants: Vec<(String, String)> = Vec::new();
+    let mut resume: Vec<(String, String)> = Vec::new();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -583,6 +677,57 @@ fn parse_board(args: &[&String]) -> Result<Invocation, ParseError> {
                     ParseError::Usage("board: --config requires a path argument".to_string())
                 })?;
                 config_path = Some(PathBuf::from(value));
+            }
+            "--plan" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    ParseError::Usage(
+                        "board: --plan requires a path to the reviewed bound-input document"
+                            .to_string(),
+                    )
+                })?;
+                plan_path = Some(PathBuf::from(value));
+            }
+            "--grant" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    ParseError::Usage("board: --grant requires a REF=GRANT_ID value".to_string())
+                })?;
+                grants.push(parse_grant_argument("board", value)?);
+            }
+            "--resume" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    ParseError::Usage(
+                        "board: --resume requires an INSTANCE=DIGEST value".to_string(),
+                    )
+                })?;
+                resume.push(parse_resume_argument("board", value)?);
+            }
+            "--host-available" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    ParseError::Usage("board: --host-available requires yes|no|unknown".to_string())
+                })?;
+                host_available = parse_host_available_argument("board", value)?;
+            }
+            "--harness-lanes" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    ParseError::Usage(
+                        "board: --harness-lanes requires a lane count or unknown".to_string(),
+                    )
+                })?;
+                harness_lanes = parse_harness_lanes_argument("board", value)?;
+            }
+            "--caps" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    ParseError::Usage(
+                        "board: --caps requires a GLOBAL/REPOSITORY/HARNESS value".to_string(),
+                    )
+                })?;
+                caps = Some(parse_caps_argument("board", value)?);
             }
             "-h" | "--help" => return Err(ParseError::Help(help_request("board"))),
             "--json" => {
@@ -599,11 +744,55 @@ fn parse_board(args: &[&String]) -> Result<Invocation, ParseError> {
         }
         index += 1;
     }
+    let board = match plan_path {
+        None => {
+            // Presenting observations without a run is an invocation
+            // mistake: there is nothing to observe, and silently dropping
+            // attested facts would be exactly the kind of guess this surface
+            // never makes.
+            if caps.is_some()
+                || host_available.is_some()
+                || harness_lanes.is_some()
+                || !grants.is_empty()
+                || !resume.is_empty()
+            {
+                return Err(ParseError::Usage(
+                    "board: --plan FILE is required with the presented observation flags \
+                     (--caps/--host-available/--harness-lanes/--grant/--resume describe the one \
+                     presented run)"
+                        .to_string(),
+                ));
+            }
+            None
+        }
+        Some(plan_path) => {
+            // The admission axes are never assumed: an unspecified cap is
+            // unknown capacity, and unknown capacity admits nothing, so the
+            // presented run requires the same explicit --caps the CLI's
+            // `queue submit` requires.
+            let caps = caps.ok_or_else(|| {
+                ParseError::Usage(
+                    "board: --caps GLOBAL/REPOSITORY/HARNESS is required with --plan (the \
+                     presented admission axes; unknown capacity is never assumed)"
+                        .to_string(),
+                )
+            })?;
+            Some(BoardArgs {
+                plan_path,
+                host_available,
+                harness_lanes,
+                caps,
+                grants,
+                resume,
+            })
+        }
+    };
     Ok(Invocation {
         command: "board".to_string(),
         json: false,
         config_path,
         plan: None,
+        board,
         config_action: None,
         daemon_action: None,
         service_action: None,
@@ -677,7 +866,7 @@ const BOARD_USAGE: &str = "\
 canter board — render the read-only operator board in this terminal
 
 USAGE:
-    canter board [--config PATH]
+    canter board [--plan FILE --caps G/R/H [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]...] [--config PATH]
 
 Renders the live board from the recorded work items and runs of the daemon
 state store (the bounded read model, no second database): wide four-group
@@ -692,6 +881,21 @@ running daemon: it reads the state store the daemon writes. `--config` is
 honoured for the daemon path derivation (a configured daemon.socket removes
 the XDG_RUNTIME_DIR requirement). This command is an interactive terminal
 surface and does not accept --json.
+
+With `--plan FILE` the board runs the operator authority path over ONE
+presented reviewed run: `p` opens the exact preview (the real preview
+service re-derived against the live state), Enter continues to the
+authorization screen, and Space then Enter is the ONLY keystroke that
+authorizes anything. Back/cancel/quit never authorize, a resize clears the
+approval box, and a moved preview digest, state epoch or role revision is
+refused typed before anything is sent. FILE is the bound-input document
+`canter queue preview --out` produces (the same material `queue submit
+--request` reads). The presented observations (--host-available,
+--harness-lanes, --caps, --grant, --resume) are attestations from the
+operator: the surface never measures, infers or guesses them, and an
+unattested value holds work instead of admitting it. The run itself is
+daemon-owned: closing the terminal stops nothing, and a reopened board reads
+the recorded state back.
 ";
 
 const PLAN_USAGE: &str = "\
@@ -774,6 +978,7 @@ fn parse_config(args: &[&String]) -> Result<Invocation, ParseError> {
         .to_string(),
         json,
         config_path,
+        board: None,
         plan: None,
         config_action: Some(action),
         daemon_action: None,
@@ -868,6 +1073,7 @@ fn parse_daemon(args: &[&String]) -> Result<Invocation, ParseError> {
         },
         json,
         config_path,
+        board: None,
         plan: None,
         config_action: None,
         daemon_action: Some(action),
@@ -928,6 +1134,7 @@ fn parse_service(args: &[&String]) -> Result<Invocation, ParseError> {
         command: command.to_string(),
         json,
         config_path,
+        board: None,
         plan: None,
         config_action: None,
         daemon_action: None,
@@ -1113,6 +1320,7 @@ fn parse_lane(args: &[&String]) -> Result<Invocation, ParseError> {
             command: command.to_string(),
             json,
             config_path,
+            board: None,
             plan: None,
             config_action: None,
             daemon_action: None,
@@ -1185,6 +1393,7 @@ fn parse_lane(args: &[&String]) -> Result<Invocation, ParseError> {
         command: command.to_string(),
         json,
         config_path,
+        board: None,
         plan: None,
         config_action: None,
         daemon_action: None,
@@ -1370,6 +1579,7 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
         command: command.to_string(),
         json,
         config_path,
+        board: None,
         plan: None,
         config_action: None,
         daemon_action: None,
@@ -1439,6 +1649,7 @@ fn parse_supervision(args: &[&String]) -> Result<Invocation, ParseError> {
         command: command.to_string(),
         json,
         config_path,
+        board: None,
         plan: None,
         config_action: None,
         daemon_action: None,
@@ -1453,7 +1664,8 @@ fn parse_supervision(args: &[&String]) -> Result<Invocation, ParseError> {
     })
 }
 
-/// Parse `queue <submit|status>` (issue #85).
+/// Parse `queue <submit|status|preview>` (issue #85; `preview` is the
+/// plan producer of the operator path, issue #91).
 fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
     let action = args
         .first()
@@ -1464,6 +1676,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
     let command = match action.as_str() {
         "submit" => "queue submit",
         "status" => "queue status",
+        "preview" => "queue preview",
         other => {
             return Err(ParseError::Usage(format!(
                 "queue: unknown subcommand {other:?}; run `canter queue --help`"
@@ -1489,6 +1702,15 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
     let mut supervise = "disabled".to_string();
     let mut idempotency_key: Option<String> = None;
     let mut submission: Option<String> = None;
+    // Plan-producer inputs (`queue preview`, issue #91).
+    let mut repository: Option<String> = None;
+    let mut selected: Vec<(u64, String)> = Vec::new();
+    let mut harness: Option<String> = None;
+    let mut host: Option<String> = None;
+    let mut boundary_phase: Option<String> = None;
+    let mut integration_branch: Option<String> = None;
+    let mut completion_branch: Option<String> = None;
+    let mut out: Option<PathBuf> = None;
     let mut index = 0;
     while index < rest.len() {
         match rest[index].as_str() {
@@ -1533,109 +1755,25 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
             }
             "--grant" => {
                 let raw = flag_value(&rest, &mut index, "queue", "--grant")?;
-                let Some((reference, grant_id)) = raw.split_once('=') else {
-                    return Err(ParseError::Usage(format!(
-                        "queue submit: --grant takes REF=GRANT_ID, got {raw:?}"
-                    )));
-                };
-                let reference = reference.trim();
-                if reference.is_empty() {
-                    return Err(ParseError::Usage(format!(
-                        "queue submit: --grant requires a non-empty issue reference, got {raw:?}"
-                    )));
-                }
-                if !crate::formats::is_grant_id(grant_id) {
-                    return Err(ParseError::Usage(format!(
-                        "queue submit: --grant grant ids are `gr_` + 16 lowercase hex, got \
-                         {grant_id:?}"
-                    )));
-                }
-                grants.push((reference.to_string(), grant_id.to_string()));
+                grants.push(parse_grant_argument("queue submit", &raw)?);
             }
             "--resume" => {
                 let raw = flag_value(&rest, &mut index, "queue", "--resume")?;
-                let Some((instance_id, digest)) = raw.split_once('=') else {
-                    return Err(ParseError::Usage(format!(
-                        "queue submit: --resume takes INSTANCE=DIGEST, got {raw:?}"
-                    )));
-                };
-                if instance_id.is_empty() || instance_id.len() > 64 {
-                    return Err(ParseError::Usage(format!(
-                        "queue submit: --resume requires a bounded instance id, got {raw:?}"
-                    )));
-                }
-                if !crate::formats::is_hex64(digest) {
-                    return Err(ParseError::Usage(format!(
-                        "queue submit: --resume digests are the engine-minted 64-hex digests, got \
-                         {digest:?}"
-                    )));
-                }
-                resume.push((instance_id.to_string(), digest.to_string()));
+                resume.push(parse_resume_argument("queue submit", &raw)?);
             }
             "--host-available" => {
                 let raw = flag_value(&rest, &mut index, "queue", "--host-available")?;
                 host_available_set = true;
-                host_available = match raw.as_str() {
-                    "yes" => Some(true),
-                    "no" => Some(false),
-                    "unknown" => None,
-                    other => {
-                        return Err(ParseError::Usage(format!(
-                            "queue submit: --host-available takes yes|no|unknown, got {other:?}"
-                        )));
-                    }
-                };
+                host_available = parse_host_available_argument("queue submit", &raw)?;
             }
             "--harness-lanes" => {
                 let raw = flag_value(&rest, &mut index, "queue", "--harness-lanes")?;
                 harness_lanes_set = true;
-                if raw == "unknown" {
-                    harness_lanes = None;
-                } else {
-                    let parsed = raw.parse::<i64>().map_err(|_| {
-                        ParseError::Usage(format!(
-                            "queue submit: --harness-lanes takes a non-negative lane count or \
-                             unknown, got {raw:?}"
-                        ))
-                    })?;
-                    if parsed < 0 {
-                        return Err(ParseError::Usage(format!(
-                            "queue submit: --harness-lanes takes a non-negative lane count or \
-                             unknown, got {raw:?}"
-                        )));
-                    }
-                    harness_lanes = Some(parsed);
-                }
+                harness_lanes = parse_harness_lanes_argument("queue submit", &raw)?;
             }
             "--caps" => {
                 let raw = flag_value(&rest, &mut index, "queue", "--caps")?;
-                let parts: Vec<&str> = raw.split('/').collect();
-                let parse = |text: &str| -> Option<usize> {
-                    text.parse::<usize>()
-                        .ok()
-                        .filter(|value| *value <= crate::queue_executor::CAP_MAX)
-                };
-                if parts.len() != 3 {
-                    return Err(ParseError::Usage(format!(
-                        "queue submit: --caps takes GLOBAL/REPOSITORY/HARNESS (integers 0..={}), \
-                         got {raw:?}",
-                        crate::queue_executor::CAP_MAX
-                    )));
-                }
-                let (Some(global), Some(per_repository), Some(per_harness)) =
-                    (parse(parts[0]), parse(parts[1]), parse(parts[2]))
-                else {
-                    return Err(ParseError::Usage(format!(
-                        "queue submit: --caps takes GLOBAL/REPOSITORY/HARNESS (integers 0..={}), \
-                         got {raw:?}",
-                        crate::queue_executor::CAP_MAX
-                    )));
-                };
-                caps = Some(crate::lifecycle::ConcurrencyCaps {
-                    global,
-                    per_repository,
-                    per_harness,
-                });
+                caps = Some(parse_caps_argument(command, &raw)?);
             }
             "--supervise" => {
                 let raw = flag_value(&rest, &mut index, "queue", "--supervise")?;
@@ -1669,6 +1807,59 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
                 }
                 submission = Some(raw);
             }
+            // Plan-producer inputs (`queue preview`, issue #91). Every name
+            // is a reviewed strategy input: the repository identity and the
+            // role binding come from config, the selection and the
+            // observations are attested, and nothing is inferred.
+            "--repository" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--repository")?;
+                if raw.trim().is_empty() {
+                    return Err(ParseError::Usage(format!(
+                        "queue preview: --repository requires a non-empty configured repository \
+                         key or identity, got {raw:?}"
+                    )));
+                }
+                repository = Some(raw.trim().to_string());
+            }
+            "--issue" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--issue")?;
+                selected.push(parse_selected_issue_argument(&raw)?);
+            }
+            "--harness" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--harness")?;
+                if !crate::formats::is_slug(&raw) {
+                    return Err(ParseError::Usage(format!(
+                        "queue preview: --harness must be a configured harness key (lowercase \
+                         slug), got {raw:?}"
+                    )));
+                }
+                harness = Some(raw);
+            }
+            "--host" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--host")?;
+                host = Some(raw);
+            }
+            "--boundary-phase" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--boundary-phase")?;
+                boundary_phase = Some(raw);
+            }
+            "--integration-branch" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--integration-branch")?;
+                integration_branch = Some(raw);
+            }
+            "--completion-branch" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--completion-branch")?;
+                completion_branch = Some(raw);
+            }
+            "--out" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--out")?;
+                if raw.trim().is_empty() {
+                    return Err(ParseError::Usage(format!(
+                        "queue preview: --out requires a file path, got {raw:?}"
+                    )));
+                }
+                out = Some(PathBuf::from(raw));
+            }
             "-h" | "--help" => return Err(ParseError::Help(help_request("queue"))),
             flag => {
                 return Err(ParseError::Usage(format!(
@@ -1678,10 +1869,27 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
         }
         index += 1;
     }
+    // Cross-command flag refusals: one command's flags never silently apply
+    // to another (a preview input is not a submission authorization).
+    let preview_only = repository.is_some()
+        || !selected.is_empty()
+        || harness.is_some()
+        || host.is_some()
+        || boundary_phase.is_some()
+        || integration_branch.is_some()
+        || completion_branch.is_some()
+        || out.is_some();
     let queue_action = if command == "queue submit" {
         if submission.is_some() {
             return Err(ParseError::Usage(
                 "queue submit: --submission is only valid for `canter queue status`".to_string(),
+            ));
+        }
+        if preview_only {
+            return Err(ParseError::Usage(
+                "queue submit: preview flags are not valid for a submission (`canter queue preview` \
+                 produces the --request document)"
+                    .to_string(),
             ));
         }
         let request_path = request_path.ok_or_else(|| {
@@ -1716,6 +1924,71 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
             idempotency_key,
             socket,
         })
+    } else if command == "queue preview" {
+        if request_path.is_some()
+            || confirm_digest.is_some()
+            || epoch.is_some()
+            || !grants.is_empty()
+            || !resume.is_empty()
+            || idempotency_key.is_some()
+            || submission.is_some()
+            || supervise != "disabled"
+        {
+            return Err(ParseError::Usage(
+                "queue preview: submission flags are not valid for a read-only preview render \
+                 (grants and resume authorizations are presented to `canter queue submit`)"
+                    .to_string(),
+            ));
+        }
+        let repository = repository.ok_or_else(|| {
+            ParseError::Usage(
+                "queue preview: --repository KEY is required (the configured repository whose \
+                 identity and branches the plan binds)"
+                    .to_string(),
+            )
+        })?;
+        let harness = harness.ok_or_else(|| {
+            ParseError::Usage(
+                "queue preview: --harness KEY is required (the configured harness whose reviewed \
+                 role configuration the plan re-observes)"
+                    .to_string(),
+            )
+        })?;
+        let host = host.ok_or_else(|| {
+            ParseError::Usage(
+                "queue preview: --host HOST is required (the explicit target host identity; it is \
+                 never inferred)"
+                    .to_string(),
+            )
+        })?;
+        if selected.is_empty() {
+            return Err(ParseError::Usage(
+                "queue preview: at least one --issue N=HEX40 is required (the exact selected-issue \
+                 set with its spec revisions)"
+                    .to_string(),
+            ));
+        }
+        let caps = caps.ok_or_else(|| {
+            ParseError::Usage(
+                "queue preview: --caps GLOBAL/REPOSITORY/HARNESS is required (the presented \
+                 admission axes; unknown capacity is never assumed)"
+                    .to_string(),
+            )
+        })?;
+        QueueAction::Preview(QueuePreviewArgs {
+            repository,
+            selected,
+            harness,
+            host,
+            host_available,
+            harness_lanes,
+            caps,
+            boundary_phase,
+            integration_branch,
+            completion_branch,
+            out,
+            socket,
+        })
     } else {
         if request_path.is_some()
             || confirm_digest.is_some()
@@ -1726,6 +1999,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
             || harness_lanes_set
             || caps.is_some()
             || idempotency_key.is_some()
+            || preview_only
         {
             return Err(ParseError::Usage(
                 "queue status: submission flags are not valid for a read-only status read"
@@ -1741,6 +2015,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
         command: command.to_string(),
         json,
         config_path,
+        board: None,
         plan: None,
         config_action: None,
         daemon_action: None,
@@ -1763,6 +2038,143 @@ fn flag_value(
     args.get(*index)
         .map(|value| value.to_string())
         .ok_or_else(|| ParseError::Usage(format!("{command}: {flag} requires a value")))
+}
+
+/// Parse one `--caps GLOBAL/REPOSITORY/HARNESS` value (the presented
+/// admission axes; unknown capacity is never assumed).
+///
+/// Shared by the commands that present the same axis (`queue submit` and
+/// the operator `board`) so the accepted grammar and its refusals cannot
+/// drift apart.
+fn parse_caps_argument(
+    command: &str,
+    raw: &str,
+) -> Result<crate::lifecycle::ConcurrencyCaps, ParseError> {
+    let parts: Vec<&str> = raw.split('/').collect();
+    let parse = |text: &str| -> Option<usize> {
+        text.parse::<usize>()
+            .ok()
+            .filter(|value| *value <= crate::queue_executor::CAP_MAX)
+    };
+    let refusal = || {
+        ParseError::Usage(format!(
+            "{command}: --caps takes GLOBAL/REPOSITORY/HARNESS (integers 0..={}), got {raw:?}",
+            crate::queue_executor::CAP_MAX
+        ))
+    };
+    if parts.len() != 3 {
+        return Err(refusal());
+    }
+    let (Some(global), Some(per_repository), Some(per_harness)) =
+        (parse(parts[0]), parse(parts[1]), parse(parts[2]))
+    else {
+        return Err(refusal());
+    };
+    Ok(crate::lifecycle::ConcurrencyCaps {
+        global,
+        per_repository,
+        per_harness,
+    })
+}
+
+/// Parse one `--grant REF=GRANT_ID` presented binding.
+fn parse_grant_argument(command: &str, raw: &str) -> Result<(String, String), ParseError> {
+    let Some((reference, grant_id)) = raw.split_once('=') else {
+        return Err(ParseError::Usage(format!(
+            "{command}: --grant takes REF=GRANT_ID, got {raw:?}"
+        )));
+    };
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return Err(ParseError::Usage(format!(
+            "{command}: --grant requires a non-empty issue reference, got {raw:?}"
+        )));
+    }
+    if !crate::formats::is_grant_id(grant_id) {
+        return Err(ParseError::Usage(format!(
+            "{command}: --grant grant ids are `gr_` + 16 lowercase hex, got {grant_id:?}"
+        )));
+    }
+    Ok((reference.to_string(), grant_id.to_string()))
+}
+
+/// Parse one `--resume INSTANCE=DIGEST` presented authorization.
+fn parse_resume_argument(command: &str, raw: &str) -> Result<(String, String), ParseError> {
+    let Some((instance_id, digest)) = raw.split_once('=') else {
+        return Err(ParseError::Usage(format!(
+            "{command}: --resume takes INSTANCE=DIGEST, got {raw:?}"
+        )));
+    };
+    if instance_id.is_empty() || instance_id.len() > 64 {
+        return Err(ParseError::Usage(format!(
+            "{command}: --resume requires a bounded instance id, got {raw:?}"
+        )));
+    }
+    if !crate::formats::is_hex64(digest) {
+        return Err(ParseError::Usage(format!(
+            "{command}: --resume digests are the engine-minted 64-hex digests, got {digest:?}"
+        )));
+    }
+    Ok((instance_id.to_string(), digest.to_string()))
+}
+
+/// Parse one `--host-available yes|no|unknown` attestation; `unknown` is
+/// `None` (a hold, never a yes).
+fn parse_host_available_argument(command: &str, raw: &str) -> Result<Option<bool>, ParseError> {
+    match raw {
+        "yes" => Ok(Some(true)),
+        "no" => Ok(Some(false)),
+        "unknown" => Ok(None),
+        other => Err(ParseError::Usage(format!(
+            "{command}: --host-available takes yes|no|unknown, got {other:?}"
+        ))),
+    }
+}
+
+/// Parse one `--harness-lanes N|unknown` attestation; `unknown` is `None`
+/// (missing occupancy is never assumed to be spare capacity).
+fn parse_harness_lanes_argument(command: &str, raw: &str) -> Result<Option<i64>, ParseError> {
+    if raw == "unknown" {
+        return Ok(None);
+    }
+    let refusal = || {
+        ParseError::Usage(format!(
+            "{command}: --harness-lanes takes a non-negative lane count or unknown, got {raw:?}"
+        ))
+    };
+    let parsed = raw.parse::<i64>().map_err(|_| refusal())?;
+    if parsed < 0 {
+        return Err(refusal());
+    }
+    Ok(Some(parsed))
+}
+
+/// Parse one `--issue N=HEX40` reviewed selection: the issue number plus
+/// its exact 40-hex spec revision (never a moving ref).
+fn parse_selected_issue_argument(raw: &str) -> Result<(u64, String), ParseError> {
+    let Some((number, revision)) = raw.split_once('=') else {
+        return Err(ParseError::Usage(format!(
+            "queue preview: --issue takes N=HEX40 (the issue and its exact spec revision), got \
+             {raw:?}"
+        )));
+    };
+    let parsed = number.trim().parse::<u64>().map_err(|_| {
+        ParseError::Usage(format!(
+            "queue preview: --issue takes N=HEX40, got {raw:?} (N must be a positive integer)"
+        ))
+    })?;
+    if parsed == 0 {
+        return Err(ParseError::Usage(format!(
+            "queue preview: --issue takes N=HEX40, got {raw:?} (N must be a positive integer)"
+        )));
+    }
+    if !crate::formats::is_hex40(revision) {
+        return Err(ParseError::Usage(format!(
+            "queue preview: --issue takes N=HEX40, got {raw:?} (the revision must be 40 lowercase \
+             hex)"
+        )));
+    }
+    Ok((parsed, revision.to_string()))
 }
 
 /// Require one already-parsed flag value.
@@ -1835,6 +2247,7 @@ fn parse_plan(args: &[&String]) -> Result<Invocation, ParseError> {
         config_path,
         daemon_action: None,
         service_action: None,
+        board: None,
         plan: Some(PlanArgs {
             repository: positionals[0].clone(),
             issue_number,
@@ -2450,6 +2863,15 @@ fn execute_capabilities(_invocation: &Invocation) -> CmdResult {
 /// request) and the surface only changes local selection/focus. A state
 /// store that does not exist is reported typed — this command never creates
 /// one — and a terminal failure is reported as the session error it is.
+///
+/// With `--plan` (issue #91) the same terminal runs the operator authority
+/// path instead: the recorded board plus the exact preview, the explicit
+/// authorization and the daemon-owned run. The console consumes the SAME
+/// typed services the CLI uses ([`crate::queue_preview::preview_queue`],
+/// [`crate::queue_executor::revalidate`], `queue.submit` over the derived
+/// socket); the surface never synthesizes a shell command and never runs a
+/// UI scheduler, and a plan whose digest/epoch/role revision moved is
+/// refused typed before anything is sent.
 fn execute_board(invocation: &Invocation) -> CmdResult {
     let config = match load_optional_config(invocation) {
         Ok(config) => config,
@@ -2486,8 +2908,19 @@ fn execute_board(invocation: &Invocation) -> CmdResult {
             );
         }
     };
-    let board = crate::tui::live::LiveBoard::new(&state);
-    match crate::tui::session::run(&board) {
+    // The presented reviewed run: loaded from the bound-input document (the
+    // same material `queue submit --request` reads) and paired with the
+    // attested observations below. Absent `--plan`, no run is presented and
+    // the operator surface refuses preview/authorize typed.
+    let presented = match invocation.board.as_ref() {
+        None => None,
+        Some(args) => match presented_run(args) {
+            Ok(run) => Some(run),
+            Err(result) => return result,
+        },
+    };
+    let mut console = OperatorConsole::new(&state, paths.socket_path.clone(), config, presented);
+    match crate::tui::session::run_operator(&mut console) {
         Ok(()) => ok_result(object(vec![]), String::new()),
         Err(err) => error_result(
             1,
@@ -2496,6 +2929,74 @@ fn execute_board(invocation: &Invocation) -> CmdResult {
             false,
         ),
     }
+}
+
+/// Build the presented run of `board --plan`: the reviewed bound-input
+/// document plus the operator's attested observations.
+///
+/// The document is loaded (never rebuilt — the same rule the tests of the
+/// operator surface follow) and must be one JSON object; the operator
+/// surface re-derives and refuses anything malformed or moved typed at
+/// preview time. The label is the file NAME, never a host path: the surface
+/// displays it, so it stays a label. (The error is a full `CmdResult`, the
+/// CLI's one result shape, so the allowance mirrors the crate's convention.)
+#[allow(clippy::result_large_err)]
+fn presented_run(args: &BoardArgs) -> Result<PresentedRun, CmdResult> {
+    let text = match std::fs::read_to_string(&args.plan_path) {
+        Ok(text) => text,
+        Err(err) => {
+            return Err(error_result(
+                2,
+                "usage.board_plan",
+                format!(
+                    "board: cannot read {} ({err}); --plan names the reviewed bound-input document",
+                    args.plan_path.display()
+                ),
+                false,
+            ));
+        }
+    };
+    let bound = match Val::parse_json(&text) {
+        Ok(bound @ Val::Obj(_)) => bound,
+        _ => {
+            return Err(error_result(
+                2,
+                "usage.board_plan",
+                format!(
+                    "board: {} must carry one bound-input document (JSON object)",
+                    args.plan_path.display()
+                ),
+                false,
+            ));
+        }
+    };
+    let label = args
+        .plan_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "reviewed-run-plan".to_string());
+    let mut run = PresentedRun::new(label, bound, args.caps);
+    run.host_available = args.host_available;
+    run.harness_lanes = args.harness_lanes;
+    run.grants = args
+        .grants
+        .iter()
+        .map(|(id, grant_id)| crate::queue_executor::ItemGrant {
+            id: id.clone(),
+            grant_id: grant_id.clone(),
+        })
+        .collect();
+    run.resume = args
+        .resume
+        .iter()
+        .map(
+            |(instance_id, digest)| crate::queue_executor::ResumeAuthorization {
+                instance_id: instance_id.clone(),
+                digest: digest.clone(),
+            },
+        )
+        .collect();
+    Ok(run)
 }
 
 // ---------------------------------------------------------------------------
@@ -3238,6 +3739,7 @@ fn execute_queue(action: QueueAction, invocation: &Invocation) -> CmdResult {
     match action {
         QueueAction::Submit(args) => execute_queue_submit(&args, invocation),
         QueueAction::Status(args) => execute_queue_status(&args, invocation),
+        QueueAction::Preview(args) => execute_queue_preview(&args, invocation),
     }
 }
 
@@ -3459,6 +3961,288 @@ fn execute_queue_status(args: &QueueStatusArgs, invocation: &Invocation) -> CmdR
             lane_error(&code, format!("queue status: {message}"), false)
         }
     }
+}
+
+/// `queue preview` (issue #91): render the effect-free preview of one
+/// reviewed run and produce its bound-input document — the plan producer
+/// the operator path consumes.
+///
+/// Read-only by construction: the render is the real #84 preview service
+/// over the recorded state store (the same store the daemon writes), the
+/// repository identity and the role binding are re-observed from
+/// configuration (never free-form argv), and the declared spine is the
+/// doctrine spine with resolved parameters. Nothing is spawned, no grant is
+/// issued, and no external state is written; the emitted digest is the
+/// exact authorization a `queue submit --confirm-digest` (or the operator
+/// surface) binds.
+fn execute_queue_preview(args: &QueuePreviewArgs, invocation: &Invocation) -> CmdResult {
+    let config = match required_config(&invocation.config_path) {
+        Ok(config) => config,
+        Err(result) => return *result,
+    };
+    let repository = match resolve_repository(&config, &args.repository) {
+        Ok(repository) => repository,
+        Err(message) => {
+            return error_result(
+                2,
+                "usage.error",
+                format!("queue preview: {message}; run `canter queue preview --help`"),
+                false,
+            );
+        }
+    };
+    // The reviewed role configuration: re-observed from the CURRENT config
+    // exactly as `queue submit` re-observes it (a revision the operator
+    // cannot edit). A missing/unknown/unbound harness refuses before any
+    // state is touched.
+    let Some(harness) = config
+        .harnesses
+        .iter()
+        .find(|harness| harness.key == args.harness)
+    else {
+        return error_result(
+            5,
+            "config.harness",
+            format!(
+                "no configured harness {:?}; --harness names a configured harness key (see \
+                 `canter config show --json`)",
+                args.harness
+            ),
+            false,
+        );
+    };
+    let env = crate::config::credential_environment(harness);
+    let Some(binding) = crate::config::ProfileBinding::from_config(&config, &args.harness, &env)
+    else {
+        return error_result(
+            5,
+            "config.harness",
+            format!(
+                "harness {:?} declares no provider/model binding; there is no re-observed role \
+                 configuration to preview",
+                args.harness
+            ),
+            false,
+        );
+    };
+    // The workflow binding: the same rule as `canter plan` (a configured pin
+    // that names another workflow is refused; the workflow engine is a later
+    // slice), otherwise the hash derived from the doctrine spine itself.
+    let workflow = config
+        .workflows
+        .iter()
+        .find(|pin| pin.id == DOCTRINE_WORKFLOW_ID)
+        .or_else(|| config.workflows.first());
+    if let Some(pin) = workflow.filter(|pin| pin.id != DOCTRINE_WORKFLOW_ID) {
+        return error_result(
+            4,
+            "refusal.workflow.unsupported",
+            format!(
+                "the configured workflow pin {:?} is not supported by this read-only core (only \
+                 {DOCTRINE_WORKFLOW_ID} is available; the workflow engine lands with a later \
+                 slice)",
+                pin.id
+            ),
+            false,
+        );
+    }
+    // The reviewed selected set: stable issue identity plus its exact
+    // 40-hex spec revision, sorted and deduplicated. The same issue with
+    // two different revisions is a conflict, never a silent pick.
+    let mut selected = args.selected.clone();
+    selected.sort();
+    let mut unique: Vec<(u64, String)> = Vec::new();
+    for (number, revision) in selected {
+        match unique.last() {
+            Some((seen, other)) if *seen == number => {
+                if other != &revision {
+                    return error_result(
+                        2,
+                        "usage.queue_issue",
+                        format!(
+                            "queue preview: issue #{number} is presented twice with conflicting \
+                             spec revisions ({other}, {revision})"
+                        ),
+                        false,
+                    );
+                }
+            }
+            _ => unique.push((number, revision)),
+        }
+    }
+    let issues: Vec<u64> = unique.iter().map(|(number, _)| *number).collect();
+    let integration = args
+        .integration_branch
+        .clone()
+        .or_else(|| repository.branch.clone())
+        .unwrap_or_else(|| "staging".to_string());
+    let completion = args
+        .completion_branch
+        .clone()
+        .unwrap_or_else(|| integration.clone());
+    let phase = args
+        .boundary_phase
+        .clone()
+        .unwrap_or_else(|| "merge".to_string());
+    // The declared executable spine: the doctrine spine bound to the
+    // reviewed run, with every step resolved.
+    let steps = queue_run_steps(&repository.identity(), &integration, &args.harness, &issues);
+    if steps.len() > crate::queue_preview::STEPS_MAX {
+        return error_result(
+            2,
+            "usage.queue_steps",
+            format!(
+                "queue preview: the derived executable spine for {} selected issues carries {} \
+                 steps, above the {}-step bound the preview and the submission enforce; preview a \
+                 narrower selected set",
+                issues.len(),
+                steps.len(),
+                crate::queue_preview::STEPS_MAX
+            ),
+            false,
+        );
+    }
+    // The allowed completion boundary: the phase/branches are reviewed
+    // inputs, and the capability set is derived from the spine itself (every
+    // step's required capability, in spine order) so the rendered boundary
+    // can never contradict the declared steps.
+    let mut boundary_caps: Vec<String> = Vec::new();
+    for step in &steps {
+        if let Some(capability) = crate::mutation::required_capability(&step.kind)
+            && !boundary_caps.iter().any(|known| known == capability)
+        {
+            boundary_caps.push(capability.to_string());
+        }
+    }
+    let workflow_hash = match workflow {
+        Some(pin) => pin.hash.clone(),
+        None => doctrine_workflow_hash(&steps),
+    };
+    let request = QueueRequest {
+        repository: repository.identity(),
+        host: args.host.clone(),
+        host_available: args.host_available,
+        harness_key: args.harness.clone(),
+        harness_lanes: args.harness_lanes,
+        caps: args.caps,
+        workflow_id: DOCTRINE_WORKFLOW_ID.to_string(),
+        workflow_hash,
+        role_config: binding.to_doc(),
+        boundary: Boundary {
+            phase,
+            integration_branch: integration,
+            completion_branch: completion,
+            caps: boundary_caps,
+        },
+        steps: steps
+            .iter()
+            .map(|step| PlannedStep {
+                id: step.id.clone(),
+                kind: step.kind.clone(),
+                params: step.params.clone(),
+            })
+            .collect(),
+        selected: unique
+            .iter()
+            .map(|(number, revision)| SelectedIssue {
+                id: number.to_string(),
+                title: None,
+                revision: revision.clone(),
+                requires: Vec::new(),
+            })
+            .collect(),
+    };
+    // The preview is a projection over the recorded state: it reads the
+    // state store the daemon writes and never creates one (or contacts the
+    // daemon): a missing store is reported typed.
+    let socket = effective_socket(args.socket.as_deref(), Some(&config));
+    let paths = match derive_paths(socket) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    if !paths.db_path.exists() {
+        return error_result(
+            1,
+            "queue.no_state",
+            format!(
+                "no daemon state store at {}; run `canter daemon run` first (the preview only \
+                 reads recorded state)",
+                paths.db_path.display()
+            ),
+            false,
+        );
+    }
+    let state = match State::open(&paths.db_path, Retention::default()) {
+        Ok(state) => state,
+        Err(err) => {
+            return error_result(
+                1,
+                err.code,
+                format!("queue preview: state store unavailable: {}", err.message),
+                false,
+            );
+        }
+    };
+    let preview = match crate::queue_preview::preview_queue(&state, &request) {
+        Ok(preview) => preview,
+        Err(err) => return lane_error(err.code, err.message, false),
+    };
+    let Some(bound) = preview.doc.get("request").cloned() else {
+        return error_result(
+            1,
+            "queue.preview",
+            "queue preview: the preview render carries no bound-input document".to_string(),
+            false,
+        );
+    };
+    // `--out` writes the exact bound-input document (canonical bytes): the
+    // material `queue submit --request` and `board --plan` read.
+    let written = match &args.out {
+        None => None,
+        Some(out) => {
+            let text = format!("{}\n", crate::canonical::canonical_text(&bound));
+            match std::fs::write(out, text) {
+                Ok(()) => Some(out.display().to_string()),
+                Err(err) => {
+                    return error_result(
+                        1,
+                        "queue.out",
+                        format!("queue preview: cannot write {} ({err})", out.display()),
+                        false,
+                    );
+                }
+            }
+        }
+    };
+    let mut data = vec![
+        ("preview", preview.doc.clone()),
+        ("request", bound.clone()),
+        ("digest", string(&preview.digest)),
+        ("ready", bool_(preview.ready)),
+    ];
+    if let Some(written) = &written {
+        data.push(("out", string(written)));
+    }
+    let mut human = String::new();
+    human.push_str(&format!(
+        "queue preview {} ({} selected issue(s), revision-bound)\n",
+        repository.identity(),
+        unique.len()
+    ));
+    human.push_str(&format!(
+        "plan digest sha256 {}\nready {}\n",
+        preview.digest, preview.ready
+    ));
+    human.push_str(&format!("steps ({})", steps.len()));
+    for step in &steps {
+        human.push_str(&format!(" {} {}", step.id, step.kind));
+    }
+    human.push('\n');
+    if let Some(written) = &written {
+        human.push_str(&format!("bound-input document: {written}\n"));
+    }
+    human.push_str(crate::queue_preview::NO_EFFECTS_STATEMENT);
+    ok_result(object(data), human)
 }
 
 /// Execute one `run <pause|resume|retry|status>` invocation (issue #86).
@@ -3976,15 +4760,31 @@ EXAMPLES:
 ";
 
 const QUEUE_USAGE: &str = "\
-canter queue <submit|status> — the durable selected-run submission path
+canter queue <preview|submit|status> — the durable selected-run path
 
 USAGE:
+    canter queue preview --repository KEY --harness KEY --host HOST \
+--issue N=HEX40... --caps G/R/H [--host-available yes|no|unknown] \
+[--harness-lanes N|unknown] [--boundary-phase PHASE] \
+[--integration-branch B] [--completion-branch B] [--out FILE] \
+[--socket PATH] [--config PATH] [--json]
     canter queue submit --request FILE --confirm-digest HEX64 [--epoch N] \
 [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]... \
 [--host-available yes|no|unknown] [--harness-lanes N|unknown] \
 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter queue status --submission QS_ID [--socket PATH] [--config PATH] \
 [--json]
+
+preview renders the effect-free preview of ONE reviewed run through the real
+preview service and produces its bound-input document: the repository
+identity, branch and the reviewed role configuration come from the config
+(re-observed, never free text), each --issue carries its exact 40-hex spec
+revision, and the declared step spine is the doctrine spine with every step
+resolved. --out writes the exact bound-input document (the material
+--request/--plan read); the printed digest is sha256 over that document's
+canonical bytes, i.e. the exact authorization submit binds. It reads the
+recorded state store the daemon writes and never creates one, spawns
+nothing, issues no grant and writes no external state.
 
 submit commits ONE approved selected-issue run (daemon `queue.submit`),
 consuming the reviewed queue preview: --request names the exact bound-input
@@ -4538,7 +5338,9 @@ fn per_command_usage(command: &str) -> &'static str {
             "usage: canter plan <repository> <issue> [--revision HEX40] [--config PATH] [--json]"
         }
         "capabilities" => "usage: canter capabilities [--json]",
-        "board" => "usage: canter board [--config PATH]",
+        "board" => {
+            "usage: canter board [--plan FILE --caps G/R/H [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]...] [--config PATH]"
+        }
         "daemon" => {
             "usage: canter daemon run [--socket PATH] [--config PATH]\n       canter daemon status [--config PATH] [--json]"
         }
@@ -4549,7 +5351,7 @@ fn per_command_usage(command: &str) -> &'static str {
             "usage: canter lane preview|request --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY]\n       canter lane status --replacement RP_ID | --lane ID --generation N"
         }
         "queue" => {
-            "usage: canter queue submit --request FILE --confirm-digest HEX64 --caps G/R/H [--epoch N]\n       canter queue status --submission QS_ID"
+            "usage: canter queue preview --repository KEY --harness KEY --host HOST --issue N=HEX40... --caps G/R/H [--out FILE]\n       canter queue submit --request FILE --confirm-digest HEX64 --caps G/R/H [--epoch N]\n       canter queue status --submission QS_ID"
         }
         _ => "usage: canter [--help] [--version] | canter <command> [options]",
     }
@@ -4661,10 +5463,12 @@ mod tests {
     }
 
     #[test]
-    fn board_parses_config_and_refuses_json_and_positionals() {
-        // The interactive surface takes `--config PATH` only: a malformed
-        // invocation is a typed usage error and never reaches the state
-        // store or the terminal.
+    fn board_parses_config_plan_and_refuses_json_and_positionals() {
+        // Issue #91: the interactive surface is now the reachable operator
+        // authority path — it takes `--config PATH` (daemon path derivation)
+        // and, for one presented reviewed run, `--plan FILE` plus the
+        // attested observation axis. A malformed invocation stays a typed
+        // usage error that never reaches the state store or the terminal.
         let board = invocation(&["board", "--config", "canter.toml"]);
         assert_eq!(board.command, "board");
         assert!(!board.json);
@@ -4672,10 +5476,67 @@ mod tests {
             board.config_path.as_deref(),
             Some(std::path::Path::new("canter.toml"))
         );
+        assert!(
+            board.board.is_none(),
+            "without --plan the read-only board presents no run"
+        );
+
+        let planned = invocation(&[
+            "board",
+            "--config",
+            "canter.toml",
+            "--plan",
+            "reviewed-plan.json",
+            "--caps",
+            "4/2/2",
+            "--host-available",
+            "yes",
+            "--harness-lanes",
+            "0",
+            "--grant",
+            "5=gr_0123456789abcdef",
+            "--resume",
+            "run-seeded-0001=1111111111111111111111111111111111111111111111111111111111111111",
+        ]);
+        let presented = planned.board.expect("the presented run");
+        assert_eq!(
+            presented.plan_path,
+            std::path::PathBuf::from("reviewed-plan.json")
+        );
+        assert_eq!(presented.host_available, Some(true));
+        assert_eq!(presented.harness_lanes, Some(0));
+        assert_eq!(presented.caps.global, 4);
+        assert_eq!(presented.caps.per_repository, 2);
+        assert_eq!(presented.caps.per_harness, 2);
+        assert_eq!(
+            presented.grants,
+            vec![("5".to_string(), "gr_0123456789abcdef".to_string())]
+        );
+        assert_eq!(
+            presented.resume,
+            vec![("run-seeded-0001".to_string(), "1".repeat(64),)]
+        );
+        // The attestation axis defaults to unknown, never to a yes: an
+        // unattested host/occupancy holds work instead of admitting it.
+        let bare_plan = invocation(&["board", "--plan", "reviewed-plan.json", "--caps", "4/2/2"]);
+        let presented = bare_plan.board.expect("the presented run");
+        assert_eq!(presented.host_available, None);
+        assert_eq!(presented.harness_lanes, None);
+        assert!(presented.grants.is_empty());
+        assert!(presented.resume.is_empty());
+
+        // A presented run without the admission axes, and observation flags
+        // without a run, are both typed refusals.
         for args in [
-            vec!["board", "--json"],
-            vec!["board", "extra"],
-            vec!["board", "--config"],
+            vec!["board", "--plan", "reviewed-plan.json"],
+            vec!["board", "--caps", "4/2/2"],
+            vec!["board", "--host-available", "yes"],
+            vec!["board", "--grant", "5=gr_0123456789abcdef"],
+            vec![
+                "board",
+                "--resume",
+                "run-x=1111111111111111111111111111111111111111111111111111111111111111",
+            ],
         ] {
             let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             assert!(
@@ -4683,6 +5544,256 @@ mod tests {
                 "expected a typed refusal for {args:?}"
             );
         }
+        // Malformed flag values are typed usage errors too (never a call).
+        for args in [
+            vec!["board", "--plan", "p.json", "--caps", "4/2"],
+            vec!["board", "--plan", "p.json", "--caps", "a/b/c"],
+            vec![
+                "board", "--plan", "p.json", "--caps", "4/2/2", "--grant", "5",
+            ],
+            vec![
+                "board",
+                "--plan",
+                "p.json",
+                "--caps",
+                "4/2/2",
+                "--grant",
+                "5=not-a-grant",
+            ],
+            vec![
+                "board", "--plan", "p.json", "--caps", "4/2/2", "--resume", "x=zz",
+            ],
+            vec![
+                "board",
+                "--plan",
+                "p.json",
+                "--caps",
+                "4/2/2",
+                "--host-available",
+                "maybe",
+            ],
+            vec![
+                "board",
+                "--plan",
+                "p.json",
+                "--caps",
+                "4/2/2",
+                "--harness-lanes",
+                "-1",
+            ],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert!(
+                parse_invocation(&owned).is_err(),
+                "expected a typed refusal for {args:?}"
+            );
+        }
+        for args in [
+            vec!["board", "--json"],
+            vec!["board", "extra"],
+            vec!["board", "--config"],
+            vec!["board", "--plan"],
+            vec!["board", "--caps"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert!(
+                parse_invocation(&owned).is_err(),
+                "expected a typed refusal for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_preview_invocation_parses_and_refuses_cross_command_flags() {
+        // Issue #91: the plan producer is a first-class `queue` subcommand.
+        let preview = invocation(&[
+            "queue",
+            "preview",
+            "--repository",
+            "widgets",
+            "--harness",
+            "lane-1",
+            "--host",
+            "host-1",
+            "--issue",
+            "5=1111111111111111111111111111111111111111",
+            "--caps",
+            "4/2/2",
+            "--out",
+            "plan.json",
+            "--json",
+        ]);
+        assert_eq!(preview.command, "queue preview");
+        assert!(preview.json);
+        let Some(QueueAction::Preview(args)) = preview.queue_action else {
+            panic!("expected the preview action");
+        };
+        assert_eq!(args.repository, "widgets");
+        assert_eq!(args.harness, "lane-1");
+        assert_eq!(args.host, "host-1");
+        assert_eq!(
+            args.selected,
+            vec![(5, "1111111111111111111111111111111111111111".to_string())]
+        );
+        assert_eq!(args.caps.global, 4);
+        assert_eq!(args.out.as_deref(), Some(std::path::Path::new("plan.json")));
+        assert!(args.host_available.is_none(), "unknown is the default");
+        assert!(args.harness_lanes.is_none(), "unknown is the default");
+        assert!(args.boundary_phase.is_none());
+        assert!(args.integration_branch.is_none());
+        assert!(args.completion_branch.is_none());
+
+        let base = [
+            "queue",
+            "preview",
+            "--repository",
+            "widgets",
+            "--harness",
+            "lane-1",
+            "--host",
+            "host-1",
+            "--issue",
+            "5=1111111111111111111111111111111111111111",
+            "--caps",
+            "4/2/2",
+        ];
+        let without = |drop: &str| -> Vec<String> {
+            let mut args: Vec<String> = base.iter().map(|s| s.to_string()).collect();
+            if let Some(position) = args.iter().position(|value| value == drop) {
+                args.drain(position..=position + 1);
+            }
+            args
+        };
+        for flag in ["--repository", "--harness", "--host", "--issue", "--caps"] {
+            assert!(
+                parse_invocation(&without(flag)).is_err(),
+                "{flag} is required for a preview"
+            );
+        }
+
+        // The two surfaces never swap flags: a submission authorization is
+        // not a preview input, and preview inputs are not a submission.
+        let mut submit_with_preview = vec!["queue", "submit"];
+        submit_with_preview.extend(base[2..].iter().copied());
+        submit_with_preview.extend(["--request", "r.json", "--confirm-digest"]);
+        let mut owned: Vec<String> = submit_with_preview.iter().map(|s| s.to_string()).collect();
+        owned.push("0".repeat(64));
+        assert!(parse_invocation(&owned).is_err());
+
+        for args in [
+            vec![
+                "queue",
+                "status",
+                "--submission",
+                "qs_0123456789abcdef",
+                "--repository",
+                "widgets",
+            ],
+            vec![
+                "queue",
+                "preview",
+                "--repository",
+                "widgets",
+                "--harness",
+                "lane-1",
+                "--host",
+                "h",
+                "--issue",
+                "5=1111111111111111111111111111111111111111",
+                "--caps",
+                "4/2/2",
+                "--request",
+                "r.json",
+            ],
+            vec![
+                "queue",
+                "preview",
+                "--repository",
+                "widgets",
+                "--harness",
+                "lane-1",
+                "--host",
+                "h",
+                "--issue",
+                "5=1111111111111111111111111111111111111111",
+                "--caps",
+                "4/2/2",
+                "--supervise",
+                "arm",
+            ],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert!(
+                parse_invocation(&owned).is_err(),
+                "expected a cross-command refusal for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn board_plan_preflight_is_typed_and_labels_without_a_host_path() {
+        // `board --plan` loads the reviewed document as a pure file load (no
+        // config, no state store, no terminal). The typed refusals are
+        // stable codes; a loaded document is labelled with its file NAME so
+        // the displayed source can never leak a host path.
+        let dir = std::env::temp_dir().join(format!("hf-cmd-board-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let base = BoardArgs {
+            plan_path: dir.join("missing.json"),
+            host_available: None,
+            harness_lanes: None,
+            caps: crate::lifecycle::ConcurrencyCaps {
+                global: 4,
+                per_repository: 2,
+                per_harness: 2,
+            },
+            grants: Vec::new(),
+            resume: Vec::new(),
+        };
+        let refused = presented_run(&base).expect_err("an unreadable plan refuses");
+        assert_eq!(refused.exit_code, 2);
+        assert_eq!(
+            refused.error.as_ref().expect("error doc").code,
+            "usage.board_plan"
+        );
+
+        let malformed = dir.join("malformed.json");
+        std::fs::write(&malformed, "[1, 2, 3]\n").expect("write malformed");
+        let refused = presented_run(&BoardArgs {
+            plan_path: malformed,
+            ..base.clone()
+        })
+        .expect_err("a non-object document refuses");
+        assert_eq!(refused.exit_code, 2);
+        assert_eq!(
+            refused.error.as_ref().expect("error doc").code,
+            "usage.board_plan"
+        );
+
+        let valid = dir.join("reviewed-plan.json");
+        std::fs::write(
+            &valid,
+            "{\"schema\":\"hf-queue-preview/v1\",\"repository\":\"example-org/widgets\"}\n",
+        )
+        .expect("write plan");
+        let run = presented_run(&BoardArgs {
+            plan_path: valid,
+            host_available: Some(true),
+            harness_lanes: Some(0),
+            ..base.clone()
+        })
+        .expect("a document object loads");
+        assert_eq!(
+            run.source, "reviewed-plan.json",
+            "the label is the file name"
+        );
+        assert!(!run.source.contains('/'), "the label is never a host path");
+        assert_eq!(run.host_available, Some(true));
+        assert_eq!(run.harness_lanes, Some(0));
+        assert_eq!(run.caps.per_harness, 2);
+        assert!(run.grants.is_empty() && run.resume.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
