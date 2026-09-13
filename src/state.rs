@@ -887,6 +887,13 @@ fn admit_queue_item_in_tx(
         ],
     )
     .map_err(|err| StateError::from_sqlite("admit_queue_item: instance", err))?;
+    // Issue #98, restart-matrix boundary (b): the dispatch is half-written —
+    // the candidate's run row exists and its ownership row does not — inside
+    // the caller's transaction, so an abort here rolls the whole dispatch
+    // back and the resumed daemon re-dispatches it exactly once. This is the
+    // SAME boundary for a submission that admits an item and for a queue
+    // advance that dispatches the next one.
+    crate::daemon::crash_point("queue.advance.during-dispatch");
     let prior: Option<String> = tx
         .query_row(
             "SELECT instance_id FROM queue_ownership
@@ -11400,6 +11407,12 @@ fn advance_queue_in_tx(
             }
         }
     };
+    // Issue #98, restart-matrix boundary (c1): the dispatch phase finished
+    // (run row, ownership row, membership flip and the dispatched run's own
+    // supervision arm all written) and the cursor row is not yet recorded.
+    // The code writes the dispatch first and the cursor last; both live in
+    // this ONE transaction, so an abort here rolls the dispatch back too.
+    crate::daemon::crash_point("queue.advance.after-dispatch");
     // 5. Record the consumption of this delivery: the durable idempotency
     //    key, the cursor and the outcome. A held row is updated in place when
     //    its reason settles (the row is keyed to the delivery, so the update
@@ -11432,6 +11445,10 @@ fn advance_queue_in_tx(
         ],
     )
     .map_err(|err| StateError::from_sqlite("queue_advance: record", err))?;
+    // Issue #98, restart-matrix boundary (c2): the cursor row is written and
+    // nothing is committed yet: an abort here leaves no consumed delivery and
+    // no dispatched run, and the resumed daemon re-applies both once.
+    crate::daemon::crash_point("queue.advance.after-cursor");
     Ok(())
 }
 
@@ -11947,6 +11964,14 @@ impl State {
         plan: &SupervisionCheckPlan,
     ) -> Result<SupervisionRow, StateError> {
         self.ensure_writable()?;
+        // Issue #98, restart-matrix boundary (a): this reconciliation verified
+        // a fresh delivery of the run and the cursor-advance transaction has
+        // not started. The durable state at this instant is the recorded
+        // delivery evidence alone, so a resumed daemon re-derives the whole
+        // advance from it (exactly once).
+        if plan.advance.is_some() {
+            crate::daemon::crash_point("queue.advance.after-delivery");
+        }
         let mut conn = self.lock("commit_supervision_check")?;
         let tx = conn
             .transaction()
@@ -12070,6 +12095,14 @@ impl State {
         }
         tx.commit()
             .map_err(|err| StateError::from_sqlite("commit_supervision_check: commit", err))?;
+        // Issue #98, restart-matrix boundary (d): the whole advance is durable.
+        // A crash here leaves the consumed delivery, the dispatched run and
+        // the cursor row committed together; the resumed daemon re-derives the
+        // same delivery and the recorded consumption keeps the restart from
+        // repeating any of it.
+        if plan.advance.is_some() {
+            crate::daemon::crash_point("queue.advance.after-commit");
+        }
         Ok(updated)
     }
 

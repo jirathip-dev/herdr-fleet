@@ -7331,7 +7331,12 @@ fn crash_point_requested(canonical: Option<&str>, legacy: Option<&str>) -> Optio
 
 /// Abort the daemon at a named journal boundary. Honored only when
 /// `cfg!(debug_assertions)` — release binaries never crash from this hook.
-fn crash_point(point: &str) {
+///
+/// Reachable from every layer that performs durable fleet work (the daemon
+/// handlers and, since issue #98, the queue-advance boundaries inside the
+/// state transactions), so the restart/pause acceptance battery can kill the
+/// process at an exact durable boundary.
+pub(crate) fn crash_point(point: &str) {
     if !cfg!(debug_assertions) {
         return;
     }
